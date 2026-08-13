@@ -91,7 +91,7 @@ pub fn compose(
                 background_start = column;
                 background_color = Some(background);
             }
-            if cell.width != CellWidth::Spacer
+            if !matches!(cell.width, CellWidth::Spacer | CellWidth::LeadingSpacer)
                 && !cell.flags.hidden
                 && (cell.ch != ' ' || cell.zerowidth.is_some())
             {

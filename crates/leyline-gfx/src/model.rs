@@ -56,7 +56,7 @@ pub struct WindowState {
     pub activated: bool,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum PlatformEvent {
     CloseRequested,
     Configured {
@@ -70,6 +70,75 @@ pub enum PlatformEvent {
     FrameReady,
     SurfaceSuspended,
     SurfaceResumed,
+    KeyboardFocus {
+        serial: u32,
+        focused: bool,
+    },
+    Key(KeyInput),
+    ModifiersChanged(ModifiersState),
+    Pointer(PointerInput),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct ModifiersState {
+    pub shift: bool,
+    pub control: bool,
+    pub alt: bool,
+    pub super_key: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyState {
+    Pressed,
+    Released,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyInput {
+    pub serial: u32,
+    pub time_ms: u32,
+    pub physical_keycode: u32,
+    pub keysym: u32,
+    pub keysym_name: Option<String>,
+    pub utf8: Option<String>,
+    pub modifiers: ModifiersState,
+    pub state: KeyState,
+    pub repeat: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointerInput {
+    pub position: (f64, f64),
+    pub kind: PointerKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PointerKind {
+    Enter {
+        serial: u32,
+    },
+    Leave {
+        serial: u32,
+    },
+    Motion {
+        time_ms: u32,
+    },
+    Press {
+        serial: u32,
+        time_ms: u32,
+        button: u32,
+    },
+    Release {
+        serial: u32,
+        time_ms: u32,
+        button: u32,
+    },
+    Axis {
+        time_ms: u32,
+        horizontal_120: i32,
+        vertical_120: i32,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]

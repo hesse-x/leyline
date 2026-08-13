@@ -178,6 +178,10 @@ impl GfxRuntime {
                     self.frame_ready = true;
                     self.swapchain_state = SwapchainState::RecreatePending;
                 }
+                PlatformEvent::KeyboardFocus { .. }
+                | PlatformEvent::Key(_)
+                | PlatformEvent::ModifiersChanged(_)
+                | PlatformEvent::Pointer(_) => {}
             }
         }
         Ok(())

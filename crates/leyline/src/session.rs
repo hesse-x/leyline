@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use leyline_pty::{PtyProcess, PtySinks, SpawnSpec};
 
@@ -42,6 +42,8 @@ pub struct TerminalSession {
     dirty: bool,
     latest_snapshot: Option<FrameSnapshot>,
     pending_title: Option<Arc<str>>,
+    pending_input: VecDeque<Vec<u8>>,
+    pending_input_bytes: usize,
 }
 
 #[allow(clippy::missing_errors_doc)]
@@ -64,6 +66,7 @@ impl TerminalSession {
         let reliable_exit = runtime.reliable_control_sink();
         let reliable_failure = runtime.reliable_control_sink();
         let bulk_close = bulk.clone();
+        let writable = runtime.control_sink();
         let sinks = PtySinks {
             output: Arc::new(move |bytes| {
                 ByteBatch::new(bytes)
@@ -90,6 +93,10 @@ impl TerminalSession {
                 let _ = reliable_failure
                     .send_or_cancel(ControlEvent::PtyFailed(PtyFailure { message }));
             }),
+            writable: Arc::new(move || {
+                // A full control queue is already wake-visible; end-of-round draining retries input.
+                let _ = writable.try_send(ControlEvent::PtyWritable);
+            }),
         };
         let process = PtyProcess::spawn(spec, sinks)?;
         Ok(Self {
@@ -102,6 +109,8 @@ impl TerminalSession {
             dirty: true,
             latest_snapshot: None,
             pending_title: None,
+            pending_input: VecDeque::new(),
+            pending_input_bytes: 0,
         })
     }
 
@@ -130,6 +139,7 @@ impl TerminalSession {
                 self.state = SessionState::Failed;
                 return Err(SessionError::Pty(failure.message));
             }
+            PtyEvent::Writable => self.flush_input(64 * 1024)?,
         }
         self.update_state()
     }
@@ -155,6 +165,7 @@ impl TerminalSession {
     }
 
     pub fn end_drain_round(&mut self) -> Result<Option<FrameSnapshot>, SessionError> {
+        self.flush_input(64 * 1024)?;
         if !self.dirty {
             return Ok(None);
         }
@@ -166,6 +177,92 @@ impl TerminalSession {
 
     pub fn latest_snapshot(&self) -> Option<&FrameSnapshot> {
         self.latest_snapshot.as_ref()
+    }
+    pub fn input_modes(&self) -> crate::terminal::TerminalModes {
+        self.core.input_modes()
+    }
+    pub fn input_key(
+        &mut self,
+        key: crate::terminal::TerminalKey,
+        modifiers: crate::terminal::Modifiers,
+    ) -> Result<(), SessionError> {
+        let bytes = crate::terminal::encode_key(key, modifiers, self.core.input_modes())
+            .map_err(SessionError::Input)?;
+        self.queue_input(bytes)
+    }
+    pub fn commit_text(&mut self, text: &str) -> Result<(), SessionError> {
+        let bytes = crate::terminal::commit_text(text).map_err(SessionError::Input)?;
+        self.queue_input(bytes)
+    }
+    pub fn focus_changed(&mut self, focused: bool) -> Result<(), SessionError> {
+        if let Some(bytes) = crate::terminal::encode_focus(focused, self.core.input_modes()) {
+            self.queue_input(bytes)?;
+        }
+        Ok(())
+    }
+    pub fn start_selection(
+        &mut self,
+        point: crate::terminal::SelectionPoint,
+    ) -> Result<(), SessionError> {
+        self.core.start_selection(
+            crate::terminal::SelectionKind::Simple,
+            point,
+            crate::terminal::SelectionSide::Left,
+        )?;
+        self.dirty = true;
+        Ok(())
+    }
+    pub fn update_selection(
+        &mut self,
+        point: crate::terminal::SelectionPoint,
+    ) -> Result<(), SessionError> {
+        self.core
+            .update_selection(point, crate::terminal::SelectionSide::Right)?;
+        self.dirty = true;
+        Ok(())
+    }
+    pub fn selection_overlay(&self, generation: u64) -> crate::frame_composer::SelectionOverlay {
+        let ranges = self.core.projected_selection().map_or_else(
+            || Arc::from([]),
+            |range| {
+                Arc::from([crate::frame_composer::CellRange {
+                    start: range.start,
+                    end: range.end,
+                }])
+            },
+        );
+        crate::frame_composer::SelectionOverlay {
+            snapshot_generation: generation,
+            revision: self.core.selection_revision(),
+            ranges,
+        }
+    }
+    pub fn pointer_report(
+        &mut self,
+        button: crate::terminal::MouseButton,
+        state: crate::terminal::ButtonState,
+        point: crate::terminal::SelectionPoint,
+        modifiers: crate::terminal::Modifiers,
+    ) -> Result<bool, SessionError> {
+        let bytes = crate::terminal::encode_mouse(
+            button,
+            state,
+            point.column,
+            point.line,
+            modifiers,
+            self.core.input_modes(),
+        )
+        .map_err(SessionError::Input)?;
+        if let Some(bytes) = bytes {
+            self.queue_input(bytes)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+    pub fn scroll(&mut self, lines: i32) -> Result<(), SessionError> {
+        self.core.scroll_display(lines)?;
+        self.dirty = true;
+        Ok(())
     }
     pub const fn state(&self) -> SessionState {
         self.state
@@ -186,14 +283,64 @@ impl TerminalSession {
         for action in actions {
             match action {
                 TerminalAction::WriteToPty(bytes) => {
-                    if let Some(process) = &self.process {
-                        process.write(bytes).map_err(SessionError::Command)?;
-                    }
+                    self.queue_input(bytes)?;
                 }
                 TerminalAction::SetTitle(title) => self.pending_title = Some(title),
                 TerminalAction::Bell
                 | TerminalAction::ClipboardRequestRejected
                 | TerminalAction::UnsupportedSequence => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn queue_input(&mut self, bytes: Vec<u8>) -> Result<(), SessionError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let next = self
+            .pending_input_bytes
+            .checked_add(bytes.len())
+            .ok_or(SessionError::InputCapacityExceeded)?;
+        let worker_bytes = self
+            .process
+            .as_ref()
+            .map_or(0, PtyProcess::outstanding_write_bytes);
+        if next
+            .checked_add(worker_bytes)
+            .is_none_or(|total| total > leyline_pty::MAX_OUTSTANDING_WRITE_BYTES)
+        {
+            return Err(SessionError::InputCapacityExceeded);
+        }
+        self.pending_input_bytes = next;
+        self.pending_input.push_back(bytes);
+        Ok(())
+    }
+
+    pub fn flush_input(&mut self, mut budget: usize) -> Result<(), SessionError> {
+        let Some(process) = &self.process else {
+            return Ok(());
+        };
+        while budget != 0 {
+            let Some(transaction) = self.pending_input.front() else {
+                break;
+            };
+            let chunk_len = transaction.len().min(64 * 1024).min(budget);
+            let chunk = transaction[..chunk_len].to_vec();
+            match process.try_write(chunk).map_err(SessionError::Command)? {
+                leyline_pty::WriteStatus::Accepted => {
+                    let Some(transaction) = self.pending_input.front_mut() else {
+                        break;
+                    };
+                    transaction.drain(..chunk_len);
+                    self.pending_input_bytes -= chunk_len;
+                    budget -= chunk_len;
+                    if transaction.is_empty() {
+                        self.pending_input.pop_front();
+                    }
+                }
+                leyline_pty::WriteStatus::WouldBlock => break,
+                leyline_pty::WriteStatus::Closed => return Err(SessionError::InputClosed),
             }
         }
         Ok(())
@@ -322,4 +469,10 @@ pub enum SessionError {
     DuplicateExit,
     #[error("received duplicate PTY read closure")]
     DuplicateReadClose,
+    #[error("PTY input capacity exceeded")]
+    InputCapacityExceeded,
+    #[error("PTY input endpoint is closed")]
+    InputClosed,
+    #[error(transparent)]
+    Input(#[from] crate::terminal::InputError),
 }

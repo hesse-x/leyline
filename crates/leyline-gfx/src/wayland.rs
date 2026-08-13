@@ -13,8 +13,14 @@ use rustix::{
 use smithay_client_toolkit::reexports::csd_frame::WindowState as XdgWindowState;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_output, delegate_xdg_shell, delegate_xdg_window,
+    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_seat,
+    delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
+    seat::{
+        Capability, SeatHandler, SeatState,
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+    },
     shell::{
         WaylandSurface,
         xdg::{
@@ -27,7 +33,7 @@ use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
     backend::WaylandError,
     globals::{GlobalListContents, registry_queue_init},
-    protocol::{wl_output, wl_registry, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_surface},
 };
 use wayland_protocols::wp::{
     fractional_scale::v1::client::{
@@ -41,7 +47,10 @@ use wayland_protocols::wp::{
 };
 
 use crate::decor::Libdecor;
-use crate::{GfxInitError, LogicalSize, PlatformEvent, Scale120, WindowState};
+use crate::{
+    GfxInitError, KeyInput, KeyState, LogicalSize, ModifiersState, PlatformEvent, PointerInput,
+    PointerKind, Scale120, WindowState,
+};
 
 const DEFAULT_SIZE: LogicalSize = LogicalSize {
     width: 800,
@@ -55,6 +64,7 @@ struct PendingEvents {
     scale: Option<Scale120>,
     frame_ready: bool,
     suspended: Option<bool>,
+    input: Vec<PlatformEvent>,
 }
 
 pub(crate) struct WaylandWindow {
@@ -136,6 +146,11 @@ impl WaylandWindow {
         Ok(Self {
             state: WaylandState {
                 outputs: OutputState::new(&globals, &qh),
+                seats: SeatState::new(&globals, &qh),
+                keyboard: None,
+                pointer: None,
+                target_surface: surface.clone(),
+                modifiers: ModifiersState::default(),
                 logical_size: DEFAULT_SIZE,
                 scale: Scale120::ONE,
                 pending: PendingEvents::default(),
@@ -339,6 +354,7 @@ impl WaylandWindow {
                 PlatformEvent::SurfaceResumed
             });
         }
+        output.append(&mut self.state.pending.input);
     }
 
     pub(crate) fn request_frame(&self) {
@@ -378,6 +394,11 @@ impl WaylandWindow {
 
 pub(crate) struct WaylandState {
     outputs: OutputState,
+    seats: SeatState,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
+    target_surface: wl_surface::WlSurface,
+    modifiers: ModifiersState,
     logical_size: LogicalSize,
     scale: Scale120,
     pending: PendingEvents,
@@ -392,6 +413,201 @@ impl OutputHandler for WaylandState {
     fn new_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
     fn update_output(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
+}
+
+impl SeatHandler for WaylandState {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seats
+    }
+    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_capability(
+        &mut self,
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            self.keyboard = self.seats.get_keyboard(qh, &seat, None).ok();
+        } else if capability == Capability::Pointer && self.pointer.is_none() {
+            self.pointer = self.seats.get_pointer(qh, &seat).ok();
+        }
+    }
+    fn remove_capability(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Keyboard
+            && let Some(keyboard) = self.keyboard.take()
+        {
+            keyboard.release();
+        }
+        if capability == Capability::Pointer
+            && let Some(pointer) = self.pointer.take()
+        {
+            pointer.release();
+        }
+    }
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+}
+
+impl KeyboardHandler for WaylandState {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        serial: u32,
+        _: &[u32],
+        _: &[Keysym],
+    ) {
+        if surface == &self.target_surface {
+            self.pending.input.push(PlatformEvent::KeyboardFocus {
+                serial,
+                focused: true,
+            });
+        }
+    }
+    fn leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        surface: &wl_surface::WlSurface,
+        serial: u32,
+    ) {
+        if surface == &self.target_surface {
+            self.pending.input.push(PlatformEvent::KeyboardFocus {
+                serial,
+                focused: false,
+            });
+        }
+    }
+    fn press_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        serial: u32,
+        event: KeyEvent,
+    ) {
+        self.push_key(serial, event, KeyState::Pressed, false);
+    }
+    fn repeat_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        serial: u32,
+        event: KeyEvent,
+    ) {
+        self.push_key(serial, event, KeyState::Pressed, true);
+    }
+    fn release_key(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        serial: u32,
+        event: KeyEvent,
+    ) {
+        self.push_key(serial, event, KeyState::Released, false);
+    }
+    fn update_modifiers(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: u32,
+        modifiers: Modifiers,
+        _: RawModifiers,
+        _: u32,
+    ) {
+        self.modifiers = ModifiersState {
+            shift: modifiers.shift,
+            control: modifiers.ctrl,
+            alt: modifiers.alt,
+            super_key: modifiers.logo,
+        };
+        self.pending
+            .input
+            .push(PlatformEvent::ModifiersChanged(self.modifiers));
+    }
+}
+
+impl WaylandState {
+    fn push_key(&mut self, serial: u32, event: KeyEvent, state: KeyState, repeat: bool) {
+        self.pending.input.push(PlatformEvent::Key(KeyInput {
+            serial,
+            time_ms: event.time,
+            physical_keycode: event.raw_code,
+            keysym: event.keysym.raw(),
+            keysym_name: event.keysym.name().map(str::to_owned),
+            utf8: event.utf8,
+            modifiers: self.modifiers,
+            state,
+            repeat,
+        }));
+    }
+}
+
+impl PointerHandler for WaylandState {
+    fn pointer_frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            if event.surface != self.target_surface {
+                continue;
+            }
+            let kind = match &event.kind {
+                PointerEventKind::Enter { serial } => PointerKind::Enter { serial: *serial },
+                PointerEventKind::Leave { serial } => PointerKind::Leave { serial: *serial },
+                PointerEventKind::Motion { time } => PointerKind::Motion { time_ms: *time },
+                PointerEventKind::Press {
+                    time,
+                    button,
+                    serial,
+                } => PointerKind::Press {
+                    serial: *serial,
+                    time_ms: *time,
+                    button: *button,
+                },
+                PointerEventKind::Release {
+                    time,
+                    button,
+                    serial,
+                } => PointerKind::Release {
+                    serial: *serial,
+                    time_ms: *time,
+                    button: *button,
+                },
+                PointerEventKind::Axis {
+                    time,
+                    horizontal,
+                    vertical,
+                    ..
+                } => PointerKind::Axis {
+                    time_ms: *time,
+                    horizontal_120: horizontal.value120,
+                    vertical_120: vertical.value120,
+                },
+            };
+            self.pending
+                .input
+                .push(PlatformEvent::Pointer(PointerInput {
+                    position: event.position,
+                    kind,
+                }));
+        }
+    }
 }
 
 impl WindowHandler for WaylandState {
@@ -541,5 +757,8 @@ impl Dispatch<WpViewport, ()> for WaylandState {
 
 delegate_compositor!(WaylandState);
 delegate_output!(WaylandState);
+delegate_seat!(WaylandState);
+delegate_keyboard!(WaylandState);
+delegate_pointer!(WaylandState);
 delegate_xdg_shell!(WaylandState);
 delegate_xdg_window!(WaylandState);

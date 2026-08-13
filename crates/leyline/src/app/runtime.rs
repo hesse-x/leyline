@@ -328,6 +328,7 @@ fn control_to_app(event: ControlEvent) -> AppEvent {
         ControlEvent::Shutdown(reason) => AppEvent::ShutdownRequested(reason),
         ControlEvent::PtyExited(exit) => AppEvent::Pty(PtyEvent::Exited(exit)),
         ControlEvent::PtyFailed(failure) => AppEvent::Pty(PtyEvent::Failed(failure)),
+        ControlEvent::PtyWritable => AppEvent::Pty(PtyEvent::Writable),
     }
 }
 fn bulk_to_app(event: BulkEvent) -> AppEvent {

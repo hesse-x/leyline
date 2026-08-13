@@ -15,6 +15,19 @@ pub struct GridLayout {
 }
 
 impl GridLayout {
+    #[must_use]
+    pub fn cell_at_pixel(&self, pixel: [u32; 2]) -> Option<[u16; 2]> {
+        let relative_x = pixel[0].checked_sub(self.content_origin_px[0])?;
+        let relative_y = pixel[1].checked_sub(self.content_origin_px[1])?;
+        let column = relative_x / u32::from(self.cell_px[0].get());
+        let line = relative_y / u32::from(self.cell_px[1].get());
+        if column >= u32::from(self.grid.columns.get()) || line >= u32::from(self.grid.lines.get())
+        {
+            return None;
+        }
+        Some([u16::try_from(column).ok()?, u16::try_from(line).ok()?])
+    }
+
     /// Calculates a deterministic physical grid and centers its unused remainder.
     ///
     /// # Errors
@@ -147,5 +160,26 @@ mod tests {
         .unwrap();
         assert!(scaled.grid.columns() > one.grid.columns());
         assert_eq!(scaled.font_generation, 2);
+    }
+
+    #[test]
+    fn cell_mapping_uses_half_open_content_bounds() {
+        let layout = GridLayout::calculate(
+            LogicalSize {
+                width: 100,
+                height: 60,
+            },
+            Scale120::ONE,
+            [5, 5],
+            metrics(),
+            1,
+        )
+        .unwrap();
+        let origin = layout.content_origin_px;
+        assert_eq!(layout.cell_at_pixel(origin), Some([0, 0]));
+        assert_eq!(layout.cell_at_pixel([origin[0] - 1, origin[1]]), None);
+        let right =
+            origin[0] + u32::from(layout.grid.columns.get()) * u32::from(layout.cell_px[0].get());
+        assert_eq!(layout.cell_at_pixel([right, origin[1]]), None);
     }
 }

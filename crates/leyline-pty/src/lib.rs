@@ -6,5 +6,6 @@ compile_error!("leyline-pty currently supports Linux only");
 mod spawn;
 
 pub use spawn::{
-    ChildExit, JoinError, PtyCommandError, PtyProcess, PtySinks, PtySize, SpawnError, SpawnSpec,
+    ChildExit, JoinError, MAX_OUTSTANDING_WRITE_BYTES, PtyCommandError, PtyProcess, PtySinks,
+    PtySize, SpawnError, SpawnSpec, WriteStatus,
 };

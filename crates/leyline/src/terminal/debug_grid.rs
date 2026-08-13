@@ -18,11 +18,13 @@ pub fn format_debug_grid(snapshot: &FrameSnapshot) -> String {
         snapshot.display_offset,
         snapshot.modes.alternate_screen,
         snapshot.modes.bracketed_paste,
-        snapshot.modes.mouse_reporting
+        snapshot.modes.mouse_protocol != super::MouseProtocol::None
     );
     for row in snapshot.cells.chunks(snapshot.grid.columns()) {
         for cell in row {
-            let ch = if cell.flags.hidden || matches!(cell.width, CellWidth::Spacer) {
+            let ch = if cell.flags.hidden
+                || matches!(cell.width, CellWidth::Spacer | CellWidth::LeadingSpacer)
+            {
                 ' '
             } else if cell.ch.is_control() {
                 '\u{fffd}'

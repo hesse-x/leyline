@@ -2,9 +2,12 @@
 
 pub mod app;
 pub mod cli;
+pub mod clipboard;
 pub mod config;
+pub mod desktop;
 pub mod diagnostics;
 pub mod frame_composer;
+pub mod interaction;
 pub mod layout;
 pub mod logging;
 pub mod session;

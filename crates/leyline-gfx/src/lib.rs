@@ -10,8 +10,9 @@ mod wake;
 mod wayland;
 
 pub use model::{
-    GfxCommand, GlyphInstance, GlyphPlacement, LinearColor, LogicalSize, PixelSize, PlatformEvent,
-    RectangleInstance, RenderOutcome, RenderScene, Scale120, SceneData, WindowState,
+    GfxCommand, GlyphInstance, GlyphPlacement, KeyInput, KeyState, LinearColor, LogicalSize,
+    ModifiersState, PixelSize, PlatformEvent, PointerInput, PointerKind, RectangleInstance,
+    RenderOutcome, RenderScene, Scale120, SceneData, WindowState,
 };
 pub use runtime::{GfxError, GfxInitError, GfxOptions, GfxRuntime};
 pub use wake::{EventWake, WakeError};

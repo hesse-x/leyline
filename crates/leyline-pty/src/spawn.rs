@@ -10,8 +10,8 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -26,6 +26,7 @@ const _: () = ();
 
 const READ_CHUNK: usize = 16 * 1024;
 const MAX_BATCH: usize = 64 * 1024;
+pub const MAX_OUTSTANDING_WRITE_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PtySize {
@@ -158,6 +159,7 @@ pub struct PtySinks {
     pub read_closed: Arc<dyn Fn() -> bool + Send + Sync>,
     pub exited: Arc<dyn Fn(ChildExit) + Send + Sync>,
     pub failed: Arc<dyn Fn(String) + Send + Sync>,
+    pub writable: Arc<dyn Fn() + Send + Sync>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -168,13 +170,21 @@ pub enum ChildExit {
 }
 
 enum CommandMessage {
-    Resize(PtySize),
     Write(Vec<u8>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteStatus {
+    Accepted,
+    WouldBlock,
+    Closed,
 }
 
 pub struct PtyProcess {
     commands: Sender<CommandMessage>,
     shutdown: Arc<AtomicBool>,
+    outstanding_write_bytes: Arc<AtomicUsize>,
+    latest_resize: Arc<Mutex<Option<PtySize>>>,
     io_thread: Option<JoinHandle<()>>,
     wait_thread: Option<JoinHandle<()>>,
 }
@@ -223,13 +233,26 @@ impl PtyProcess {
                 return Err(SpawnError::PidFd(error));
             }
         };
-        let (commands, command_rx) = bounded(64);
+        let (commands, command_rx) = bounded(16);
         let shutdown = Arc::new(AtomicBool::new(false));
+        let outstanding_write_bytes = Arc::new(AtomicUsize::new(0));
+        let latest_resize = Arc::new(Mutex::new(None));
         let io_sinks = sinks.clone();
         let io_shutdown = Arc::clone(&shutdown);
+        let io_outstanding = Arc::clone(&outstanding_write_bytes);
+        let io_resize = Arc::clone(&latest_resize);
         let io_thread = thread::Builder::new()
             .name("leyline-pty-io".into())
-            .spawn(move || io_worker(master, &command_rx, &io_shutdown, &io_sinks))
+            .spawn(move || {
+                io_worker(
+                    master,
+                    &command_rx,
+                    &io_shutdown,
+                    &io_outstanding,
+                    &io_resize,
+                    &io_sinks,
+                );
+            })
             .map_err(|error| {
                 shutdown.store(true, Ordering::Release);
                 let _ = signal_pidfd(pidfd.as_raw_fd(), libc::SIGKILL);
@@ -252,6 +275,8 @@ impl PtyProcess {
         Ok(Self {
             commands,
             shutdown,
+            outstanding_write_bytes,
+            latest_resize,
             io_thread: Some(io_thread),
             wait_thread: Some(wait_thread),
         })
@@ -260,23 +285,58 @@ impl PtyProcess {
     /// Queues a terminal window resize.
     ///
     /// # Errors
-    /// Returns [`PtyCommandError::Unavailable`] when the bounded endpoint cannot accept it.
+    /// The control lane is latest-wins and independent of input backpressure.
     pub fn resize(&self, size: PtySize) -> Result<(), PtyCommandError> {
-        self.commands
-            .try_send(CommandMessage::Resize(size))
-            .map_err(|_| PtyCommandError::Unavailable)
+        if self.shutdown.load(Ordering::Acquire) {
+            return Err(PtyCommandError::Unavailable);
+        }
+        *self
+            .latest_resize
+            .lock()
+            .map_err(|_| PtyCommandError::Unavailable)? = Some(size);
+        Ok(())
     }
     /// Queues a bounded parser response for the PTY master.
     ///
     /// # Errors
     /// Returns an error for invalid bytes or an unavailable bounded endpoint.
-    pub fn write(&self, bytes: Vec<u8>) -> Result<(), PtyCommandError> {
+    pub fn try_write(&self, bytes: Vec<u8>) -> Result<WriteStatus, PtyCommandError> {
         if bytes.is_empty() || bytes.len() > MAX_BATCH {
             return Err(PtyCommandError::InvalidWrite);
         }
-        self.commands
-            .try_send(CommandMessage::Write(bytes))
-            .map_err(|_| PtyCommandError::Unavailable)
+        if self.shutdown.load(Ordering::Acquire) {
+            return Ok(WriteStatus::Closed);
+        }
+        let len = bytes.len();
+        let reserved = self.outstanding_write_bytes.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |current| {
+                current
+                    .checked_add(len)
+                    .filter(|next| *next <= MAX_OUTSTANDING_WRITE_BYTES)
+            },
+        );
+        if reserved.is_err() {
+            return Ok(WriteStatus::WouldBlock);
+        }
+        match self.commands.try_send(CommandMessage::Write(bytes)) {
+            Ok(()) => Ok(WriteStatus::Accepted),
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                self.outstanding_write_bytes
+                    .fetch_sub(len, Ordering::AcqRel);
+                Ok(WriteStatus::WouldBlock)
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                self.outstanding_write_bytes
+                    .fetch_sub(len, Ordering::AcqRel);
+                Ok(WriteStatus::Closed)
+            }
+        }
+    }
+    #[must_use]
+    pub fn outstanding_write_bytes(&self) -> usize {
+        self.outstanding_write_bytes.load(Ordering::Acquire)
     }
     /// Requests worker shutdown and master closure.
     ///
@@ -317,7 +377,10 @@ impl PtyProcess {
 
 impl Drop for PtyProcess {
     fn drop(&mut self) {
-        let _ = self.join_inner(true);
+        self.shutdown.store(true, Ordering::Release);
+        // Dropping JoinHandle detaches; shutdown ownership stays in worker-owned Arcs.
+        self.io_thread.take();
+        self.wait_thread.take();
     }
 }
 
@@ -387,10 +450,13 @@ fn open_pty(size: PtySize) -> Result<(File, File), SpawnError> {
 }
 
 #[allow(clippy::needless_pass_by_value)] // Moving File documents and enforces exclusive fd ownership.
+#[allow(clippy::too_many_lines)]
 fn io_worker(
     master: File,
     commands: &Receiver<CommandMessage>,
     shutdown: &AtomicBool,
+    outstanding: &AtomicUsize,
+    latest_resize: &Mutex<Option<PtySize>>,
     sinks: &PtySinks,
 ) {
     let fd = master.as_raw_fd();
@@ -399,14 +465,16 @@ fn io_worker(
         if shutdown.load(Ordering::Acquire) {
             break;
         }
+        if let Ok(mut resize) = latest_resize.lock()
+            && let Some(size) = resize.take()
+        {
+            let winsize = size.winsize();
+            if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) } == -1 {
+                (sinks.failed)(format!("resize: {}", io::Error::last_os_error()));
+            }
+        }
         while let Ok(command) = commands.try_recv() {
             match command {
-                CommandMessage::Resize(size) => {
-                    let winsize = size.winsize();
-                    if unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) } == -1 {
-                        (sinks.failed)(format!("resize: {}", io::Error::last_os_error()));
-                    }
-                }
                 CommandMessage::Write(bytes) => pending_write.extend(bytes),
             }
         }
@@ -432,7 +500,10 @@ fn io_worker(
             let count =
                 unsafe { libc::write(fd, pending_write.as_ptr().cast(), pending_write.len()) };
             if count > 0 {
-                pending_write.drain(..count.cast_unsigned());
+                let count = count.cast_unsigned();
+                pending_write.drain(..count);
+                outstanding.fetch_sub(count, Ordering::AcqRel);
+                (sinks.writable)();
             }
         }
         if fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0 {
@@ -481,6 +552,17 @@ fn io_worker(
                 break;
             }
         }
+    }
+    let discarded = pending_write.len()
+        + commands
+            .try_iter()
+            .map(|command| match command {
+                CommandMessage::Write(bytes) => bytes.len(),
+            })
+            .sum::<usize>();
+    if discarded != 0 {
+        outstanding.fetch_sub(discarded, Ordering::AcqRel);
+        (sinks.writable)();
     }
 }
 
@@ -678,6 +760,7 @@ mod tests {
                     let _ = exit_tx.send("exited");
                 }),
                 failed: Arc::new(|message| panic!("PTY failure: {message}")),
+                writable: Arc::new(|| {}),
             },
         )
         .unwrap();
@@ -791,6 +874,7 @@ mod tests {
             read_closed: Arc::new(|| true),
             exited: Arc::new(|_| {}),
             failed: Arc::new(|_| {}),
+            writable: Arc::new(|| {}),
         };
         assert!(matches!(
             PtyProcess::spawn(missing, sinks.clone()),

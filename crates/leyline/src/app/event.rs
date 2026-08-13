@@ -9,6 +9,7 @@ pub enum ControlEvent {
     Shutdown(ShutdownReason),
     PtyExited(ChildExit),
     PtyFailed(PtyFailure),
+    PtyWritable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -23,6 +24,7 @@ pub enum PtyEvent {
     Exited(ChildExit),
     Failed(PtyFailure),
     ReadClosed,
+    Writable,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

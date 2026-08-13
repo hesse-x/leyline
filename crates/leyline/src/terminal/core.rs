@@ -3,13 +3,16 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
+    index::{Column, Line, Point, Side},
+    selection::{Selection, SelectionType},
     term::{Config, TermMode, cell::Flags, test::TermSize},
     vte::ansi::{self, Color},
 };
 
 use super::snapshot::{
-    CellFlags, CellWidth, CursorSnapshot, FrameSnapshot, GridSize, SnapshotCell, SnapshotHyperlink,
-    TerminalColor, TerminalModes,
+    CellFlags, CellWidth, CursorSnapshot, FrameSnapshot, GridSize, MouseEncoding, MouseProtocol,
+    ProjectedSelection, SelectionKind, SelectionPoint, SelectionSide, SnapshotCell,
+    SnapshotHyperlink, TerminalColor, TerminalModes,
 };
 
 const MAX_TITLE_BYTES: usize = 1024;
@@ -51,6 +54,7 @@ pub struct TerminalCoreAdapter {
     size: GridSize,
     title: Option<Arc<str>>,
     cached: RefCell<Option<FrameSnapshot>>,
+    selection_revision: u64,
     _main_thread: Rc<()>,
 }
 
@@ -78,6 +82,7 @@ impl TerminalCoreAdapter {
             size,
             title: None,
             cached: RefCell::new(None),
+            selection_revision: 0,
             _main_thread: Rc::new(()),
         })
     }
@@ -173,10 +178,9 @@ impl TerminalCoreAdapter {
                 },
                 width: if cell.flags.contains(Flags::WIDE_CHAR) {
                     CellWidth::Wide
-                } else if cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                {
+                } else if cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER) {
+                    CellWidth::LeadingSpacer
+                } else if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                     CellWidth::Spacer
                 } else {
                     CellWidth::Narrow
@@ -201,12 +205,7 @@ impl TerminalCoreAdapter {
                 line: u16::try_from(cursor.point.line.0.max(0)).unwrap_or(u16::MAX),
                 visible: mode.contains(TermMode::SHOW_CURSOR),
             },
-            modes: TerminalModes {
-                alternate_screen: mode.contains(TermMode::ALT_SCREEN),
-                bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
-                application_cursor: mode.contains(TermMode::APP_CURSOR),
-                mouse_reporting: mode.intersects(TermMode::MOUSE_MODE),
-            },
+            modes: map_modes(mode),
             display_offset: content.display_offset,
             title: self.title.clone(),
             hyperlinks: links.into(),
@@ -217,6 +216,100 @@ impl TerminalCoreAdapter {
 
     pub fn drain_actions(&mut self, out: &mut Vec<TerminalAction>) {
         out.append(&mut self.actions);
+    }
+
+    pub fn start_selection(
+        &mut self,
+        kind: SelectionKind,
+        point: SelectionPoint,
+        side: SelectionSide,
+    ) -> Result<(), TerminalError> {
+        let point = self.history_point(point)?;
+        self.term.selection = Some(Selection::new(
+            map_selection_kind(kind),
+            point,
+            map_selection_side(side),
+        ));
+        self.bump_selection_revision()
+    }
+
+    pub fn update_selection(
+        &mut self,
+        point: SelectionPoint,
+        side: SelectionSide,
+    ) -> Result<(), TerminalError> {
+        let point = self.history_point(point)?;
+        if let Some(selection) = self.term.selection.as_mut() {
+            selection.update(point, map_selection_side(side));
+        }
+        self.bump_selection_revision()
+    }
+
+    pub fn clear_selection(&mut self) -> Result<(), TerminalError> {
+        self.term.selection = None;
+        self.bump_selection_revision()
+    }
+
+    pub fn selected_text(&self) -> Option<String> {
+        self.term.selection_to_string()
+    }
+    pub fn input_modes(&self) -> TerminalModes {
+        map_modes(*self.term.mode())
+    }
+    pub const fn selection_revision(&self) -> u64 {
+        self.selection_revision
+    }
+
+    pub fn projected_selection(&self) -> Option<ProjectedSelection> {
+        let range = self.term.selection.as_ref()?.to_range(&self.term)?;
+        let offset = i32::try_from(self.term.grid().display_offset()).ok()?;
+        let visible = |point: Point| -> Option<[u16; 2]> {
+            let line = point.line.0.checked_add(offset)?;
+            if line < 0 || usize::try_from(line).ok()? >= self.size.lines() {
+                return None;
+            }
+            Some([
+                u16::try_from(point.column.0).ok()?,
+                u16::try_from(line).ok()?,
+            ])
+        };
+        Some(ProjectedSelection {
+            start: visible(range.start)?,
+            end: visible(range.end)?,
+        })
+    }
+
+    pub fn scroll_display(&mut self, lines: i32) -> Result<(), TerminalError> {
+        self.term
+            .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(TerminalError::GenerationOverflow)?;
+        self.cached.get_mut().take();
+        Ok(())
+    }
+
+    fn history_point(&self, point: SelectionPoint) -> Result<Point, TerminalError> {
+        if usize::from(point.column) >= self.size.columns()
+            || usize::from(point.line) >= self.size.lines()
+        {
+            return Err(TerminalError::SelectionPoint);
+        }
+        let offset = i32::try_from(self.term.grid().display_offset())
+            .map_err(|_| TerminalError::SelectionPoint)?;
+        Ok(Point::new(
+            Line(i32::from(point.line) - offset),
+            Column(usize::from(point.column)),
+        ))
+    }
+
+    fn bump_selection_revision(&mut self) -> Result<(), TerminalError> {
+        self.selection_revision = self
+            .selection_revision
+            .checked_add(1)
+            .ok_or(TerminalError::GenerationOverflow)?;
+        Ok(())
     }
 
     fn audit_grid(&self) -> Result<(), TerminalError> {
@@ -259,6 +352,47 @@ impl TerminalCoreAdapter {
                 _ => {}
             }
         }
+    }
+}
+
+fn map_selection_kind(kind: SelectionKind) -> SelectionType {
+    match kind {
+        SelectionKind::Simple => SelectionType::Simple,
+        SelectionKind::Semantic => SelectionType::Semantic,
+        SelectionKind::Lines => SelectionType::Lines,
+    }
+}
+fn map_selection_side(side: SelectionSide) -> Side {
+    match side {
+        SelectionSide::Left => Side::Left,
+        SelectionSide::Right => Side::Right,
+    }
+}
+
+fn map_modes(mode: TermMode) -> TerminalModes {
+    TerminalModes {
+        alternate_screen: mode.contains(TermMode::ALT_SCREEN),
+        bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
+        application_cursor: mode.contains(TermMode::APP_CURSOR),
+        application_keypad: mode.contains(TermMode::APP_KEYPAD),
+        focus_reporting: mode.contains(TermMode::FOCUS_IN_OUT),
+        alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
+        mouse_protocol: if mode.contains(TermMode::MOUSE_MOTION) {
+            MouseProtocol::AnyEvent
+        } else if mode.contains(TermMode::MOUSE_DRAG) {
+            MouseProtocol::ButtonEvent
+        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            MouseProtocol::Normal
+        } else {
+            MouseProtocol::None
+        },
+        mouse_encoding: if mode.contains(TermMode::SGR_MOUSE) {
+            MouseEncoding::Sgr
+        } else if mode.contains(TermMode::UTF8_MOUSE) {
+            MouseEncoding::Utf8
+        } else {
+            MouseEncoding::Legacy
+        },
     }
 }
 
@@ -305,6 +439,8 @@ pub enum TerminalError {
     HyperlinkTooLarge,
     #[error("terminal hyperlink table is full")]
     TooManyHyperlinks,
+    #[error("selection point is outside the visible grid")]
+    SelectionPoint,
 }
 
 #[cfg(test)]
@@ -335,6 +471,29 @@ mod tests {
     }
 
     #[test]
+    fn selection_facade_extracts_text_and_projects_current_generation() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 2).unwrap(), 10).unwrap();
+        core.advance(b"hello").unwrap();
+        core.start_selection(
+            SelectionKind::Simple,
+            SelectionPoint { column: 0, line: 0 },
+            SelectionSide::Left,
+        )
+        .unwrap();
+        core.update_selection(SelectionPoint { column: 4, line: 0 }, SelectionSide::Right)
+            .unwrap();
+        assert_eq!(core.selected_text().as_deref(), Some("hello"));
+        assert_eq!(
+            core.projected_selection(),
+            Some(ProjectedSelection {
+                start: [0, 0],
+                end: [4, 0]
+            })
+        );
+        assert_eq!(core.selection_revision(), 2);
+    }
+
+    #[test]
     fn snapshot_preserves_indexed_color_wide_combining_cursor_and_modes() {
         let mut core = TerminalCoreAdapter::new(GridSize::new(12, 3).unwrap(), 10).unwrap();
         core.advance(b"e\xcc\x81\xe4\xb8\xad\x1b[38;5;196mX\x1b[2;4H\x1b[?1h\x1b[?1000h")
@@ -356,7 +515,10 @@ mod tests {
                 .any(|cell| cell.ch == 'X' && cell.foreground == TerminalColor::Indexed(196))
         );
         assert_eq!((snapshot.cursor.column, snapshot.cursor.line), (3, 1));
-        assert!(snapshot.modes.application_cursor && snapshot.modes.mouse_reporting);
+        assert!(
+            snapshot.modes.application_cursor
+                && snapshot.modes.mouse_protocol == MouseProtocol::Normal
+        );
     }
 
     #[test]

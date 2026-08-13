@@ -1,10 +1,16 @@
 mod core;
 mod debug_grid;
+mod input;
 mod snapshot;
 
 pub use core::{TerminalAction, TerminalCoreAdapter, TerminalDelta, TerminalError};
 pub use debug_grid::format_debug_grid;
+pub use input::{
+    ButtonState, InputError, Modifiers, MouseButton, TerminalKey, commit_text, encode_focus,
+    encode_key, encode_mouse, paste_transaction,
+};
 pub use snapshot::{
-    CellFlags, CellWidth, CursorSnapshot, FrameSnapshot, GridSize, SnapshotCell, SnapshotHyperlink,
-    TerminalColor, TerminalModes,
+    CellFlags, CellWidth, CursorSnapshot, FrameSnapshot, GridSize, MouseEncoding, MouseProtocol,
+    ProjectedSelection, SelectionKind, SelectionPoint, SelectionSide, SnapshotCell,
+    SnapshotHyperlink, TerminalColor, TerminalModes,
 };
