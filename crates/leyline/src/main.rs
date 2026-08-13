@@ -35,6 +35,9 @@ impl ProcessIo for Stdio {
     ) -> Result<(), leyline::logging::LoggingError> {
         leyline::logging::initialize(verbosity)
     }
+    fn graphical_session(&self) -> bool {
+        true
+    }
 }
 
 fn main() -> ExitCode {

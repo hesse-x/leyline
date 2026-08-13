@@ -1,8 +1,8 @@
 # Leyline
 
-Leyline is a native Wayland terminal written in Rust. Stage 1 provides the application skeleton:
-CLI parsing, validated XDG/TOML configuration, structured diagnostics, and bounded cross-thread event
-ingress. It intentionally does not open a window, connect a PTY, or start a shell yet.
+Leyline is a native Wayland terminal written in Rust. Stage 2 opens a real Wayland window and uses
+Vulkan 1.3 dynamic rendering and synchronization2 to present a demand-driven rectangle test scene.
+CLI/configuration and bounded cross-thread ingress are active; PTY, terminal text, and input are not.
 
 ## Ubuntu 24.04 dependencies
 
@@ -27,7 +27,7 @@ cargo run --locked --bin leyline
 cargo run --locked --bin leyline -- -e program arg1 arg2
 ```
 
-`-e` preserves program arguments exactly and does not invoke a shell. During stage 1 the request is
+`-e` preserves program arguments exactly and does not invoke a shell. During stage 2 the request is
 validated and retained by the application coordinator, but the program is not started. Use `-v`,
 `-vv`, or `-vvv` for progressively more detailed stderr logging.
 
@@ -90,7 +90,9 @@ padding, and scrollback are bounded to prevent accidental resource exhaustion.
 
 ## Current limitations
 
-The stage 1 executable only initializes and shuts down the application skeleton. Window creation,
-Vulkan rendering, PTY sessions, terminal emulation, text rendering, clipboard, and input handling
-arrive in later stages. The final pure Wayland/Vulkan client will not inherit an accessibility tree
-from a GUI toolkit; screen-reader integration is outside the v0.1 commitment.
+The stage 2 executable renders only a fixed diagnostic scene. PTY sessions, terminal emulation,
+text rendering, clipboard, and input handling arrive in later stages. GNOME client-side decoration
+uses libdecor; compositors providing xdg-decoration use server-side decoration. Fractional scale is
+enabled only when fractional-scale-v1 and viewporter are both available, with integer buffer-scale
+as the fallback. The final pure Wayland/Vulkan client will not inherit an accessibility tree from a
+GUI toolkit; screen-reader integration is outside the v0.1 commitment.

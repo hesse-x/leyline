@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+leyline-gfx.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true
 serde.workspace = true
@@ -19,4 +20,3 @@ tempfile = "3.21.0"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-

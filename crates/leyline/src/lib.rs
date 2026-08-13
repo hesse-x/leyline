@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod diagnostics;
 pub mod logging;
+pub mod ui_runtime;
 
 use std::{ffi::OsString, sync::Arc};
 
@@ -26,6 +27,10 @@ pub trait ProcessIo {
     /// # Errors
     /// Returns [`logging::LoggingError`] when process logging cannot be initialized.
     fn initialize_logging(&mut self, verbosity: Verbosity) -> Result<(), logging::LoggingError>;
+    /// Selects the real desktop loop. Test/process adapters remain headless by default.
+    fn graphical_session(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -100,7 +105,19 @@ fn startup(
     }
 
     let mut app = AppBuilder::new(Arc::new(loaded.effective), cli.launch_request()).build();
-    let _runtime = AppRuntimeBuilder::new(Arc::new(CountingWake::default()))
+    let event_wake = io
+        .graphical_session()
+        .then(leyline_gfx::EventWake::new)
+        .transpose()
+        .map_err(|source| StartupError {
+            source: StartupErrorSource::Graphics(source.into()),
+            verbose: cli.verbosity != Verbosity::Warn,
+        })?;
+    let wake_backend: Arc<dyn app::runtime::WakeBackend> = event_wake.as_ref().map_or_else(
+        || Arc::new(CountingWake::default()) as Arc<dyn app::runtime::WakeBackend>,
+        |wake| Arc::new(wake.clone()) as Arc<dyn app::runtime::WakeBackend>,
+    );
+    let runtime = AppRuntimeBuilder::new(wake_backend)
         .build()
         .map_err(|source| StartupError {
             source: StartupErrorSource::Runtime(source),
@@ -110,6 +127,22 @@ fn startup(
         source: StartupErrorSource::App(source),
         verbose: cli.verbosity != Verbosity::Warn,
     })?;
+    if io.graphical_session() {
+        return ui_runtime::UiRuntime::new(
+            app,
+            runtime,
+            event_wake.expect("graphical wake exists"),
+        )
+        .map_err(|source| StartupError {
+            source: StartupErrorSource::Graphics(source),
+            verbose: cli.verbosity != Verbosity::Warn,
+        })?
+        .run()
+        .map_err(|source| StartupError {
+            source: StartupErrorSource::Graphics(source),
+            verbose: cli.verbosity != Verbosity::Warn,
+        });
+    }
     tracing::info!(
         category = "application",
         module = "startup",
@@ -145,12 +178,15 @@ enum StartupErrorSource {
     App(#[from] app::AppError),
     #[error(transparent)]
     Runtime(#[from] app::runtime::RuntimeBuildError),
+    #[error(transparent)]
+    Graphics(#[from] ui_runtime::UiRuntimeError),
 }
 
 impl ClassifiedError for StartupError {
     fn category(&self) -> ErrorCategory {
         match &self.source {
             StartupErrorSource::Config(error) => error.category(),
+            StartupErrorSource::Graphics(error) => error.category(),
             StartupErrorSource::Logging(_)
             | StartupErrorSource::App(_)
             | StartupErrorSource::Runtime(_) => ErrorCategory::Internal,
