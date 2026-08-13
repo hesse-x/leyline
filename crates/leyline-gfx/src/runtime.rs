@@ -3,6 +3,7 @@ use std::{os::fd::BorrowedFd, time::Duration};
 use crate::{
     GfxCommand, LinearColor, LogicalSize, PlatformEvent, RectangleInstance, RenderOutcome,
     RenderScene, Scale120,
+    atlas::AtlasManager,
     model::SceneData,
     vulkan::{RenderStatus, VulkanRenderer},
     wayland::WaylandWindow,
@@ -66,6 +67,8 @@ pub struct GfxRuntime {
     logical_size: LogicalSize,
     scale: Scale120,
     scene: SceneData,
+    atlas: AtlasManager,
+    glyphs: Vec<crate::GlyphInstance>,
     dirty: bool,
     frame_ready: bool,
     swapchain_state: SwapchainState,
@@ -118,7 +121,13 @@ impl GfxRuntime {
             scene: SceneData {
                 clear: options.clear,
                 rectangles: test_rectangles(pixels.width, pixels.height),
+                glyphs: Vec::new(),
+                glyph_assets: Vec::new(),
+                source_generation: 0,
+                font_generation: 0,
             },
+            atlas: AtlasManager::new(),
+            glyphs: Vec::new(),
             dirty: true,
             frame_ready: true,
             swapchain_state: SwapchainState::Ready,
@@ -188,6 +197,14 @@ impl GfxRuntime {
             }
             GfxCommand::SetDirty => self.dirty = true,
             GfxCommand::SetScene(scene) => {
+                let prepared = self
+                    .atlas
+                    .prepare(&scene.glyphs, &scene.glyph_assets)
+                    .map_err(|error| GfxError::Internal(error.to_string()))?;
+                self.renderer
+                    .upload_glyphs(&prepared.uploads)
+                    .map_err(GfxError::Renderer)?;
+                self.glyphs = prepared.instances;
                 self.scene = scene;
                 self.dirty = true;
             }
@@ -220,13 +237,13 @@ impl GfxRuntime {
             if !self.renderer.recreate(target).map_err(GfxError::Renderer)? {
                 return Ok(RenderOutcome::Deferred);
             }
-            self.scene.rectangles = test_rectangles(target.width, target.height);
             self.swapchain_state = SwapchainState::Ready;
         }
         let scene = RenderScene {
             clear: self.scene.clear,
             viewport: target,
             rectangles: &self.scene.rectangles,
+            glyphs: &self.glyphs,
         };
         let recreate_after_present =
             match self.renderer.render(&scene).map_err(GfxError::Renderer)? {
@@ -276,6 +293,16 @@ impl GfxRuntime {
     #[must_use]
     pub const fn close_requested(&self) -> bool {
         self.close_requested
+    }
+
+    #[must_use]
+    pub const fn logical_size(&self) -> LogicalSize {
+        self.logical_size
+    }
+
+    #[must_use]
+    pub const fn scale(&self) -> Scale120 {
+        self.scale
     }
 
     #[must_use]

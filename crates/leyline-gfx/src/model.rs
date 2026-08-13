@@ -1,3 +1,5 @@
+use leyline_text::{GlyphAsset, GlyphKey};
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LogicalSize {
     pub width: u32,
@@ -109,12 +111,35 @@ pub struct RectangleInstance {
 pub struct SceneData {
     pub clear: LinearColor,
     pub rectangles: Vec<RectangleInstance>,
+    pub glyphs: Vec<GlyphPlacement>,
+    pub glyph_assets: Vec<GlyphAsset>,
+    pub source_generation: u64,
+    pub font_generation: u64,
 }
 
 pub struct RenderScene<'a> {
     pub clear: LinearColor,
     pub viewport: PixelSize,
     pub rectangles: &'a [RectangleInstance],
+    pub glyphs: &'a [GlyphInstance],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlyphPlacement {
+    pub key: GlyphKey,
+    pub origin_px: [i32; 2],
+    pub clip_px: [u32; 4],
+    pub color: LinearColor,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlyphInstance {
+    pub origin_px: [f32; 2],
+    pub size_px: [f32; 2],
+    pub uv_min: [f32; 2],
+    pub uv_max: [f32; 2],
+    pub color: LinearColor,
+    pub atlas_page: u16,
 }
 
 pub enum GfxCommand {

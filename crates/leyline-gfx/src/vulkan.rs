@@ -19,12 +19,18 @@ use gpu_allocator::{
     vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc},
 };
 
+use crate::atlas::{ATLAS_PAGE_SIZE, AtlasRect, MAX_ATLAS_PAGES};
 use crate::wayland::WaylandWindow;
-use crate::{GfxInitError, LinearColor, PixelSize, RectangleInstance, RenderScene, select};
+use crate::{
+    GfxInitError, GlyphInstance, LinearColor, PixelSize, RectangleInstance, RenderScene, select,
+};
+use leyline_text::GlyphAsset;
 
 const FRAME_SLOTS: usize = 2;
 const FENCE_TIMEOUT: Duration = Duration::from_secs(2);
-const RECTANGLES_PER_SLOT: usize = 4096;
+const RECTANGLES_PER_SLOT: usize = 524_304;
+const GLYPHS_PER_SLOT: usize = 524_288;
+const GLYPH_STAGING_PER_SLOT: usize = 32 * 1024 * 1024;
 const MAX_RETIRED_GENERATIONS: usize = 3;
 
 #[repr(C)]
@@ -38,6 +44,35 @@ struct GpuRectangle {
 struct InstanceBuffer {
     buffer: vk::Buffer,
     allocation: Allocation,
+}
+
+struct AtlasPage {
+    image: vk::Image,
+    view: vk::ImageView,
+    allocation: Allocation,
+    initialized: bool,
+}
+struct GlyphResources {
+    instances: InstanceBuffer,
+    staging: InstanceBuffer,
+    pages: Vec<AtlasPage>,
+    sampler: vk::Sampler,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_layout: vk::DescriptorSetLayout,
+    descriptors: Vec<vk::DescriptorSet>,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    pending: Vec<(AtlasRect, GlyphAsset)>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GpuGlyph {
+    origin_px: [f32; 2],
+    size_px: [f32; 2],
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
+    color: [f32; 4],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +115,7 @@ pub(crate) struct VulkanRenderer {
     instances: Option<InstanceBuffer>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    glyph: Option<GlyphResources>,
     queue: vk::Queue,
     queue_family: u32,
     swapchain_loader: ash::khr::swapchain::Device,
@@ -184,6 +220,7 @@ impl VulkanRenderer {
             instances: None,
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
+            glyph: None,
             queue,
             queue_family,
             swapchain_loader,
@@ -220,7 +257,35 @@ impl VulkanRenderer {
                 "initial swapchain creation was unexpectedly deferred".into(),
             ));
         }
+        renderer.glyph = Some(
+            renderer
+                .create_glyph_resources()
+                .map_err(GfxInitError::Device)?,
+        );
         Ok(renderer)
+    }
+
+    pub(crate) fn upload_glyphs(
+        &mut self,
+        uploads: &[(AtlasRect, GlyphAsset)],
+    ) -> Result<(), String> {
+        let bytes = uploads
+            .iter()
+            .try_fold(0usize, |total, (_, asset)| {
+                total.checked_add(asset.bitmap.coverage.len())
+            })
+            .ok_or("glyph upload size overflow")?;
+        if bytes > GLYPH_STAGING_PER_SLOT {
+            return Err(format!(
+                "glyph upload {bytes} exceeds bounded staging partition"
+            ));
+        }
+        self.glyph
+            .as_mut()
+            .expect("glyph resources")
+            .pending
+            .extend_from_slice(uploads);
+        Ok(())
     }
 
     fn create_frames(&self) -> Result<Vec<FrameSlot>, String> {
@@ -303,6 +368,339 @@ impl VulkanRenderer {
         }
         .map_err(vk_error("bind rectangle instance buffer"))?;
         Ok(InstanceBuffer { buffer, allocation })
+    }
+
+    fn create_buffer(
+        &mut self,
+        bytes: u64,
+        usage: vk::BufferUsageFlags,
+        name: &'static str,
+    ) -> Result<InstanceBuffer, String> {
+        let buffer = unsafe {
+            self.device.create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(bytes)
+                    .usage(usage)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                None,
+            )
+        }
+        .map_err(vk_error("create buffer"))?;
+        let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let allocation = self
+            .allocator
+            .as_mut()
+            .expect("allocator initialized")
+            .allocate(&AllocationCreateDesc {
+                name,
+                requirements,
+                location: MemoryLocation::CpuToGpu,
+                linear: true,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            })
+            .map_err(|error| format!("allocate {name}: {error}"))?;
+        unsafe {
+            self.device
+                .bind_buffer_memory(buffer, allocation.memory(), allocation.offset())
+        }
+        .map_err(vk_error("bind buffer memory"))?;
+        Ok(InstanceBuffer { buffer, allocation })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn create_glyph_resources(&mut self) -> Result<GlyphResources, String> {
+        let instances = self.create_buffer(
+            (FRAME_SLOTS * GLYPHS_PER_SLOT * size_of::<GpuGlyph>()) as u64,
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+            "glyph instances",
+        )?;
+        let staging = self.create_buffer(
+            (FRAME_SLOTS * GLYPH_STAGING_PER_SLOT) as u64,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            "glyph staging",
+        )?;
+        let properties = unsafe { self.instance.get_physical_device_properties(self.physical) };
+        if properties.limits.max_image_dimension2_d < u32::from(ATLAS_PAGE_SIZE) {
+            return Err("device cannot create 2048x2048 glyph atlas".into());
+        }
+        let mut pages = Vec::new();
+        for _ in 0..MAX_ATLAS_PAGES {
+            let image = unsafe {
+                self.device.create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .format(vk::Format::R8_UNORM)
+                        .extent(vk::Extent3D {
+                            width: u32::from(ATLAS_PAGE_SIZE),
+                            height: u32::from(ATLAS_PAGE_SIZE),
+                            depth: 1,
+                        })
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .tiling(vk::ImageTiling::OPTIMAL)
+                        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                        .initial_layout(vk::ImageLayout::UNDEFINED),
+                    None,
+                )
+            }
+            .map_err(vk_error("create glyph atlas image"))?;
+            let requirements = unsafe { self.device.get_image_memory_requirements(image) };
+            let allocation = self
+                .allocator
+                .as_mut()
+                .expect("allocator initialized")
+                .allocate(&AllocationCreateDesc {
+                    name: "glyph atlas",
+                    requirements,
+                    location: MemoryLocation::GpuOnly,
+                    linear: false,
+                    allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+                })
+                .map_err(|error| format!("allocate glyph atlas: {error}"))?;
+            unsafe {
+                self.device
+                    .bind_image_memory(image, allocation.memory(), allocation.offset())
+            }
+            .map_err(vk_error("bind glyph atlas image"))?;
+            let view = unsafe {
+                self.device.create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(image)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::R8_UNORM)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::COLOR,
+                            level_count: 1,
+                            layer_count: 1,
+                            ..Default::default()
+                        }),
+                    None,
+                )
+            }
+            .map_err(vk_error("create glyph atlas view"))?;
+            pages.push(AtlasPage {
+                image,
+                view,
+                allocation,
+                initialized: false,
+            });
+        }
+        let sampler = unsafe {
+            self.device.create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                None,
+            )
+        }
+        .map_err(vk_error("create glyph sampler"))?;
+        let bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        let descriptor_layout = unsafe {
+            self.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings),
+                None,
+            )
+        }
+        .map_err(vk_error("create glyph descriptor layout"))?;
+        let sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER,
+            descriptor_count: MAX_ATLAS_PAGES as u32,
+        }];
+        let descriptor_pool = unsafe {
+            self.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .max_sets(MAX_ATLAS_PAGES as u32)
+                    .pool_sizes(&sizes),
+                None,
+            )
+        }
+        .map_err(vk_error("create glyph descriptor pool"))?;
+        let layouts = vec![descriptor_layout; MAX_ATLAS_PAGES];
+        let descriptors = unsafe {
+            self.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&layouts),
+            )
+        }
+        .map_err(vk_error("allocate glyph descriptors"))?;
+        for (descriptor, page) in descriptors.iter().zip(&pages) {
+            let image = [vk::DescriptorImageInfo::default()
+                .sampler(sampler)
+                .image_view(page.view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write = [vk::WriteDescriptorSet::default()
+                .dst_set(*descriptor)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image)];
+            unsafe { self.device.update_descriptor_sets(&write, &[]) };
+        }
+        let (pipeline_layout, pipeline) =
+            self.create_glyph_pipeline(self.format, descriptor_layout)?;
+        Ok(GlyphResources {
+            instances,
+            staging,
+            pages,
+            sampler,
+            descriptor_pool,
+            descriptor_layout,
+            descriptors,
+            pipeline_layout,
+            pipeline,
+            pending: Vec::new(),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn create_glyph_pipeline(
+        &self,
+        format: vk::Format,
+        descriptor_layout: vk::DescriptorSetLayout,
+    ) -> Result<(vk::PipelineLayout, vk::Pipeline), String> {
+        let vertex_code = ash::util::read_spv(&mut Cursor::new(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/glyph.vert"
+        ))))
+        .map_err(|error| format!("read glyph vertex shader: {error}"))?;
+        let fragment_code = ash::util::read_spv(&mut Cursor::new(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/glyph.frag"
+        ))))
+        .map_err(|error| format!("read glyph fragment shader: {error}"))?;
+        let vertex = unsafe {
+            self.device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&vertex_code),
+                None,
+            )
+        }
+        .map_err(vk_error("create glyph vertex shader"))?;
+        let fragment = unsafe {
+            self.device.create_shader_module(
+                &vk::ShaderModuleCreateInfo::default().code(&fragment_code),
+                None,
+            )
+        }
+        .map_err(vk_error("create glyph fragment shader"))?;
+        let push = [vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .size(8)];
+        let layouts = [descriptor_layout];
+        let layout = unsafe {
+            self.device.create_pipeline_layout(
+                &vk::PipelineLayoutCreateInfo::default()
+                    .set_layouts(&layouts)
+                    .push_constant_ranges(&push),
+                None,
+            )
+        }
+        .map_err(vk_error("create glyph pipeline layout"))?;
+        let entry = c"main";
+        let stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vertex)
+                .name(entry),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(fragment)
+                .name(entry),
+        ];
+        let binding = [vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: size_of::<GpuGlyph>() as u32,
+            input_rate: vk::VertexInputRate::INSTANCE,
+        }];
+        let attributes = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 8,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 16,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 3,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 24,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 4,
+                binding: 0,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 32,
+            },
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&binding)
+            .vertex_attribute_descriptions(&attributes);
+        let assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let raster = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::ONE)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD)
+            .color_write_mask(vk::ColorComponentFlags::RGBA)];
+        let blend = vk::PipelineColorBlendStateCreateInfo::default().attachments(&attachments);
+        let dynamics = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamics);
+        let mut rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(std::slice::from_ref(&format));
+        let info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&assembly)
+            .viewport_state(&viewport)
+            .rasterization_state(&raster)
+            .multisample_state(&multisample)
+            .color_blend_state(&blend)
+            .dynamic_state(&dynamic)
+            .layout(layout)
+            .push_next(&mut rendering);
+        let pipeline = unsafe {
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
+        }
+        .map_err(|(_, error)| format!("create glyph pipeline: {error:?}"))?[0];
+        unsafe {
+            self.device.destroy_shader_module(fragment, None);
+            self.device.destroy_shader_module(vertex, None);
+        }
+        Ok((layout, pipeline))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -633,6 +1031,7 @@ impl VulkanRenderer {
                 .map_err(vk_error("reset command pool"))?;
         }
         self.upload_rectangles(acquired.slot, scene.rectangles)?;
+        self.upload_glyph_instances(acquired.slot, scene.glyphs)?;
         self.record(slot_command, acquired.slot, image_index as usize, scene)?;
         let wait = [vk::SemaphoreSubmitInfo::default()
             .semaphore(slot_available)
@@ -673,8 +1072,9 @@ impl VulkanRenderer {
         Ok(RenderStatus::Rendered)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn record(
-        &self,
+        &mut self,
         command: vk::CommandBuffer,
         slot: usize,
         image_index: usize,
@@ -688,6 +1088,7 @@ impl VulkanRenderer {
             )
         }
         .map_err(vk_error("begin command buffer"))?;
+        self.upload_glyph_data(slot, command)?;
         transition(
             &self.device,
             command,
@@ -748,6 +1149,47 @@ impl VulkanRenderer {
             );
             self.device
                 .cmd_draw(command, 6, scene.rectangles.len() as u32, 0, 0);
+            if !scene.glyphs.is_empty() {
+                let glyph = self.glyph.as_ref().expect("glyph resources");
+                self.device.cmd_bind_pipeline(
+                    command,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    glyph.pipeline,
+                );
+                let offset = (slot * GLYPHS_PER_SLOT * size_of::<GpuGlyph>()) as u64;
+                self.device.cmd_bind_vertex_buffers(
+                    command,
+                    0,
+                    &[glyph.instances.buffer],
+                    &[offset],
+                );
+                self.device.cmd_push_constants(
+                    command,
+                    glyph.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    as_bytes(&viewport_size),
+                );
+                let mut start = 0;
+                while start < scene.glyphs.len() {
+                    let page = scene.glyphs[start].atlas_page;
+                    let mut end = start + 1;
+                    while end < scene.glyphs.len() && scene.glyphs[end].atlas_page == page {
+                        end += 1;
+                    }
+                    self.device.cmd_bind_descriptor_sets(
+                        command,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        glyph.pipeline_layout,
+                        0,
+                        &[glyph.descriptors[usize::from(page)]],
+                        &[],
+                    );
+                    self.device
+                        .cmd_draw(command, 6, (end - start) as u32, 0, start as u32);
+                    start = end;
+                }
+            }
         }
         unsafe {
             self.device.cmd_end_rendering(command);
@@ -764,6 +1206,114 @@ impl VulkanRenderer {
             vk::AccessFlags2::empty(),
         );
         unsafe { self.device.end_command_buffer(command) }.map_err(vk_error("end command buffer"))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn upload_glyph_data(&mut self, slot: usize, command: vk::CommandBuffer) -> Result<(), String> {
+        let glyphs = self.glyph.as_mut().expect("glyph resources");
+        let mut staging_offset = slot * GLYPH_STAGING_PER_SLOT;
+        let start_offset = staging_offset;
+        let mapped = glyphs
+            .staging
+            .allocation
+            .mapped_slice_mut()
+            .ok_or("glyph staging memory is not mapped")?;
+        let mut copies = Vec::new();
+        for (rect, asset) in glyphs.pending.drain(..) {
+            let bytes = asset.bitmap.coverage.as_ref();
+            let end = staging_offset
+                .checked_add(bytes.len())
+                .ok_or("glyph staging offset overflow")?;
+            if end > start_offset + GLYPH_STAGING_PER_SLOT {
+                return Err("glyph uploads exceed staging partition".into());
+            }
+            mapped[staging_offset..end].copy_from_slice(bytes);
+            copies.push((rect, (staging_offset - start_offset) as u64));
+            staging_offset = end;
+        }
+        for (rect, offset) in copies {
+            let page = &mut glyphs.pages[usize::from(rect.page)];
+            let was_initialized = page.initialized;
+            transition(
+                &self.device,
+                command,
+                page.image,
+                if was_initialized {
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                } else {
+                    vk::ImageLayout::UNDEFINED
+                },
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                if was_initialized {
+                    vk::PipelineStageFlags2::FRAGMENT_SHADER
+                } else {
+                    vk::PipelineStageFlags2::NONE
+                },
+                vk::PipelineStageFlags2::COPY,
+                if was_initialized {
+                    vk::AccessFlags2::SHADER_SAMPLED_READ
+                } else {
+                    vk::AccessFlags2::empty()
+                },
+                vk::AccessFlags2::TRANSFER_WRITE,
+            );
+            if !was_initialized {
+                let range = vk::ImageSubresourceRange {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    level_count: 1,
+                    layer_count: 1,
+                    ..Default::default()
+                };
+                unsafe {
+                    self.device.cmd_clear_color_image(
+                        command,
+                        page.image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &vk::ClearColorValue { uint32: [0; 4] },
+                        &[range],
+                    );
+                }
+            }
+            let region = vk::BufferImageCopy::default()
+                .buffer_offset((start_offset as u64) + offset)
+                .image_subresource(vk::ImageSubresourceLayers {
+                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                    layer_count: 1,
+                    ..Default::default()
+                })
+                .image_offset(vk::Offset3D {
+                    x: i32::from(rect.x),
+                    y: i32::from(rect.y),
+                    z: 0,
+                })
+                .image_extent(vk::Extent3D {
+                    width: u32::from(rect.width),
+                    height: u32::from(rect.height),
+                    depth: 1,
+                });
+            unsafe {
+                self.device.cmd_copy_buffer_to_image(
+                    command,
+                    glyphs.staging.buffer,
+                    page.image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    &[region],
+                );
+            }
+            transition(
+                &self.device,
+                command,
+                page.image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                vk::PipelineStageFlags2::COPY,
+                vk::PipelineStageFlags2::FRAGMENT_SHADER,
+                vk::AccessFlags2::TRANSFER_WRITE,
+                vk::AccessFlags2::SHADER_SAMPLED_READ,
+            );
+            page.initialized = true;
+        }
+        Ok(())
     }
 
     fn upload_rectangles(
@@ -795,6 +1345,43 @@ impl VulkanRenderer {
             };
             let start = offset + index * size_of::<GpuRectangle>();
             mapped[start..start + size_of::<GpuRectangle>()].copy_from_slice(as_bytes(&gpu));
+        }
+        Ok(())
+    }
+
+    fn upload_glyph_instances(
+        &mut self,
+        slot: usize,
+        glyphs: &[GlyphInstance],
+    ) -> Result<(), String> {
+        if glyphs.len() > GLYPHS_PER_SLOT {
+            return Err(format!(
+                "glyph count {} exceeds per-frame capacity {GLYPHS_PER_SLOT}",
+                glyphs.len()
+            ));
+        }
+        let resources = self.glyph.as_mut().expect("glyph resources");
+        let offset = slot * GLYPHS_PER_SLOT * size_of::<GpuGlyph>();
+        let mapped = resources
+            .instances
+            .allocation
+            .mapped_slice_mut()
+            .ok_or("glyph instance memory is not mapped")?;
+        for (index, glyph) in glyphs.iter().enumerate() {
+            let gpu = GpuGlyph {
+                origin_px: glyph.origin_px,
+                size_px: glyph.size_px,
+                uv_min: glyph.uv_min,
+                uv_max: glyph.uv_max,
+                color: [
+                    glyph.color.red,
+                    glyph.color.green,
+                    glyph.color.blue,
+                    glyph.color.alpha,
+                ],
+            };
+            let start = offset + index * size_of::<GpuGlyph>();
+            mapped[start..start + size_of::<GpuGlyph>()].copy_from_slice(as_bytes(&gpu));
         }
         Ok(())
     }
@@ -857,6 +1444,31 @@ impl Drop for VulkanRenderer {
             };
         }
         self.destroy_swapchain_views();
+        if let Some(glyph) = self.glyph.take() {
+            unsafe {
+                self.device.destroy_pipeline(glyph.pipeline, None);
+                self.device
+                    .destroy_pipeline_layout(glyph.pipeline_layout, None);
+                self.device
+                    .destroy_descriptor_pool(glyph.descriptor_pool, None);
+                self.device
+                    .destroy_descriptor_set_layout(glyph.descriptor_layout, None);
+                self.device.destroy_sampler(glyph.sampler, None);
+                self.device.destroy_buffer(glyph.instances.buffer, None);
+                self.device.destroy_buffer(glyph.staging.buffer, None);
+                for page in &glyph.pages {
+                    self.device.destroy_image_view(page.view, None);
+                    self.device.destroy_image(page.image, None);
+                }
+            }
+            if let Some(allocator) = self.allocator.as_mut() {
+                let _ = allocator.free(glyph.instances.allocation);
+                let _ = allocator.free(glyph.staging.allocation);
+                for page in glyph.pages {
+                    let _ = allocator.free(page.allocation);
+                }
+            }
+        }
         self.destroy_pipeline();
         if let Some(instances) = self.instances.take() {
             unsafe { self.device.destroy_buffer(instances.buffer, None) };

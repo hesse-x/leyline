@@ -26,8 +26,10 @@ pub enum PtyEvent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ChildExit {
-    pub status: Option<i32>,
+pub enum ChildExit {
+    Code(i32),
+    Signaled { signal: i32, core_dumped: bool },
+    Other { raw_status: i32 },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

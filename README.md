@@ -1,8 +1,9 @@
 # Leyline
 
-Leyline is a native Wayland terminal written in Rust. Stage 2 opens a real Wayland window and uses
-Vulkan 1.3 dynamic rendering and synchronization2 to present a demand-driven rectangle test scene.
-CLI/configuration and bounded cross-thread ingress are active; PTY, terminal text, and input are not.
+Leyline is a native Wayland terminal written in Rust. The current implementation opens a real
+Wayland/Vulkan window, starts one shell or `-e` command in a real PTY, parses terminal output into
+an immutable renderer-independent snapshot, and renders that snapshot through Fontconfig,
+FreeType, HarfBuzz, and a bounded Vulkan glyph atlas.
 
 ## Ubuntu 24.04 dependencies
 
@@ -27,9 +28,10 @@ cargo run --locked --bin leyline
 cargo run --locked --bin leyline -- -e program arg1 arg2
 ```
 
-`-e` preserves program arguments exactly and does not invoke a shell. During stage 2 the request is
-validated and retained by the application coordinator, but the program is not started. Use `-v`,
-`-vv`, or `-vvv` for progressively more detailed stderr logging.
+Without `-e`, Leyline resolves the effective user's account shell and starts it interactively as a
+non-login shell. `-e` preserves program arguments exactly and does not invoke a shell. PTY children
+inherit the startup environment and working directory with `TERM=xterm-256color` and
+`COLORTERM=truecolor`. Use `-v`, `-vv`, or `-vvv` for progressively more detailed stderr logging.
 
 The stage 0 hardware and integration probes remain available:
 
@@ -88,10 +90,24 @@ action = "Copy"
 Unknown configuration fields produce warnings. Colors must be `#RRGGBB` or `#RRGGBBAA`; font size,
 padding, and scrollback are bounded to prevent accidental resource exhaustion.
 
+`behavior.hold_after_exit = false` closes the window only after both the child status and PTY EOF
+have been observed, so trailing output is parsed first. Setting it to `true` retains the final
+terminal snapshot while releasing the PTY worker and file descriptor.
+Closing a running session targets the child through a Linux pidfd, requests `SIGTERM`, and escalates
+after a short grace period, so an uncooperative child cannot indefinitely block window shutdown.
+
 ## Current limitations
 
-The stage 2 executable renders only a fixed diagnostic scene. PTY sessions, terminal emulation,
-text rendering, clipboard, and input handling arrive in later stages. GNOME client-side decoration
+Text rendering uses system Fontconfig fallback, grayscale FreeType coverage, and a four-page
+`2048x2048 R8_UNORM` atlas. Color emoji are not supported; an outline fallback is used when one is
+available. Ligatures are disabled by default and always remain constrained to terminal cell spans.
+Strong RTL runs are shaped, but v0.1 does not perform full Unicode bidi visual reordering: cursor
+and selection coordinates remain in logical cell order.
+
+Keyboard, mouse, IME, interactive selection, clipboard, and hyperlink interaction arrive in later
+stages. The renderer already accepts a generation-bound selection overlay for integration testing.
+OSC 52 clipboard requests are deliberately rejected and OSC 8 links remain inert metadata.
+GNOME client-side decoration
 uses libdecor; compositors providing xdg-decoration use server-side decoration. Fractional scale is
 enabled only when fractional-scale-v1 and viewporter are both available, with integer buffer-scale
 as the fallback. The final pure Wayland/Vulkan client will not inherit an accessibility tree from a

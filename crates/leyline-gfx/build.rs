@@ -5,6 +5,8 @@ fn main() {
     for (file, kind) in [
         ("shaders/rectangle.vert", shaderc::ShaderKind::Vertex),
         ("shaders/rectangle.frag", shaderc::ShaderKind::Fragment),
+        ("shaders/glyph.vert", shaderc::ShaderKind::Vertex),
+        ("shaders/glyph.frag", shaderc::ShaderKind::Fragment),
     ] {
         println!("cargo::rerun-if-changed={file}");
         let source = fs::read_to_string(file).unwrap_or_else(|error| {

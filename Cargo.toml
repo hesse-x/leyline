@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/leyline", "crates/leyline-gfx", "crates/leyline-probe"]
+members = ["crates/leyline", "crates/leyline-gfx", "crates/leyline-probe", "crates/leyline-pty", "crates/leyline-text"]
 resolver = "2"
 
 [workspace.package]
@@ -24,6 +24,9 @@ thiserror = "2.0.16"
 toml = { version = "0.9.5", default-features = false, features = ["parse", "serde"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["ansi", "fmt", "registry"] }
-rustix = { version = "1.1.4", features = ["event", "fs"] }
+rustix = { version = "1.1.4", features = ["event", "fs", "time"] }
+libc = "0.2.175"
+leyline-pty = { version = "0.1.0", path = "crates/leyline-pty" }
 leyline-gfx = { version = "0.1.0", path = "crates/leyline-gfx" }
+leyline-text = { version = "0.1.0", path = "crates/leyline-text" }
 shaderc = "0.10.1"

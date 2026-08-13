@@ -7,6 +7,9 @@ rust-version.workspace = true
 
 [dependencies]
 leyline-gfx.workspace = true
+leyline-pty.workspace = true
+leyline-text.workspace = true
+alacritty_terminal.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true
 serde.workspace = true

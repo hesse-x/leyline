@@ -438,9 +438,15 @@ mod tests {
     fn pty_completion_requires_exit_and_read_close_in_any_order() {
         use crate::app::event::ChildExit;
         let mut state = PtyCompletion::default();
-        state.observe_control(&ControlEvent::PtyExited(ChildExit { status: Some(0) }));
+        state.observe_control(&ControlEvent::PtyExited(ChildExit::Code(0)));
         assert!(!state.final_output_complete());
         state.observe_bulk(&BulkEvent::PtyReadClosed);
         assert!(state.final_output_complete());
+
+        let mut reverse = PtyCompletion::default();
+        reverse.observe_bulk(&BulkEvent::PtyReadClosed);
+        assert!(!reverse.final_output_complete());
+        reverse.observe_control(&ControlEvent::PtyExited(ChildExit::Code(0)));
+        assert!(reverse.final_output_complete());
     }
 }

@@ -16,6 +16,7 @@ rustix.workspace = true
 smithay-client-toolkit.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+leyline-text.workspace = true
 wayland-client.workspace = true
 wayland-protocols.workspace = true
 

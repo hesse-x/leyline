@@ -17,6 +17,6 @@ const vec2 QUAD[6] = vec2[](
 void main() {
     vec2 pixel = origin_px + QUAD[gl_VertexIndex] * size_px;
     vec2 clip = pixel / viewport.size_px * 2.0 - 1.0;
-    gl_Position = vec4(clip.x, -clip.y, 0.0, 1.0);
+    gl_Position = vec4(clip, 0.0, 1.0);
     rectangle_color = color;
 }

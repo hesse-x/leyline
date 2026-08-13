@@ -4,7 +4,11 @@ pub mod app;
 pub mod cli;
 pub mod config;
 pub mod diagnostics;
+pub mod frame_composer;
+pub mod layout;
 pub mod logging;
+pub mod session;
+pub mod terminal;
 pub mod ui_runtime;
 
 use std::{ffi::OsString, sync::Arc};

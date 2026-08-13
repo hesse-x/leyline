@@ -47,7 +47,7 @@ pub enum ParseOutcome {
 pub fn parse(args: impl IntoIterator<Item = OsString>) -> ParseOutcome {
     let command = Command::new("leyline")
         .version(env!("CARGO_PKG_VERSION"))
-        .about("A fast native Wayland terminal (stage 1 application skeleton)")
+        .about("A fast native Wayland terminal")
         .disable_help_subcommand(true)
         .arg(
             Arg::new("verbose")
@@ -63,7 +63,7 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> ParseOutcome {
                 .num_args(1..)
                 .allow_hyphen_values(true)
                 .trailing_var_arg(true)
-                .help("Preserve a command argv for a future terminal session"),
+                .help("Run a command directly in the terminal PTY"),
         );
 
     match command.try_get_matches_from(args) {
