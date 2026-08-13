@@ -31,7 +31,7 @@ struct Options {
 }
 
 fn usage() -> &'static str {
-    "Usage: fastterm-probe <environment|terminal|text|wayland|vulkan|all> \
+    "Usage: leyline-probe <environment|terminal|text|wayland|vulkan|all> \
      [--verbose] [--json] [--font PATTERN] [--terminal-fixture PATH] \
      [--wayland-interactive-seconds SECONDS]"
 }

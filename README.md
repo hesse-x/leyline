@@ -1,7 +1,8 @@
-# FastTerm technical probes
+# Leyline
 
-This workspace implements FastTerm v0.1 stage 0. It validates the terminal core, Ubuntu system text
-libraries, a native Wayland connection, and the Vulkan 1.3 loader path; it is not the terminal app.
+Leyline is a native Wayland terminal written in Rust. Stage 1 provides the application skeleton:
+CLI parsing, validated XDG/TOML configuration, structured diagnostics, and bounded cross-thread event
+ingress. It intentionally does not open a window, connect a PTY, or start a shell yet.
 
 ## Ubuntu 24.04 dependencies
 
@@ -22,11 +23,22 @@ route is preferable.
 
 ```sh
 cargo build --release --locked
-cargo run --locked --bin fastterm-probe -- environment
-cargo run --locked --bin fastterm-probe -- terminal
-cargo run --locked --bin fastterm-probe -- text
-cargo run --locked --bin fastterm-probe -- wayland
-cargo run --locked --bin fastterm-probe -- vulkan
+cargo run --locked --bin leyline
+cargo run --locked --bin leyline -- -e program arg1 arg2
+```
+
+`-e` preserves program arguments exactly and does not invoke a shell. During stage 1 the request is
+validated and retained by the application coordinator, but the program is not started. Use `-v`,
+`-vv`, or `-vvv` for progressively more detailed stderr logging.
+
+The stage 0 hardware and integration probes remain available:
+
+```sh
+cargo run --locked --bin leyline-probe -- environment
+cargo run --locked --bin leyline-probe -- terminal
+cargo run --locked --bin leyline-probe -- text
+cargo run --locked --bin leyline-probe -- wayland
+cargo run --locked --bin leyline-probe -- vulkan
 ```
 
 Use `--json` for machine-readable evidence and `--verbose` for scope notes. Exit codes are 0 for
@@ -36,3 +48,49 @@ probe; resize the visible window once and then close it before the timeout.
 
 Wayland window decoration and Vulkan presentation checks require an interactive Ubuntu 24.04 GNOME
 Wayland session. Missing system packages are reported with their corresponding Ubuntu package name.
+
+## Configuration
+
+Leyline reads `$XDG_CONFIG_HOME/leyline/config.toml`, falling back to
+`$HOME/.config/leyline/config.toml`. A missing file uses safe defaults; an invalid file stops startup
+with a field-specific diagnostic. Example:
+
+```toml
+[font]
+family = "monospace"
+size = 11.0
+ligatures = false
+
+[colors]
+foreground = "#d8d8d8"
+background = "#181818"
+
+[window]
+padding_x = 8
+padding_y = 8
+
+[scrolling]
+history_lines = 10000
+
+[cursor]
+style = "block"
+
+[behavior]
+hold_after_exit = false
+confirm_multiline_paste = true
+
+[[keybindings]]
+key = "C"
+mods = ["Control", "Shift"]
+action = "Copy"
+```
+
+Unknown configuration fields produce warnings. Colors must be `#RRGGBB` or `#RRGGBBAA`; font size,
+padding, and scrollback are bounded to prevent accidental resource exhaustion.
+
+## Current limitations
+
+The stage 1 executable only initializes and shuts down the application skeleton. Window creation,
+Vulkan rendering, PTY sessions, terminal emulation, text rendering, clipboard, and input handling
+arrive in later stages. The final pure Wayland/Vulkan client will not inherit an accessibility tree
+from a GUI toolkit; screen-reader integration is outside the v0.1 commitment.

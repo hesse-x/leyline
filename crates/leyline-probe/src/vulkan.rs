@@ -31,7 +31,7 @@ pub fn run(reporter: &mut Reporter) -> ProbeResult<()> {
         ),
     );
 
-    let application_name = CString::new("fastterm-probe")
+    let application_name = CString::new("leyline-probe")
         .map_err(|error| ProbeError::internal("vulkan.instance", error.to_string()))?;
     let application = vk::ApplicationInfo::default()
         .application_name(&application_name)

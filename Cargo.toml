@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/fastterm-probe"]
+members = ["crates/leyline", "crates/leyline-probe"]
 resolver = "2"
 
 [workspace.package]
@@ -15,3 +15,10 @@ harfbuzz-sys = { version = "0.8.0", default-features = false, features = ["bundl
 smithay-client-toolkit = { version = "0.20.0", default-features = false }
 wayland-client = { version = "0.31.14", features = ["system"] }
 yeslogic-fontconfig-sys = { version = "6.0.1", features = ["dlopen"] }
+clap = { version = "4.5.46", default-features = false, features = ["derive", "help", "std", "usage"] }
+crossbeam-channel = "0.5.15"
+serde = { version = "1.0.219", features = ["derive"] }
+thiserror = "2.0.16"
+toml = { version = "0.9.5", default-features = false, features = ["parse", "serde"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["ansi", "fmt", "registry"] }

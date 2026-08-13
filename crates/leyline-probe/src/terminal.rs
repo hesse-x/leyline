@@ -12,7 +12,7 @@ use alacritty_terminal::vte::ansi;
 use crate::report::{ProbeError, ProbeResult, Reporter};
 
 const MAX_FIXTURE_BYTES: usize = 1024 * 1024;
-const BUILTIN_FIXTURE: &[u8] = b"ASCII \xE4\xB8\xAD e\xCC\x81\r\n\x1b[38;2;1;2;3mRGB\x1b[0m\x1b[?1049hALT\x1b[?1049l\x1b[?2004h\x1b[?1000h\x1b]0;FastTerm Probe\x07\x1b]52;c;Zm9v\x07";
+const BUILTIN_FIXTURE: &[u8] = b"ASCII \xE4\xB8\xAD e\xCC\x81\r\n\x1b[38;2;1;2;3mRGB\x1b[0m\x1b[?1049hALT\x1b[?1049l\x1b[?2004h\x1b[?1000h\x1b]0;Leyline Probe\x07\x1b]52;c;Zm9v\x07";
 
 #[derive(Clone, Default)]
 struct Listener(Rc<RefCell<Vec<&'static str>>>);
@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn oversized_fixture_is_rejected() {
-        let path = std::env::temp_dir().join(format!("fastterm-oversized-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("leyline-oversized-{}", std::process::id()));
         let mut file = std::fs::File::create(&path).expect("temporary fixture");
         file.write_all(&vec![0; MAX_FIXTURE_BYTES + 1])
             .expect("write fixture");

@@ -83,8 +83,8 @@ impl SurfaceHarness {
         let activation = ActivationState::bind(&globals, &qh).ok();
         let surface = compositor.create_surface(&qh);
         let window = shell.create_window(surface.clone(), WindowDecorations::RequestServer, &qh);
-        window.set_title("FastTerm stage 0 probe");
-        window.set_app_id("io.fastterm.Stage0Probe");
+        window.set_title("Leyline stage 0 probe");
+        window.set_app_id("io.leyline.Stage0Probe");
         window.set_min_size(Some(DEFAULT_SIZE));
         window.commit();
         let mut pool = SlotPool::new(DEFAULT_SIZE.0 as usize * DEFAULT_SIZE.1 as usize * 4, &shm)
@@ -117,7 +117,7 @@ impl SurfaceHarness {
             activation.request_token(
                 &qh,
                 RequestData {
-                    app_id: Some("io.fastterm.Stage0Probe".into()),
+                    app_id: Some("io.leyline.Stage0Probe".into()),
                     seat_and_serial: None,
                     surface: Some(window.wl_surface().clone()),
                 },
@@ -667,9 +667,9 @@ mod libdecor {
                     "libdecor_decorate returned null",
                 ));
             }
-            let title = CString::new("FastTerm libdecor probe")
+            let title = CString::new("Leyline libdecor probe")
                 .map_err(|_| ProbeError::internal("libdecor.title", "invalid title"))?;
-            let app_id = CString::new("io.fastterm.LibdecorProbe")
+            let app_id = CString::new("io.leyline.LibdecorProbe")
                 .map_err(|_| ProbeError::internal("libdecor.app-id", "invalid app id"))?;
             libdecor_frame_set_title(frame, title.as_ptr());
             libdecor_frame_set_app_id(frame, app_id.as_ptr());
@@ -704,7 +704,7 @@ mod libdecor {
                     ));
                 }
                 eprintln!(
-                    "Resize the FastTerm libdecor probe window, then close it (timeout: {seconds}s)."
+                    "Resize the Leyline libdecor probe window, then close it (timeout: {seconds}s)."
                 );
                 let deadline = Instant::now() + Duration::from_secs(seconds);
                 while Instant::now() < deadline && !callback_state.closed {

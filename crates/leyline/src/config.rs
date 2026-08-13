@@ -1,0 +1,839 @@
+use std::{
+    collections::{BTreeMap, HashMap},
+    ffi::OsString,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
+};
+
+use serde::Deserialize;
+
+use crate::diagnostics::{ClassifiedError, ErrorCategory, escape_diagnostic};
+
+pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct EffectiveConfig {
+    pub font: FontConfig,
+    pub colors: ColorsConfig,
+    pub window: WindowConfig,
+    pub scrolling: ScrollingConfig,
+    pub cursor: CursorConfig,
+    pub behavior: BehaviorConfig,
+    pub keybindings: Vec<KeyBinding>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct FontConfig {
+    pub family: String,
+    pub size: f64,
+    pub ligatures: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Color(pub u32);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ColorsConfig {
+    pub foreground: Color,
+    pub background: Color,
+    pub cursor: Color,
+    pub selection_foreground: Color,
+    pub selection_background: Color,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WindowConfig {
+    pub padding_x: u16,
+    pub padding_y: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScrollingConfig {
+    pub history_lines: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CursorStyle {
+    Block,
+    Beam,
+    Underline,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CursorConfig {
+    pub style: CursorStyle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BehaviorConfig {
+    pub hold_after_exit: bool,
+    pub confirm_multiline_paste: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KeyBinding {
+    pub key: String,
+    pub mods: Vec<Modifier>,
+    pub action: Action,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum Modifier {
+    Control,
+    Shift,
+    Alt,
+    Super,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Action {
+    Copy,
+    Paste,
+    IncreaseFontSize,
+    DecreaseFontSize,
+    ResetFontSize,
+    ScrollPageUp,
+    ScrollPageDown,
+}
+
+impl Default for EffectiveConfig {
+    fn default() -> Self {
+        Self {
+            font: FontConfig {
+                family: "monospace".into(),
+                size: 11.0,
+                ligatures: false,
+            },
+            colors: ColorsConfig {
+                foreground: Color(0xd8d8_d8ff),
+                background: Color(0x1818_18ff),
+                cursor: Color(0xf2f2_f2ff),
+                selection_foreground: Color(0xffff_ffff),
+                selection_background: Color(0x365b_7dff),
+            },
+            window: WindowConfig {
+                padding_x: 8,
+                padding_y: 8,
+            },
+            scrolling: ScrollingConfig {
+                history_lines: 10_000,
+            },
+            cursor: CursorConfig {
+                style: CursorStyle::Block,
+            },
+            behavior: BehaviorConfig {
+                hold_after_exit: false,
+                confirm_multiline_paste: true,
+            },
+            keybindings: default_keybindings(),
+        }
+    }
+}
+
+fn default_keybindings() -> Vec<KeyBinding> {
+    use Action::{
+        Copy, DecreaseFontSize, IncreaseFontSize, Paste, ResetFontSize, ScrollPageDown,
+        ScrollPageUp,
+    };
+    use Modifier::{Control, Shift};
+    [
+        ("C", vec![Control, Shift], Copy),
+        ("V", vec![Control, Shift], Paste),
+        ("Plus", vec![Control, Shift], IncreaseFontSize),
+        ("Minus", vec![Control, Shift], DecreaseFontSize),
+        ("0", vec![Control, Shift], ResetFontSize),
+        ("PageUp", vec![Shift], ScrollPageUp),
+        ("PageDown", vec![Shift], ScrollPageDown),
+    ]
+    .into_iter()
+    .map(|(key, mods, action)| KeyBinding {
+        key: key.into(),
+        mods,
+        action,
+    })
+    .collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigOrigin {
+    Default,
+    File(PathBuf),
+}
+
+#[derive(Clone, Debug)]
+pub struct LoadedConfig {
+    pub effective: EffectiveConfig,
+    pub warnings: Vec<ConfigWarning>,
+    pub source: ConfigOrigin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigWarning {
+    pub message: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfigLocation {
+    Missing(PathBuf),
+    File(PathBuf),
+}
+
+pub trait ConfigEnvironment {
+    fn xdg_config_home(&self) -> Option<OsString>;
+    fn home(&self) -> Option<OsString>;
+}
+
+pub trait ConfigSource {
+    /// Resolves the configured XDG location.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] when no absolute configuration base is available.
+    fn locate(&self) -> Result<ConfigLocation, ConfigError>;
+    /// Loads and validates a resolved configuration.
+    ///
+    /// # Errors
+    /// Returns [`ConfigError`] for I/O, encoding, TOML, or semantic failures.
+    fn load(&self, location: &ConfigLocation) -> Result<LoadedConfig, ConfigError>;
+}
+
+pub struct FileConfigSource<E> {
+    environment: E,
+}
+
+impl<E> FileConfigSource<E> {
+    pub const fn new(environment: E) -> Self {
+        Self { environment }
+    }
+}
+
+impl<E: ConfigEnvironment> ConfigSource for FileConfigSource<E> {
+    fn locate(&self) -> Result<ConfigLocation, ConfigError> {
+        let base = absolute_env_path(self.environment.xdg_config_home())
+            .or_else(|| absolute_env_path(self.environment.home()).map(|home| home.join(".config")))
+            .ok_or(ConfigError::PathUnavailable)?;
+        let path = base.join("leyline/config.toml");
+        match path.try_exists() {
+            Ok(true) => Ok(ConfigLocation::File(path)),
+            Ok(false) => Ok(ConfigLocation::Missing(path)),
+            Err(source) => Err(ConfigError::Read { path, source }),
+        }
+    }
+
+    fn load(&self, location: &ConfigLocation) -> Result<LoadedConfig, ConfigError> {
+        let ConfigLocation::File(path) = location else {
+            return Ok(LoadedConfig {
+                effective: EffectiveConfig::default(),
+                warnings: Vec::new(),
+                source: ConfigOrigin::Default,
+            });
+        };
+        let text = read_config(path)?;
+        let raw = toml::from_str::<RawConfig>(&text).map_err(|source| ConfigError::Parse {
+            path: path.clone(),
+            source,
+        })?;
+        let (effective, warnings) = raw.into_effective(path, &text)?;
+        Ok(LoadedConfig {
+            effective,
+            warnings,
+            source: ConfigOrigin::File(path.clone()),
+        })
+    }
+}
+
+fn absolute_env_path(value: Option<OsString>) -> Option<PathBuf> {
+    let path = PathBuf::from(value?);
+    (!path.as_os_str().is_empty() && path.is_absolute()).then_some(path)
+}
+
+fn read_config(path: &Path) -> Result<String, ConfigError> {
+    let file = File::open(path).map_err(|source| ConfigError::Read {
+        path: path.into(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| ConfigError::Read {
+        path: path.into(),
+        source,
+    })?;
+    if !metadata.file_type().is_file() {
+        return Err(ConfigError::NotRegularFile(path.into()));
+    }
+    if metadata.len() > MAX_CONFIG_BYTES {
+        return Err(ConfigError::TooLarge(path.into()));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len().try_into().unwrap_or(0));
+    file.take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| ConfigError::Read {
+            path: path.into(),
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_CONFIG_BYTES {
+        return Err(ConfigError::TooLarge(path.into()));
+    }
+    String::from_utf8(bytes).map_err(|source| ConfigError::Utf8 {
+        path: path.into(),
+        source,
+    })
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConfigError {
+    #[error(
+        "no absolute configuration directory is available; set XDG_CONFIG_HOME to an absolute path"
+    )]
+    PathUnavailable,
+    #[error("cannot read configuration file {}: {source}", path.display())]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("configuration path {} does not resolve to a regular file", .0.display())]
+    NotRegularFile(PathBuf),
+    #[error("configuration file {} exceeds the 1 MiB limit", .0.display())]
+    TooLarge(PathBuf),
+    #[error("configuration file {} is not valid UTF-8: {source}", path.display())]
+    Utf8 {
+        path: PathBuf,
+        #[source]
+        source: std::string::FromUtf8Error,
+    },
+    #[error("invalid TOML in {}: {source}", path.display())]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml::de::Error,
+    },
+    #[error("invalid configuration field {field} in {}: {reason}", path.display())]
+    Semantic {
+        path: PathBuf,
+        field: String,
+        reason: String,
+    },
+}
+
+impl ClassifiedError for ConfigError {
+    fn category(&self) -> ErrorCategory {
+        if matches!(self, Self::PathUnavailable) {
+            ErrorCategory::Environment
+        } else {
+            ErrorCategory::Configuration
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawConfig {
+    font: RawFont,
+    colors: RawColors,
+    window: RawWindow,
+    scrolling: RawScrolling,
+    cursor: RawCursor,
+    behavior: RawBehavior,
+    keybindings: Option<Vec<RawKeyBinding>>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawFont {
+    family: Option<String>,
+    size: Option<f64>,
+    ligatures: Option<bool>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawColors {
+    foreground: Option<String>,
+    background: Option<String>,
+    cursor: Option<String>,
+    selection_foreground: Option<String>,
+    selection_background: Option<String>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawWindow {
+    padding_x: Option<i64>,
+    padding_y: Option<i64>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawScrolling {
+    history_lines: Option<i64>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawCursor {
+    style: Option<String>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawBehavior {
+    hold_after_exit: Option<bool>,
+    confirm_multiline_paste: Option<bool>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+#[derive(Debug, Deserialize)]
+struct RawKeyBinding {
+    key: String,
+    mods: Vec<String>,
+    action: String,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+
+impl RawConfig {
+    #[allow(clippy::too_many_lines)]
+    fn into_effective(
+        self,
+        path: &Path,
+        source: &str,
+    ) -> Result<(EffectiveConfig, Vec<ConfigWarning>), ConfigError> {
+        let mut result = EffectiveConfig::default();
+        let mut warnings = Vec::new();
+        collect_unknown(&mut warnings, source, "", &self.unknown, TOP_FIELDS);
+        collect_unknown(
+            &mut warnings,
+            source,
+            "font",
+            &self.font.unknown,
+            &["family", "size", "ligatures"],
+        );
+        collect_unknown(
+            &mut warnings,
+            source,
+            "colors",
+            &self.colors.unknown,
+            &[
+                "foreground",
+                "background",
+                "cursor",
+                "selection_foreground",
+                "selection_background",
+            ],
+        );
+        collect_unknown(
+            &mut warnings,
+            source,
+            "window",
+            &self.window.unknown,
+            &["padding_x", "padding_y"],
+        );
+        collect_unknown(
+            &mut warnings,
+            source,
+            "scrolling",
+            &self.scrolling.unknown,
+            &["history_lines"],
+        );
+        collect_unknown(
+            &mut warnings,
+            source,
+            "cursor",
+            &self.cursor.unknown,
+            &["style"],
+        );
+        collect_unknown(
+            &mut warnings,
+            source,
+            "behavior",
+            &self.behavior.unknown,
+            &["hold_after_exit", "confirm_multiline_paste"],
+        );
+
+        if let Some(family) = self.font.family {
+            result.font.family = family;
+        }
+        if let Some(size) = self.font.size {
+            if !size.is_finite() || !(6.0..=72.0).contains(&size) {
+                return semantic(path, "font.size", format!("{size:?} is outside 6.0..=72.0"));
+            }
+            result.font.size = size;
+        }
+        if let Some(value) = self.font.ligatures {
+            result.font.ligatures = value;
+        }
+        set_color(
+            path,
+            "colors.foreground",
+            self.colors.foreground,
+            &mut result.colors.foreground,
+        )?;
+        set_color(
+            path,
+            "colors.background",
+            self.colors.background,
+            &mut result.colors.background,
+        )?;
+        set_color(
+            path,
+            "colors.cursor",
+            self.colors.cursor,
+            &mut result.colors.cursor,
+        )?;
+        set_color(
+            path,
+            "colors.selection_foreground",
+            self.colors.selection_foreground,
+            &mut result.colors.selection_foreground,
+        )?;
+        set_color(
+            path,
+            "colors.selection_background",
+            self.colors.selection_background,
+            &mut result.colors.selection_background,
+        )?;
+        set_bounded(
+            path,
+            "window.padding_x",
+            self.window.padding_x,
+            0,
+            256,
+            &mut result.window.padding_x,
+        )?;
+        set_bounded(
+            path,
+            "window.padding_y",
+            self.window.padding_y,
+            0,
+            256,
+            &mut result.window.padding_y,
+        )?;
+        set_bounded(
+            path,
+            "scrolling.history_lines",
+            self.scrolling.history_lines,
+            0,
+            100_000,
+            &mut result.scrolling.history_lines,
+        )?;
+        if let Some(style) = self.cursor.style {
+            result.cursor.style = match style.as_str() {
+                "block" => CursorStyle::Block,
+                "beam" => CursorStyle::Beam,
+                "underline" => CursorStyle::Underline,
+                _ => {
+                    return semantic(
+                        path,
+                        "cursor.style",
+                        format!(
+                            "{} is not one of block, beam, underline",
+                            escape_diagnostic(&style)
+                        ),
+                    );
+                }
+            };
+        }
+        if let Some(value) = self.behavior.hold_after_exit {
+            result.behavior.hold_after_exit = value;
+        }
+        if let Some(value) = self.behavior.confirm_multiline_paste {
+            result.behavior.confirm_multiline_paste = value;
+        }
+
+        if let Some(bindings) = self.keybindings {
+            let mut positions = result
+                .keybindings
+                .iter()
+                .enumerate()
+                .map(|(index, binding)| (chord(binding), index))
+                .collect::<HashMap<_, _>>();
+            for (source_index, raw) in bindings.into_iter().enumerate() {
+                collect_unknown(
+                    &mut warnings,
+                    source,
+                    &format!("keybindings[{source_index}]"),
+                    &raw.unknown,
+                    &["key", "mods", "action"],
+                );
+                let binding = parse_binding(path, source_index, raw)?;
+                let chord = chord(&binding);
+                if let Some(index) = positions.get(&chord).copied() {
+                    result.keybindings[index] = binding;
+                    warnings.push(ConfigWarning {
+                        message: format!("duplicate keybinding {chord}; the later binding wins"),
+                    });
+                } else {
+                    positions.insert(chord, result.keybindings.len());
+                    result.keybindings.push(binding);
+                }
+            }
+        }
+        Ok((result, warnings))
+    }
+}
+
+const TOP_FIELDS: &[&str] = &[
+    "font",
+    "colors",
+    "window",
+    "scrolling",
+    "cursor",
+    "behavior",
+    "keybindings",
+];
+
+fn collect_unknown(
+    warnings: &mut Vec<ConfigWarning>,
+    source: &str,
+    prefix: &str,
+    fields: &BTreeMap<String, toml::Value>,
+    candidates: &[&str],
+) {
+    for key in fields.keys() {
+        let field = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        let line = source
+            .lines()
+            .position(|line| {
+                line.trim_start().starts_with(&format!("{key} "))
+                    || line.trim_start().starts_with(&format!("{key}="))
+            })
+            .map_or(String::new(), |index| format!(" at line {}", index + 1));
+        let suggestion = unique_suggestion(key, candidates)
+            .map_or(String::new(), |name| format!("; did you mean {name}?"));
+        warnings.push(ConfigWarning {
+            message: format!("unknown configuration field {field}{line}{suggestion}"),
+        });
+    }
+}
+
+fn unique_suggestion<'a>(input: &str, candidates: &'a [&str]) -> Option<&'a str> {
+    let mut matches = candidates
+        .iter()
+        .copied()
+        .filter(|candidate| edit_distance(input, candidate) <= 2);
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let mut previous: Vec<usize> = (0..=right.len()).collect();
+    for (i, a) in left.bytes().enumerate() {
+        let mut current = vec![i + 1];
+        for (j, b) in right.bytes().enumerate() {
+            current.push(
+                (previous[j + 1] + 1)
+                    .min(current[j] + 1)
+                    .min(previous[j] + usize::from(a != b)),
+            );
+        }
+        previous = current;
+    }
+    previous[right.len()]
+}
+
+fn set_color(
+    path: &Path,
+    field: &str,
+    raw: Option<String>,
+    target: &mut Color,
+) -> Result<(), ConfigError> {
+    if let Some(raw) = raw {
+        *target = parse_color(&raw).ok_or_else(|| ConfigError::Semantic {
+            path: path.into(),
+            field: field.into(),
+            reason: format!("{} must be #RRGGBB or #RRGGBBAA", escape_diagnostic(&raw)),
+        })?;
+    }
+    Ok(())
+}
+
+fn parse_color(raw: &str) -> Option<Color> {
+    let hex = raw.strip_prefix('#')?;
+    if !matches!(hex.len(), 6 | 8) || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut value = u32::from_str_radix(hex, 16).ok()?;
+    if hex.len() == 6 {
+        value = (value << 8) | 0xff;
+    }
+    Some(Color(value))
+}
+
+fn set_bounded<T>(
+    path: &Path,
+    field: &str,
+    raw: Option<i64>,
+    min: i64,
+    max: i64,
+    target: &mut T,
+) -> Result<(), ConfigError>
+where
+    T: TryFrom<i64>,
+{
+    if let Some(raw) = raw {
+        if !(min..=max).contains(&raw) {
+            return semantic(path, field, format!("{raw} is outside {min}..={max}"));
+        }
+        *target = T::try_from(raw).map_err(|_| ConfigError::Semantic {
+            path: path.into(),
+            field: field.into(),
+            reason: format!("{raw} cannot be represented"),
+        })?;
+    }
+    Ok(())
+}
+
+fn parse_binding(path: &Path, index: usize, raw: RawKeyBinding) -> Result<KeyBinding, ConfigError> {
+    if raw.key.is_empty() || raw.key.chars().any(char::is_control) {
+        return semantic(
+            path,
+            &format!("keybindings[{index}].key"),
+            "key must be a non-empty printable name".into(),
+        );
+    }
+    let mut mods = raw
+        .mods
+        .into_iter()
+        .map(|value| match value.as_str() {
+            "Control" => Ok(Modifier::Control),
+            "Shift" => Ok(Modifier::Shift),
+            "Alt" => Ok(Modifier::Alt),
+            "Super" => Ok(Modifier::Super),
+            _ => Err(ConfigError::Semantic {
+                path: path.into(),
+                field: format!("keybindings[{index}].mods"),
+                reason: format!("unknown modifier {}", escape_diagnostic(&value)),
+            }),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    mods.sort_unstable();
+    mods.dedup();
+    let action = match raw.action.as_str() {
+        "Copy" => Action::Copy,
+        "Paste" => Action::Paste,
+        "IncreaseFontSize" => Action::IncreaseFontSize,
+        "DecreaseFontSize" => Action::DecreaseFontSize,
+        "ResetFontSize" => Action::ResetFontSize,
+        "ScrollPageUp" => Action::ScrollPageUp,
+        "ScrollPageDown" => Action::ScrollPageDown,
+        _ => {
+            return semantic(
+                path,
+                &format!("keybindings[{index}].action"),
+                format!("unknown action {}", escape_diagnostic(&raw.action)),
+            );
+        }
+    };
+    Ok(KeyBinding {
+        key: raw.key,
+        mods,
+        action,
+    })
+}
+
+fn chord(binding: &KeyBinding) -> String {
+    let mut value = binding
+        .mods
+        .iter()
+        .map(|modifier| format!("{modifier:?}"))
+        .collect::<Vec<_>>()
+        .join("+");
+    if !value.is_empty() {
+        value.push('+');
+    }
+    value.push_str(&binding.key);
+    value
+}
+
+fn semantic<T>(path: &Path, field: &str, reason: String) -> Result<T, ConfigError> {
+    Err(ConfigError::Semantic {
+        path: path.into(),
+        field: field.into(),
+        reason,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Clone)]
+    struct Env {
+        xdg: Option<OsString>,
+        home: Option<OsString>,
+    }
+    impl ConfigEnvironment for Env {
+        fn xdg_config_home(&self) -> Option<OsString> {
+            self.xdg.clone()
+        }
+        fn home(&self) -> Option<OsString> {
+            self.home.clone()
+        }
+    }
+
+    #[test]
+    fn xdg_path_precedes_home_and_relative_values_fall_back() {
+        let source = FileConfigSource::new(Env {
+            xdg: Some("/xdg".into()),
+            home: Some("/home/me".into()),
+        });
+        assert_eq!(
+            source.locate().expect("location"),
+            ConfigLocation::Missing("/xdg/leyline/config.toml".into())
+        );
+        let source = FileConfigSource::new(Env {
+            xdg: Some("relative".into()),
+            home: Some("/home/me".into()),
+        });
+        assert_eq!(
+            source.locate().expect("location"),
+            ConfigLocation::Missing("/home/me/.config/leyline/config.toml".into())
+        );
+    }
+
+    #[test]
+    fn validates_and_merges_configuration() {
+        let raw: RawConfig = toml::from_str("[font]\nsize=72\n[colors]\nforeground=\"#01020304\"\n[window]\npadding_x=0\n[[keybindings]]\nkey=\"C\"\nmods=[\"Shift\",\"Control\"]\naction=\"Paste\"\n").expect("raw config");
+        let (effective, warnings) = raw
+            .into_effective(Path::new("config.toml"), "")
+            .expect("effective config");
+        assert!((effective.font.size - 72.0).abs() < f64::EPSILON);
+        assert_eq!(effective.colors.foreground, Color(0x0102_0304));
+        assert_eq!(effective.window.padding_x, 0);
+        assert_eq!(effective.keybindings[0].action, Action::Paste);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn unknown_field_warns_with_unique_suggestion() {
+        let raw: RawConfig = toml::from_str("[font]\nszie=12\n").expect("raw config");
+        let (_, warnings) = raw
+            .into_effective(Path::new("config.toml"), "[font]\nszie=12\n")
+            .expect("effective config");
+        assert!(
+            warnings[0]
+                .message
+                .contains("font.szie at line 2; did you mean size?")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_resource_values() {
+        let raw: RawConfig =
+            toml::from_str("[scrolling]\nhistory_lines=100001\n").expect("raw config");
+        let error = raw
+            .into_effective(Path::new("config.toml"), "")
+            .expect_err("must reject");
+        assert!(error.to_string().contains("scrolling.history_lines"));
+    }
+}
