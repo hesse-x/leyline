@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/fastterm-probe"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.96"
+
+[workspace.dependencies]
+alacritty_terminal = { version = "0.25.1", default-features = false }
+ash = { version = "0.38.0", default-features = false, features = ["loaded", "std"] }
+freetype-sys = { version = "0.23.0", features = ["bundled"] }
+harfbuzz-sys = { version = "0.8.0", default-features = false, features = ["bundled"] }
+smithay-client-toolkit = { version = "0.20.0", default-features = false }
+wayland-client = { version = "0.31.14", features = ["system"] }
+yeslogic-fontconfig-sys = { version = "6.0.1", features = ["dlopen"] }
