@@ -20,6 +20,7 @@ use crate::{
 };
 
 pub struct UiRuntime {
+    state: RuntimeState,
     app: App,
     app_runtime: AppRuntime,
     gfx: GfxRuntime,
@@ -46,6 +47,12 @@ pub struct UiRuntime {
     wheel_remainder_120: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeState {
+    Running,
+    FatalPendingExit,
+}
+
 #[derive(Clone, Copy, Debug)]
 struct DragScroll {
     direction: i32,
@@ -56,6 +63,7 @@ struct DragScroll {
 const DRAG_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
+const CLIPBOARD_RESULT_BUDGET: usize = 2;
 
 impl UiRuntime {
     /// Builds the single UI-thread composition root.
@@ -89,6 +97,7 @@ impl UiRuntime {
         let reset_font_size = app.config().font.size;
         let clipboard_workers = crate::clipboard::TransferWorkers::new(&wake);
         Ok(Self {
+            state: RuntimeState::Running,
             app,
             app_runtime,
             gfx,
@@ -121,6 +130,14 @@ impl UiRuntime {
     /// # Errors
     /// Returns a typed platform, renderer, or application failure.
     pub fn run(mut self) -> Result<(), UiRuntimeError> {
+        let result = self.run_loop();
+        if let Err(error) = &result {
+            self.enter_fatal_pending_exit(error.category());
+        }
+        result
+    }
+
+    fn run_loop(&mut self) -> Result<(), UiRuntimeError> {
         loop {
             let mut events = Vec::new();
             self.gfx.dispatch_pending(&mut events)?;
@@ -210,6 +227,35 @@ impl UiRuntime {
         }
         self.app.stop()?;
         Ok(())
+    }
+
+    fn enter_fatal_pending_exit(&mut self, category: ErrorCategory) {
+        if self.state == RuntimeState::FatalPendingExit {
+            return;
+        }
+        self.state = RuntimeState::FatalPendingExit;
+        tracing::error!(
+            category = "fatal_pending_exit",
+            error_category = ?category,
+            "runtime entered fatal shutdown"
+        );
+        self.app_runtime.fast_cancel();
+        let _ = self.app.request_shutdown(ShutdownReason::PlatformFailure);
+        self.session.begin_shutdown();
+
+        while let Some(deadline) = self.session.shutdown_deadline() {
+            match self.session.poll_shutdown(Instant::now()) {
+                Ok(ShutdownPoll::Complete | ShutdownPoll::TimedOut) | Err(_) => break,
+                Ok(ShutdownPoll::Pending) => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        continue;
+                    }
+                    std::thread::sleep(remaining.min(SHUTDOWN_POLL_INTERVAL));
+                }
+            }
+        }
+        let _ = self.app.stop();
     }
 
     fn poll_shutdown(&mut self) -> Result<bool, UiRuntimeError> {
@@ -1014,7 +1060,9 @@ impl UiRuntime {
 
     fn drain_clipboard_results(&mut self) -> Result<(), UiRuntimeError> {
         let mut results = Vec::new();
-        self.clipboard_workers.drain(|result| results.push(result));
+        let retained = self
+            .clipboard_workers
+            .drain_round(CLIPBOARD_RESULT_BUDGET, |result| results.push(result));
         for result in results {
             match result {
                 crate::clipboard::TransferResult::Received {
@@ -1047,6 +1095,9 @@ impl UiRuntime {
                     tracing::warn!(%error, "clipboard transfer failed");
                 }
             }
+        }
+        if retained {
+            self.wake.signal()?;
         }
         Ok(())
     }
@@ -1248,11 +1299,11 @@ impl ClassifiedError for UiRuntimeError {
         match self {
             Self::Init(GfxInitError::Environment(_))
             | Self::SessionStart(_)
-            | Self::Graphics(GfxError::Platform(_) | GfxError::Renderer(_)) => {
-                ErrorCategory::Environment
-            }
+            | Self::Graphics(GfxError::Platform(_)) => ErrorCategory::Environment,
             Self::Init(GfxInitError::Platform(_)) | Self::Ime(_) => ErrorCategory::Platform,
-            Self::Init(GfxInitError::Device(_)) => ErrorCategory::Renderer,
+            Self::Init(GfxInitError::Device(_)) | Self::Graphics(GfxError::Renderer(_)) => {
+                ErrorCategory::Renderer
+            }
             Self::Graphics(GfxError::Internal(_))
             | Self::App(_)
             | Self::Wake(_)

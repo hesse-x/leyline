@@ -3,6 +3,7 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 use alacritty_terminal::{
     Term,
     event::{Event, EventListener},
+    grid::Dimensions,
     index::{Column, Line, Point, Side},
     selection::{Selection, SelectionType},
     term::{Config, TermMode, cell::Flags, test::TermSize},
@@ -14,13 +15,13 @@ use super::snapshot::{
     ProjectedSelection, SelectionKind, SelectionPoint, SelectionSide, SnapshotCell,
     SnapshotHyperlink, TerminalColor, TerminalModes,
 };
-
-const MAX_TITLE_BYTES: usize = 1024;
-const MAX_REPLY_BYTES: usize = 64 * 1024;
-const MAX_ZERO_WIDTH_PER_CELL: usize = 64;
-const MAX_ZERO_WIDTH_TOTAL: usize = 64 * 1024;
-const MAX_HYPERLINKS: usize = 4096;
-const MAX_HYPERLINK_BYTES: usize = 4096;
+use crate::{
+    app::event::ByteBatch,
+    security::{
+        MAX_HYPERLINK_BYTES, MAX_HYPERLINKS, MAX_PTY_REPLY_BYTES, MAX_ZERO_WIDTH_PER_CELL,
+        MAX_ZERO_WIDTH_TOTAL, PolicyDecision, validate_title,
+    },
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminalAction {
@@ -35,6 +36,15 @@ pub enum TerminalAction {
 pub struct TerminalDelta {
     pub dirty: bool,
     pub actions: usize,
+    pub audit: ParseAuditDelta,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ParseAuditDelta {
+    pub unknown_sequences: u32,
+    pub rejected_actions: u32,
+    pub truncated_sequences: u32,
+    pub reply_bytes: usize,
 }
 
 #[derive(Clone, Default)]
@@ -91,17 +101,30 @@ impl TerminalCoreAdapter {
         if bytes.is_empty() {
             return Ok(TerminalDelta::default());
         }
+        if bytes.len() > ByteBatch::MAX_LEN {
+            return Err(TerminalError::BatchTooLarge(bytes.len()));
+        }
         self.parser.advance(&mut self.term, bytes);
-        self.audit_grid()?;
+        let parser_audit = self.parser.take_audit_delta();
         self.generation = self
             .generation
             .checked_add(1)
             .ok_or(TerminalError::GenerationOverflow)?;
         self.cached.get_mut().take();
-        self.collect_events();
+        let event_audit = self.collect_events();
         Ok(TerminalDelta {
             dirty: true,
             actions: self.actions.len(),
+            audit: ParseAuditDelta {
+                unknown_sequences: event_audit
+                    .unknown_sequences
+                    .saturating_add(parser_audit.unknown_sequences),
+                rejected_actions: event_audit
+                    .rejected_actions
+                    .saturating_add(parser_audit.rejected_actions),
+                truncated_sequences: parser_audit.truncated_sequences,
+                reply_bytes: event_audit.reply_bytes,
+            },
         })
     }
 
@@ -120,6 +143,7 @@ impl TerminalCoreAdapter {
         Ok(TerminalDelta {
             dirty: true,
             actions: 0,
+            audit: ParseAuditDelta::default(),
         })
     }
 
@@ -136,34 +160,45 @@ impl TerminalCoreAdapter {
         );
         let mut links = Vec::<SnapshotHyperlink>::new();
         let mut link_ids = HashMap::<(String, String), u16>::new();
+        let mut zero_width_total = 0_usize;
         for indexed in content.display_iter {
             let cell = indexed.cell;
             let hyperlink = if let Some(link) = cell.hyperlink() {
                 if link.id().len() > MAX_HYPERLINK_BYTES || link.uri().len() > MAX_HYPERLINK_BYTES {
-                    return Err(TerminalError::HyperlinkTooLarge);
-                }
-                let key = (link.id().to_owned(), link.uri().to_owned());
-                if let Some(id) = link_ids.get(&key) {
-                    Some(*id)
+                    None
                 } else {
-                    if links.len() >= MAX_HYPERLINKS {
-                        return Err(TerminalError::TooManyHyperlinks);
+                    let key = (link.id().to_owned(), link.uri().to_owned());
+                    if let Some(id) = link_ids.get(&key) {
+                        Some(*id)
+                    } else if links.len() >= MAX_HYPERLINKS {
+                        None
+                    } else {
+                        let id = u16::try_from(links.len())
+                            .map_err(|_| TerminalError::TooManyHyperlinks)?;
+                        links.push(SnapshotHyperlink {
+                            id: Arc::from(key.0.as_str()),
+                            uri: Arc::from(key.1.as_str()),
+                        });
+                        link_ids.insert(key, id);
+                        Some(id)
                     }
-                    let id =
-                        u16::try_from(links.len()).map_err(|_| TerminalError::TooManyHyperlinks)?;
-                    links.push(SnapshotHyperlink {
-                        id: Arc::from(key.0.as_str()),
-                        uri: Arc::from(key.1.as_str()),
-                    });
-                    link_ids.insert(key, id);
-                    Some(id)
                 }
             } else {
                 None
             };
+            let zerowidth = cell.zerowidth().filter(|value| {
+                !value.is_empty()
+                    && value.len() <= MAX_ZERO_WIDTH_PER_CELL
+                    && zero_width_total
+                        .checked_add(value.len())
+                        .is_some_and(|total| total <= MAX_ZERO_WIDTH_TOTAL)
+            });
+            if let Some(value) = zerowidth {
+                zero_width_total += value.len();
+            }
             cells.push(SnapshotCell {
                 ch: cell.c,
-                zerowidth: cell.zerowidth().filter(|v| !v.is_empty()).map(Arc::from),
+                zerowidth: zerowidth.map(Arc::from),
                 foreground: map_color(cell.fg),
                 background: map_color(cell.bg),
                 underline_color: cell.underline_color().map(map_color),
@@ -256,6 +291,11 @@ impl TerminalCoreAdapter {
     pub fn input_modes(&self) -> TerminalModes {
         map_modes(*self.term.mode())
     }
+
+    #[must_use]
+    pub fn history_size(&self) -> usize {
+        self.term.history_size()
+    }
     pub const fn selection_revision(&self) -> u64 {
         self.selection_revision
     }
@@ -326,27 +366,14 @@ impl TerminalCoreAdapter {
         Ok(())
     }
 
-    fn audit_grid(&self) -> Result<(), TerminalError> {
-        let mut total = 0;
-        for indexed in self.term.grid().display_iter() {
-            let count = indexed.cell.zerowidth().map_or(0, <[char]>::len);
-            if count > MAX_ZERO_WIDTH_PER_CELL {
-                return Err(TerminalError::CombiningLimit);
-            }
-            total += count;
-        }
-        if total > MAX_ZERO_WIDTH_TOTAL {
-            return Err(TerminalError::CombiningLimit);
-        }
-        Ok(())
-    }
-
-    fn collect_events(&mut self) {
+    fn collect_events(&mut self) -> ParseAuditDelta {
+        let mut audit = ParseAuditDelta::default();
         let events: Vec<_> = self.events.borrow_mut().drain(..).collect();
         for event in events {
             match event {
-                Event::Title(title) => {
-                    let title = bounded_title(&title);
+                Event::Title(title)
+                    if let PolicyDecision::Allow(title) = validate_title(&title) =>
+                {
                     self.title = Some(title.clone());
                     self.actions.push(TerminalAction::SetTitle(title));
                 }
@@ -354,18 +381,26 @@ impl TerminalCoreAdapter {
                     self.title = None;
                 }
                 Event::Bell => self.actions.push(TerminalAction::Bell),
-                Event::PtyWrite(text) if text.len() <= MAX_REPLY_BYTES => self
-                    .actions
-                    .push(TerminalAction::WriteToPty(text.into_bytes())),
+                Event::PtyWrite(text) if text.len() <= MAX_PTY_REPLY_BYTES => {
+                    audit.reply_bytes = audit.reply_bytes.saturating_add(text.len());
+                    self.actions
+                        .push(TerminalAction::WriteToPty(text.into_bytes()));
+                }
+                Event::Title(_) | Event::PtyWrite(_) => {
+                    audit.rejected_actions = audit.rejected_actions.saturating_add(1);
+                }
                 Event::ClipboardStore(..) | Event::ClipboardLoad(..) => {
+                    audit.rejected_actions = audit.rejected_actions.saturating_add(1);
                     self.actions.push(TerminalAction::ClipboardRequestRejected);
                 }
                 Event::ColorRequest(..) | Event::TextAreaSizeRequest(..) => {
+                    audit.unknown_sequences = audit.unknown_sequences.saturating_add(1);
                     self.actions.push(TerminalAction::UnsupportedSequence);
                 }
                 _ => {}
             }
         }
+        audit
     }
 }
 
@@ -410,17 +445,6 @@ fn map_modes(mode: TermMode) -> TerminalModes {
     }
 }
 
-fn bounded_title(value: &str) -> Arc<str> {
-    Arc::from(
-        value
-            .chars()
-            .filter(|ch| !ch.is_control())
-            .collect::<String>()
-            .chars()
-            .take(MAX_TITLE_BYTES)
-            .collect::<String>(),
-    )
-}
 fn map_color(color: Color) -> TerminalColor {
     match color {
         Color::Named(named) => TerminalColor::Named(named as u16),
@@ -443,6 +467,8 @@ fn default_cell() -> SnapshotCell {
 
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalError {
+    #[error("PTY output batch is {0} bytes; the limit is 65536")]
+    BatchTooLarge(usize),
     #[error("terminal generation overflow")]
     GenerationOverflow,
     #[error("terminal snapshot dimensions overflow")]
@@ -463,7 +489,8 @@ mod tests {
     #[test]
     fn parses_utf8_color_modes_title_and_rejects_clipboard() {
         let mut core = TerminalCoreAdapter::new(GridSize::new(20, 4).unwrap(), 100).unwrap();
-        core.advance(b"A\xe4\xb8\xad\x1b[38;2;1;2;3mR\x1b[?2004h\x1b]0;safe\x07\x1b]52;c;Zm9v\x07")
+        let delta = core
+            .advance(b"A\xe4\xb8\xad\x1b[38;2;1;2;3mR\x1b[?2004h\x1b]0;safe\x07\x1b]52;c;Zm9v\x07")
             .unwrap();
         let snapshot = core.snapshot().unwrap();
         assert!(snapshot.cells.iter().any(|cell| cell.ch == '\u{4e2d}'));
@@ -475,6 +502,86 @@ mod tests {
         );
         assert!(snapshot.modes.bracketed_paste);
         assert_eq!(snapshot.title.as_deref(), Some("safe"));
+        assert_eq!(delta.audit.rejected_actions, 1);
+    }
+
+    #[test]
+    fn overlong_title_is_rejected_instead_of_byte_unsafe_truncation() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(4, 2).unwrap(), 0).unwrap();
+        let input = format!("\x1b]0;{}\x07", "中".repeat(342));
+        let delta = core.advance(input.as_bytes()).unwrap();
+        assert_eq!(delta.audit.rejected_actions, 1);
+        assert!(core.snapshot().unwrap().title.is_none());
+    }
+
+    #[test]
+    fn unknown_sequences_are_counted_without_blocking_following_text() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 2).unwrap(), 0).unwrap();
+        let delta = core
+            .advance(b"\x1b]999;secret\x07\x1b]998;private\x07ok")
+            .unwrap();
+        assert!(delta.audit.unknown_sequences >= 2);
+        let visible: String = core
+            .snapshot()
+            .unwrap()
+            .cells
+            .iter()
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(visible.starts_with("ok"));
+    }
+
+    #[test]
+    fn oversized_osc_is_discarded_and_parser_recovers() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(20, 4).unwrap(), 100).unwrap();
+        let mut input = b"\x1b]0;".to_vec();
+        input.extend(std::iter::repeat_n(
+            b'x',
+            alacritty_terminal::vte::MAX_OSC_RAW,
+        ));
+        input.push(0x07);
+        let mut truncated = 0;
+        for chunk in input.chunks(ByteBatch::MAX_LEN) {
+            truncated += core.advance(chunk).unwrap().audit.truncated_sequences;
+        }
+        core.advance(b"recovered").unwrap();
+        let snapshot = core.snapshot().unwrap();
+        assert_eq!(truncated, 1);
+        assert!(snapshot.title.is_none());
+        assert_eq!(snapshot.cells[0].ch, 'r');
+    }
+
+    #[test]
+    fn advance_rejects_a_batch_above_the_ingress_contract() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(2, 2).unwrap(), 0).unwrap();
+        let oversized = vec![b'x'; ByteBatch::MAX_LEN + 1];
+        assert!(matches!(
+            core.advance(&oversized),
+            Err(TerminalError::BatchTooLarge(length)) if length == oversized.len()
+        ));
+    }
+
+    #[test]
+    fn oversized_hyperlink_metadata_does_not_hide_cell_text() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(4, 2).unwrap(), 0).unwrap();
+        let mut input = b"\x1b]8;;https://example/".to_vec();
+        input.extend(std::iter::repeat_n(b'a', MAX_HYPERLINK_BYTES));
+        input.extend_from_slice(b"\x1b\\X\x1b]8;;\x1b\\");
+        core.advance(&input).unwrap();
+        let snapshot = core.snapshot().unwrap();
+        assert_eq!(snapshot.cells[0].ch, 'X');
+        assert_eq!(snapshot.cells[0].hyperlink, None);
+        assert!(snapshot.hyperlinks.is_empty());
+    }
+
+    #[test]
+    fn excessive_combining_metadata_is_dropped_without_failing_the_terminal() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(4, 2).unwrap(), 0).unwrap();
+        let input = format!("e{}", "\u{301}".repeat(MAX_ZERO_WIDTH_PER_CELL + 1));
+        core.advance(input.as_bytes()).unwrap();
+        let snapshot = core.snapshot().unwrap();
+        assert_eq!(snapshot.cells[0].ch, 'e');
+        assert!(snapshot.cells[0].zerowidth.is_none());
     }
     #[test]
     fn snapshot_reuses_cell_storage_for_unchanged_generation() {
@@ -618,5 +725,52 @@ mod tests {
         assert_eq!(whole.cursor, chunked.cursor);
         assert_eq!(whole.modes, chunked.modes);
         assert_eq!(whole.title, chunked.title);
+    }
+
+    #[test]
+    fn deterministic_random_chunking_preserves_state_and_audit() {
+        let fixture = b"A\xe4\xb8\xad\x1b[38;2;4;5;6mRGB\x1b[0m\x1b]0;chunked\x07\x1b]8;;https://example.test\x1b\\X\x1b]8;;\x1b\\\x1b]52;c;Zm9v\x07\x1b]999;private\x07Z";
+        let mut whole = TerminalCoreAdapter::new(GridSize::new(32, 3).unwrap(), 10).unwrap();
+        let expected_audit = whole.advance(fixture).unwrap().audit;
+        let expected = whole.snapshot().unwrap();
+
+        for seed in [1_u64, 0x5eed, 0xdead_beef] {
+            let mut state = seed;
+            let mut offset = 0;
+            let mut audit = ParseAuditDelta::default();
+            let mut chunked = TerminalCoreAdapter::new(GridSize::new(32, 3).unwrap(), 10).unwrap();
+            while offset < fixture.len() {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let length = (usize::try_from(state >> 32).unwrap_or(1) % 11 + 1)
+                    .min(fixture.len() - offset);
+                let delta = chunked.advance(&fixture[offset..offset + length]).unwrap();
+                audit.unknown_sequences = audit
+                    .unknown_sequences
+                    .saturating_add(delta.audit.unknown_sequences);
+                audit.rejected_actions = audit
+                    .rejected_actions
+                    .saturating_add(delta.audit.rejected_actions);
+                audit.truncated_sequences = audit
+                    .truncated_sequences
+                    .saturating_add(delta.audit.truncated_sequences);
+                audit.reply_bytes = audit.reply_bytes.saturating_add(delta.audit.reply_bytes);
+                offset += length;
+            }
+            let actual = chunked.snapshot().unwrap();
+            assert_eq!(actual.cells, expected.cells, "seed {seed}");
+            assert_eq!(actual.cursor, expected.cursor, "seed {seed}");
+            assert_eq!(actual.modes, expected.modes, "seed {seed}");
+            assert_eq!(actual.title, expected.title, "seed {seed}");
+            assert_eq!(audit, expected_audit, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn scrollback_storage_stops_at_the_configured_limit() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(4, 2).unwrap(), 10).unwrap();
+        core.advance("line\r\n".repeat(100).as_bytes()).unwrap();
+        assert_eq!(core.history_size(), 10);
     }
 }

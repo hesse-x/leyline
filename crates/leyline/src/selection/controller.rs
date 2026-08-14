@@ -112,7 +112,7 @@ impl Default for SelectionController {
 impl SelectionController {
     #[must_use]
     pub fn publish(&mut self, text: String) -> Option<SourceToken> {
-        if self.shutdown || text.is_empty() || text.len() > 8 * 1024 * 1024 {
+        if self.shutdown || text.is_empty() || text.len() > crate::security::MAX_CLIPBOARD_BYTES {
             return None;
         }
         let token = SourceToken(self.next_source);

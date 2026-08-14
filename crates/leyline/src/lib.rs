@@ -11,6 +11,7 @@ pub mod input;
 pub mod interaction;
 pub mod layout;
 pub mod logging;
+pub mod security;
 pub mod selection;
 pub mod session;
 pub mod terminal;

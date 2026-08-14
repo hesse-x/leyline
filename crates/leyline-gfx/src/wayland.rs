@@ -1,9 +1,13 @@
 use std::{
+    collections::VecDeque,
     env,
     ffi::c_void,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     time::{Duration, Instant},
 };
+
+const RETAINED_INPUT_CAPACITY: usize = 256;
+const INPUT_DRAIN_BUDGET: usize = 64;
 
 use rustix::{
     event::{PollFd, PollFlags, poll},
@@ -160,8 +164,53 @@ struct PendingEvents {
     scale: Option<Scale120>,
     frame_ready: bool,
     suspended: Option<bool>,
-    input: Vec<PlatformEvent>,
+    input: VecDeque<PlatformEvent>,
+    input_overflowed: bool,
     resize: Option<(wl_seat::WlSeat, u32, ResizeEdge)>,
+}
+
+impl PendingEvents {
+    fn can_dispatch_callbacks(&self) -> bool {
+        self.input.is_empty()
+    }
+
+    fn push_input(&mut self, event: PlatformEvent) {
+        if matches!(
+            event,
+            PlatformEvent::Pointer(PointerInput {
+                kind: PointerKind::Motion { .. },
+                ..
+            })
+        ) && self.input.back().is_some_and(|pending| {
+            matches!(
+                pending,
+                PlatformEvent::Pointer(PointerInput {
+                    kind: PointerKind::Motion { .. },
+                    ..
+                })
+            )
+        }) {
+            // Only the newest position matters until an ordered button/axis event intervenes.
+            if let Some(pending) = self.input.back_mut() {
+                *pending = event;
+            }
+            return;
+        }
+        if self.input.len() == RETAINED_INPUT_CAPACITY {
+            self.input_overflowed = true;
+        } else {
+            self.input.push_back(event);
+        }
+    }
+
+    fn drain_input(&mut self, output: &mut Vec<PlatformEvent>) {
+        for _ in 0..INPUT_DRAIN_BUDGET {
+            let Some(event) = self.input.pop_front() else {
+                break;
+            };
+            output.push(event);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -389,13 +438,17 @@ impl WaylandWindow {
     }
 
     pub(crate) fn dispatch_pending(&mut self) -> Result<(), String> {
+        // Drain the retained round before admitting another callback batch. Otherwise a busy
+        // input source can refill the bounded queue faster than the UI consumes its old events.
+        if !self.state.pending.can_dispatch_callbacks() {
+            return Ok(());
+        }
         if let Some(decor) = self.libdecor.as_mut() {
             decor.dispatch(0)?;
-            if let Some(size) = decor.take_configured() {
+            if let Some((size, state)) = decor.take_configured() {
                 self.state.logical_size = size;
                 self.state.configured = true;
-                self.state.pending.configured =
-                    Some((size, self.state.scale, WindowState::default()));
+                self.state.pending.configured = Some((size, self.state.scale, state));
             }
             self.state.pending.close |= decor.take_close();
             if decor.take_commit_requested() {
@@ -417,11 +470,10 @@ impl WaylandWindow {
     pub(crate) fn roundtrip(&mut self) -> Result<(), String> {
         if let Some(decor) = self.libdecor.as_mut() {
             decor.dispatch(50)?;
-            if let Some(size) = decor.take_configured() {
+            if let Some((size, state)) = decor.take_configured() {
                 self.state.logical_size = size;
                 self.state.configured = true;
-                self.state.pending.configured =
-                    Some((size, self.state.scale, WindowState::default()));
+                self.state.pending.configured = Some((size, self.state.scale, state));
             }
             if decor.take_commit_requested() {
                 self.surface.commit();
@@ -450,6 +502,9 @@ impl WaylandWindow {
         wake: Option<BorrowedFd<'_>>,
         timeout: Option<Duration>,
     ) -> Result<(), String> {
+        if !self.state.pending.input.is_empty() {
+            return Ok(());
+        }
         self.flush()?;
         let timeout = min_timeout(timeout, self.state.key_repeat.deadline());
         if self.libdecor.is_some() {
@@ -555,7 +610,12 @@ impl WaylandWindow {
         Ok(())
     }
 
-    pub(crate) fn take_events(&mut self, output: &mut Vec<PlatformEvent>) {
+    pub(crate) fn take_events(&mut self, output: &mut Vec<PlatformEvent>) -> Result<(), String> {
+        if self.state.pending.input_overflowed {
+            return Err(format!(
+                "Wayland retained input queue exceeded {RETAINED_INPUT_CAPACITY} events"
+            ));
+        }
         if self.state.pending.close {
             self.state.pending.close = false;
             output.push(PlatformEvent::CloseRequested);
@@ -581,7 +641,8 @@ impl WaylandWindow {
                 PlatformEvent::SurfaceResumed
             });
         }
-        output.append(&mut self.state.pending.input);
+        self.state.pending.drain_input(output);
+        Ok(())
     }
 
     pub(crate) fn request_frame(&self) {
@@ -912,7 +973,7 @@ impl KeyboardHandler for WaylandState {
     ) {
         if surface == &self.target_surface {
             tracing::debug!("Wayland keyboard focus entered terminal surface");
-            self.pending.input.push(PlatformEvent::KeyboardFocus {
+            self.pending.push_input(PlatformEvent::KeyboardFocus {
                 seat: self.seat_token,
                 serial: InputSerial {
                     seat: self.seat_token,
@@ -934,7 +995,7 @@ impl KeyboardHandler for WaylandState {
         if surface == &self.target_surface {
             self.pressed_modifiers = PressedModifiers::default();
             self.key_repeat.cancel();
-            self.pending.input.push(PlatformEvent::KeyboardFocus {
+            self.pending.push_input(PlatformEvent::KeyboardFocus {
                 seat: self.seat_token,
                 serial: InputSerial {
                     seat: self.seat_token,
@@ -996,8 +1057,7 @@ impl KeyboardHandler for WaylandState {
             alt_graph: false,
         };
         self.pending
-            .input
-            .push(PlatformEvent::ModifiersChanged(self.modifiers));
+            .push_input(PlatformEvent::ModifiersChanged(self.modifiers));
     }
 
     fn update_keymap(
@@ -1056,7 +1116,7 @@ impl WaylandState {
             super_key = modifiers.super_key,
             "Wayland keyboard event"
         );
-        self.pending.input.push(PlatformEvent::Key(KeyInput {
+        self.pending.push_input(PlatformEvent::Key(KeyInput {
             serial: InputSerial {
                 seat: self.seat_token,
                 value: serial,
@@ -1156,8 +1216,7 @@ impl PointerHandler for WaylandState {
                 },
             };
             self.pending
-                .input
-                .push(PlatformEvent::Pointer(PointerInput {
+                .push_input(PlatformEvent::Pointer(PointerInput {
                     position: event.position,
                     kind,
                 }));
@@ -1570,7 +1629,7 @@ impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
             _ => None,
         };
         if let Some(event) = event {
-            state.pending.input.push(PlatformEvent::TextInput(event));
+            state.pending.push_input(PlatformEvent::TextInput(event));
         }
     }
 }
@@ -1617,7 +1676,7 @@ impl DataDeviceHandler for WaylandState {
                 mime_types: offer.with_mime_types(<[String]>::to_vec),
             },
         );
-        self.pending.input.push(PlatformEvent::Clipboard(event));
+        self.pending.push_input(PlatformEvent::Clipboard(event));
     }
     fn drop_performed(
         &mut self,
@@ -1670,8 +1729,7 @@ impl DataSourceHandler for WaylandState {
             .find(|(_, value)| value.inner() == source)
         {
             self.pending
-                .input
-                .push(PlatformEvent::Clipboard(ClipboardEvent::Send {
+                .push_input(PlatformEvent::Clipboard(ClipboardEvent::Send {
                     source: *source,
                     mime_type,
                     fd: OwnedFd::from(fd),
@@ -1691,8 +1749,7 @@ impl DataSourceHandler for WaylandState {
         {
             let (source, _) = self.clipboard_sources.remove(index);
             self.pending
-                .input
-                .push(PlatformEvent::Clipboard(ClipboardEvent::SourceCancelled {
+                .push_input(PlatformEvent::Clipboard(ClipboardEvent::SourceCancelled {
                     source,
                 }));
         }
@@ -1743,7 +1800,7 @@ impl PrimarySelectionDeviceHandler for WaylandState {
                 mime_types: offer.with_mime_types(<[String]>::to_vec),
             },
         );
-        self.pending.input.push(PlatformEvent::Clipboard(event));
+        self.pending.push_input(PlatformEvent::Clipboard(event));
     }
 }
 
@@ -1762,8 +1819,7 @@ impl PrimarySelectionSourceHandler for WaylandState {
             .find(|(_, value)| value.inner() == source)
         {
             self.pending
-                .input
-                .push(PlatformEvent::Clipboard(ClipboardEvent::Send {
+                .push_input(PlatformEvent::Clipboard(ClipboardEvent::Send {
                     source: *source,
                     mime_type,
                     fd: OwnedFd::from(fd),
@@ -1783,8 +1839,7 @@ impl PrimarySelectionSourceHandler for WaylandState {
         {
             let (source, _) = self.primary_sources.remove(index);
             self.pending
-                .input
-                .push(PlatformEvent::Clipboard(ClipboardEvent::SourceCancelled {
+                .push_input(PlatformEvent::Clipboard(ClipboardEvent::SourceCancelled {
                     source,
                 }));
         }
@@ -1801,3 +1856,59 @@ delegate_data_device!(WaylandState);
 delegate_primary_selection!(WaylandState);
 delegate_xdg_shell!(WaylandState);
 delegate_xdg_window!(WaylandState);
+
+#[cfg(test)]
+mod retained_event_tests {
+    use super::*;
+
+    fn motion(time_ms: u32) -> PlatformEvent {
+        PlatformEvent::Pointer(PointerInput {
+            position: (f64::from(time_ms), 0.0),
+            kind: PointerKind::Motion { time_ms },
+        })
+    }
+
+    #[test]
+    fn retained_input_is_bounded_and_drained_by_round_budget() {
+        let mut pending = PendingEvents::default();
+        for _ in 0..=RETAINED_INPUT_CAPACITY {
+            pending.push_input(PlatformEvent::FrameReady);
+        }
+        assert_eq!(pending.input.len(), RETAINED_INPUT_CAPACITY);
+        assert!(pending.input_overflowed);
+        assert!(!pending.can_dispatch_callbacks());
+
+        let mut first_round = Vec::new();
+        pending.drain_input(&mut first_round);
+        assert_eq!(first_round.len(), INPUT_DRAIN_BUDGET);
+        assert_eq!(
+            pending.input.len(),
+            RETAINED_INPUT_CAPACITY - INPUT_DRAIN_BUDGET
+        );
+        assert!(!pending.can_dispatch_callbacks());
+
+        for _ in 1..(RETAINED_INPUT_CAPACITY / INPUT_DRAIN_BUDGET) {
+            pending.drain_input(&mut Vec::new());
+        }
+        assert!(pending.can_dispatch_callbacks());
+    }
+
+    #[test]
+    fn consecutive_pointer_motion_is_coalesced_without_crossing_ordered_events() {
+        let mut pending = PendingEvents::default();
+        for time_ms in 0..1_000 {
+            pending.push_input(motion(time_ms));
+        }
+        assert_eq!(pending.input.len(), 1);
+        assert!(!pending.input_overflowed);
+
+        pending.push_input(PlatformEvent::ModifiersChanged(ModifiersState::default()));
+        pending.push_input(motion(1_000));
+        assert_eq!(pending.input.len(), 3);
+
+        let PlatformEvent::Pointer(pointer) = pending.input.front().unwrap() else {
+            panic!("expected coalesced pointer motion");
+        };
+        assert_eq!(pointer.position, (999.0, 0.0));
+    }
+}

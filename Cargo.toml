@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/leyline", "crates/leyline-gfx", "crates/leyline-probe", "crates/leyline-pty", "crates/leyline-text"]
+exclude = ["third_party/vte"]
 resolver = "2"
 
 [workspace.package]
@@ -30,3 +31,6 @@ leyline-pty = { version = "0.1.0", path = "crates/leyline-pty" }
 leyline-gfx = { version = "0.1.0", path = "crates/leyline-gfx" }
 leyline-text = { version = "0.1.0", path = "crates/leyline-text" }
 shaderc = "0.10.1"
+
+[patch.crates-io]
+vte = { path = "third_party/vte" }

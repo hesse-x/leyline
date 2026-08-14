@@ -115,6 +115,14 @@ pub struct GlyphAsset {
     pub bitmap: GlyphBitmap,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CacheStats {
+    pub entries: usize,
+    pub bytes: usize,
+    pub evictions: u64,
+    pub pinned: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ShapedGlyph {
     pub key: GlyphKey,
@@ -127,6 +135,12 @@ pub struct ShapedGlyph {
 pub struct ShapedCluster {
     pub glyphs: Vec<ShapedGlyph>,
     pub assets: Vec<GlyphAsset>,
+}
+
+/// Shaping output which deliberately contains no rasterized bitmap data.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShapedRun {
+    pub glyphs: Vec<ShapedGlyph>,
 }
 
 #[derive(Debug, thiserror::Error)]

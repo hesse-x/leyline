@@ -3,11 +3,12 @@ use std::{
     sync::mpsc::{SyncSender, TrySendError, sync_channel},
 };
 
-const MAX_URI_BYTES: usize = 4096;
-
 #[allow(clippy::missing_errors_doc)]
 pub fn validate_uri(uri: &str) -> Result<&str, DesktopError> {
-    if uri.is_empty() || uri.len() > MAX_URI_BYTES || uri.chars().any(char::is_control) {
+    if uri.is_empty()
+        || uri.len() > crate::security::MAX_URI_BYTES
+        || uri.chars().any(char::is_control)
+    {
         return Err(DesktopError::InvalidUri);
     }
     let (scheme, rest) = uri.split_once(':').ok_or(DesktopError::InvalidUri)?;

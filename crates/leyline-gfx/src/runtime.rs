@@ -6,11 +6,13 @@ use std::{
 use crate::{
     GfxCommand, LinearColor, LogicalSize, PlatformEvent, RectangleInstance, RenderOutcome,
     RenderScene, Scale120, SelectionTarget, TextInputRectangle,
-    atlas::AtlasManager,
+    atlas::{AtlasManager, AtlasPreparation},
     model::SceneData,
     vulkan::{RenderStatus, VulkanRenderer},
     wayland::WaylandWindow,
 };
+
+pub const MAX_WINDOW_TITLE_BYTES: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub struct GfxOptions {
@@ -47,7 +49,7 @@ pub enum GfxError {
     #[error("Wayland runtime error: {0}")]
     Platform(String),
     #[error("Vulkan runtime error: {0}")]
-    Renderer(String),
+    Renderer(#[from] crate::RendererFault),
     #[error("graphics state invariant failed: {0}")]
     Internal(String),
 }
@@ -71,6 +73,8 @@ pub struct GfxRuntime {
     scale: Scale120,
     scene: SceneData,
     atlas: AtlasManager,
+    pending_atlas: Option<AtlasPreparation>,
+    pending_scene: Option<SceneData>,
     glyphs: Vec<crate::GlyphInstance>,
     dirty: bool,
     frame_ready: bool,
@@ -85,6 +89,11 @@ impl GfxRuntime {
     /// # Errors
     /// Returns a categorized environment, platform, or device failure.
     pub fn new(options: &GfxOptions) -> Result<Self, GfxInitError> {
+        if options.title.contains('\0') || options.title.len() > MAX_WINDOW_TITLE_BYTES {
+            return Err(GfxInitError::Platform(
+                "initial window title is invalid".into(),
+            ));
+        }
         let mut wayland = WaylandWindow::connect(&options.title)?;
         for _ in 0..8 {
             wayland.roundtrip().map_err(GfxInitError::Platform)?;
@@ -98,7 +107,9 @@ impl GfxRuntime {
             ));
         }
         let mut events = Vec::new();
-        wayland.take_events(&mut events);
+        wayland
+            .take_events(&mut events)
+            .map_err(GfxInitError::Platform)?;
         let mut logical_size = options.default_size;
         let mut scale = Scale120::ONE;
         for event in events {
@@ -130,6 +141,8 @@ impl GfxRuntime {
                 font_generation: 0,
             },
             atlas: AtlasManager::new(),
+            pending_atlas: None,
+            pending_scene: None,
             glyphs: Vec::new(),
             dirty: true,
             frame_ready: true,
@@ -148,7 +161,9 @@ impl GfxRuntime {
             .dispatch_pending()
             .map_err(GfxError::Platform)?;
         let start = output.len();
-        self.wayland.take_events(output);
+        self.wayland
+            .take_events(output)
+            .map_err(GfxError::Platform)?;
         for event in &output[start..] {
             match event {
                 PlatformEvent::CloseRequested => self.close_requested = true,
@@ -198,22 +213,26 @@ impl GfxRuntime {
     pub fn apply(&mut self, command: GfxCommand) -> Result<(), GfxError> {
         match command {
             GfxCommand::SetTitle(title) => {
-                if title.contains('\0') || title.len() > 4096 {
+                if title.contains('\0') || title.len() > MAX_WINDOW_TITLE_BYTES {
                     return Err(GfxError::Internal("window title is invalid".into()));
                 }
                 self.wayland.set_title(&title);
             }
             GfxCommand::SetDirty => self.dirty = true,
             GfxCommand::SetScene(scene) => {
+                if self.pending_atlas.take().is_some() {
+                    self.pending_scene = None;
+                    self.renderer.discard_pending_glyphs();
+                }
                 let prepared = self
                     .atlas
                     .prepare(&scene.glyphs, &scene.glyph_assets)
                     .map_err(|error| GfxError::Internal(error.to_string()))?;
                 self.renderer
-                    .upload_glyphs(&prepared.uploads)
+                    .upload_glyphs(&prepared.uploads, prepared.is_repack())
                     .map_err(GfxError::Renderer)?;
-                self.glyphs = prepared.instances;
-                self.scene = scene;
+                self.pending_atlas = Some(prepared);
+                self.pending_scene = Some(scene);
                 self.dirty = true;
             }
             GfxCommand::RequestClose => self.close_requested = true,
@@ -265,11 +284,16 @@ impl GfxRuntime {
             self.swapchain_state = SwapchainState::Ready;
         }
         let target = self.renderer.extent();
+        let scene_data = self.pending_scene.as_ref().unwrap_or(&self.scene);
+        let glyphs = self
+            .pending_atlas
+            .as_ref()
+            .map_or(self.glyphs.as_slice(), AtlasPreparation::instances);
         let scene = RenderScene {
-            clear: self.scene.clear,
+            clear: scene_data.clear,
             viewport: target,
-            rectangles: &self.scene.rectangles,
-            glyphs: &self.glyphs,
+            rectangles: &scene_data.rectangles,
+            glyphs,
         };
         let recreate_after_present =
             match self.renderer.render(&scene).map_err(GfxError::Renderer)? {
@@ -278,8 +302,19 @@ impl GfxRuntime {
                     self.swapchain_state = SwapchainState::RecreatePending;
                     return Ok(RenderOutcome::Deferred);
                 }
-                RenderStatus::Suboptimal => true,
-                RenderStatus::Rendered => false,
+                RenderStatus::SubmittedOutOfDate => {
+                    self.commit_pending_atlas();
+                    self.swapchain_state = SwapchainState::RecreatePending;
+                    return Ok(RenderOutcome::Deferred);
+                }
+                RenderStatus::Suboptimal => {
+                    self.commit_pending_atlas();
+                    true
+                }
+                RenderStatus::Rendered => {
+                    self.commit_pending_atlas();
+                    false
+                }
             };
         self.wayland.request_frame();
         self.wayland.commit();
@@ -292,6 +327,24 @@ impl GfxRuntime {
         self.dirty = recreate_after_present;
         self.frame_ready = false;
         Ok(RenderOutcome::Rendered)
+    }
+
+    fn commit_pending_atlas(&mut self) {
+        let Some(prepared) = self.pending_atlas.take() else {
+            return;
+        };
+        let committed = self.atlas.commit(prepared);
+        if committed.repacked {
+            tracing::debug!(
+                category = "capacity_pressure",
+                operation = "atlas_repack",
+                "glyph atlas repacked"
+            );
+        }
+        self.glyphs = committed.instances;
+        if let Some(scene) = self.pending_scene.take() {
+            self.scene = scene;
+        }
     }
 
     /// Blocks in Wayland's protocol-aware read path until callbacks arrive.
@@ -329,6 +382,11 @@ impl GfxRuntime {
     #[must_use]
     pub const fn scale(&self) -> Scale120 {
         self.scale
+    }
+
+    #[must_use]
+    pub fn atlas_stats(&self) -> crate::AtlasStats {
+        self.atlas.stats()
     }
 
     #[must_use]

@@ -1,7 +1,7 @@
 #![allow(unsafe_code)]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     ffi::{CStr, CString, c_int},
     ptr,
     sync::{Arc, OnceLock},
@@ -12,10 +12,15 @@ use freetype_sys as ft;
 use harfbuzz_sys as hb;
 
 use crate::{
-    CellMetrics, FaceId, FontRequest, FontStyle, GlyphAsset, GlyphBitmap, GlyphKey, MAX_FACES,
-    MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS, MAX_PREPARED_GLYPHS, ShapedCluster, ShapedGlyph,
-    TextError,
+    CacheStats, CellMetrics, FaceId, FontRequest, FontStyle, GlyphAsset, GlyphBitmap, GlyphKey,
+    MAX_FACES, MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS, MAX_PREPARED_GLYPHS, ShapedCluster,
+    ShapedGlyph, ShapedRun, TextError,
 };
+
+struct CachedGlyph {
+    bitmap: GlyphBitmap,
+    last_used: u64,
+}
 
 #[derive(Clone, Copy)]
 struct FontconfigOwner(&'static fc::Fc);
@@ -90,8 +95,11 @@ impl Drop for Buffer {
 pub struct TextSystem {
     faces: Vec<Face>,
     face_lookup: HashMap<(Arc<str>, u32), FaceId>,
-    glyph_cache: HashMap<GlyphKey, GlyphBitmap>,
+    glyph_cache: HashMap<GlyphKey, CachedGlyph>,
     glyph_cache_bytes: usize,
+    cache_clock: u64,
+    cache_evictions: u64,
+    scene_pins: Option<HashSet<GlyphKey>>,
     library: Library,
     fontconfig: FontconfigOwner,
     request: FontRequest,
@@ -144,6 +152,9 @@ impl TextSystem {
             face_lookup: HashMap::new(),
             glyph_cache: HashMap::new(),
             glyph_cache_bytes: 0,
+            cache_clock: 0,
+            cache_evictions: 0,
+            scene_pins: None,
             library,
             fontconfig,
             request,
@@ -163,6 +174,26 @@ impl TextSystem {
     #[must_use]
     pub const fn metrics(&self) -> CellMetrics {
         self.metrics
+    }
+
+    #[must_use]
+    pub fn cache_stats(&self) -> CacheStats {
+        CacheStats {
+            entries: self.glyph_cache.len(),
+            bytes: self.glyph_cache_bytes,
+            evictions: self.cache_evictions,
+            pinned: self.scene_pins.as_ref().map_or(0, HashSet::len),
+        }
+    }
+
+    /// Pins every glyph touched until [`Self::end_scene`] so one scene cannot evict and
+    /// rerasterize its own working set while it is being composed.
+    pub fn begin_scene(&mut self) {
+        self.scene_pins = Some(HashSet::new());
+    }
+
+    pub fn end_scene(&mut self) {
+        self.scene_pins = None;
     }
 
     /// Resolves a complete replacement without changing the active font resources.
@@ -219,6 +250,31 @@ impl TextSystem {
         text: &str,
         style: FontStyle,
     ) -> Result<ShapedCluster, TextError> {
+        let shaped = self.shape_cluster_only(text, style)?;
+        let keys = shaped
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.key)
+            .collect::<Vec<_>>();
+        let assets = self.rasterize_working_set(&keys)?;
+        Ok(ShapedCluster {
+            glyphs: shaped.glyphs,
+            assets,
+        })
+    }
+
+    /// Shapes a cluster without rasterizing any glyphs.
+    ///
+    /// This is the first phase of frame preparation. Callers can collect every unique key,
+    /// validate the complete working set, and then rasterize it as one pinned transaction.
+    ///
+    /// # Errors
+    /// Returns a typed shaping, font data, or capacity error.
+    pub fn shape_cluster_only(
+        &mut self,
+        text: &str,
+        style: FontStyle,
+    ) -> Result<ShapedRun, TextError> {
         if text.is_empty() || text.len() > 4096 {
             return Err(TextError::Shape(
                 "cluster text is empty or excessive".into(),
@@ -294,7 +350,6 @@ impl TextSystem {
         let synthetic_italic = matches!(style, FontStyle::Italic | FontStyle::BoldItalic)
             && unsafe { (*face.raw).style_flags & ft::FT_STYLE_FLAG_ITALIC == 0 };
         let mut glyphs = Vec::with_capacity(count);
-        let mut assets = Vec::with_capacity(count);
         for (info, position) in infos.iter().zip(positions) {
             if info.cluster as usize >= text.len() || !text.is_char_boundary(info.cluster as usize)
             {
@@ -315,31 +370,69 @@ impl TextSystem {
                 offset_26_6: [position.x_offset, position.y_offset],
                 advance_26_6: [position.x_advance, position.y_advance],
             });
-            if !assets.iter().any(|asset: &GlyphAsset| asset.key == key) {
-                let bitmap = self.rasterize(key)?;
-                assets.push(GlyphAsset { key, bitmap });
+        }
+        Ok(ShapedRun { glyphs })
+    }
+
+    /// Rasterizes a complete scene working set while pinning every requested key up front.
+    ///
+    /// # Errors
+    /// Returns a typed font or capacity error without exposing a partial asset list.
+    pub fn rasterize_working_set(
+        &mut self,
+        keys: &[GlyphKey],
+    ) -> Result<Vec<GlyphAsset>, TextError> {
+        let mut seen = HashSet::with_capacity(keys.len().min(MAX_GLYPH_BITMAPS));
+        let mut unique = Vec::with_capacity(keys.len().min(MAX_GLYPH_BITMAPS));
+        for key in keys {
+            if key.font_generation != self.generation {
+                return Err(TextError::StalePreparedState);
+            }
+            if seen.insert(*key) {
+                unique.push(*key);
+            }
+            if unique.len() > MAX_GLYPH_BITMAPS {
+                return Err(TextError::CapacityExceeded("glyph bitmap entries"));
             }
         }
-        Ok(ShapedCluster { glyphs, assets })
+        if let Some(pins) = self.scene_pins.as_mut() {
+            pins.extend(unique.iter().copied());
+        }
+        let mut assets = Vec::with_capacity(unique.len());
+        let mut bitmap_bytes = 0_usize;
+        for key in unique {
+            let bitmap = self.rasterize(key)?;
+            bitmap_bytes = bitmap_bytes
+                .checked_add(bitmap.coverage.len())
+                .ok_or(TextError::CapacityExceeded("glyph working-set bytes"))?;
+            if bitmap_bytes > MAX_GLYPH_BITMAP_BYTES {
+                return Err(TextError::CapacityExceeded("glyph working-set bytes"));
+            }
+            assets.push(GlyphAsset { key, bitmap });
+        }
+        Ok(assets)
     }
 
     fn rasterize(&mut self, key: GlyphKey) -> Result<GlyphBitmap, TextError> {
-        if let Some(bitmap) = self.glyph_cache.get(&key) {
-            return Ok(bitmap.clone());
+        self.cache_clock = self.cache_clock.saturating_add(1);
+        if let Some(cached) = self.glyph_cache.get_mut(&key) {
+            cached.last_used = self.cache_clock;
+            let bitmap = cached.bitmap.clone();
+            if let Some(pins) = self.scene_pins.as_mut() {
+                pins.insert(key);
+            }
+            return Ok(bitmap);
         }
-        if self.glyph_cache.len() >= MAX_GLYPH_BITMAPS {
-            return Err(TextError::CapacityExceeded("glyph bitmap cache entries"));
-        }
-        let face = self.face(key.face)?;
+        let face = self.face(key.face)?.raw;
         let load = ft::FT_LOAD_DEFAULT | ft::FT_LOAD_TARGET_NORMAL;
         // SAFETY: face is UI-thread-owned and glyph slot data is copied before the next call.
-        if unsafe { ft::FT_Load_Glyph(face.raw, key.glyph_id, load) } != 0 {
+        if unsafe { ft::FT_Load_Glyph(face, key.glyph_id, load) } != 0 {
             return Err(TextError::FontData(format!(
                 "cannot load glyph {}",
                 key.glyph_id
             )));
         }
-        let slot = unsafe { (*face.raw).glyph };
+        let slot = unsafe { (*face).glyph };
         if slot.is_null() {
             return Err(TextError::FontData(
                 "FreeType returned a null glyph slot".into(),
@@ -375,12 +468,7 @@ impl TextSystem {
         let output_len = rows
             .checked_mul(width)
             .ok_or(TextError::CapacityExceeded("glyph bitmap"))?;
-        if self
-            .glyph_cache_bytes
-            .checked_add(output_len)
-            .as_ref()
-            .is_none_or(|value| *value > MAX_GLYPH_BITMAP_BYTES)
-        {
+        if output_len > MAX_GLYPH_BITMAP_BYTES {
             return Err(TextError::CapacityExceeded("glyph bitmap cache bytes"));
         }
         if source_len > 0 && raw.buffer.is_null() {
@@ -410,9 +498,54 @@ impl TextSystem {
                 .map_err(|_| TextError::FontData("glyph advance overflow".into()))?,
             coverage: Arc::from(coverage),
         };
-        self.glyph_cache_bytes += output_len;
-        self.glyph_cache.insert(key, bitmap.clone());
+        self.make_cache_room(output_len)?;
+        self.glyph_cache_bytes = self
+            .glyph_cache_bytes
+            .checked_add(output_len)
+            .ok_or(TextError::CapacityExceeded("glyph bitmap cache bytes"))?;
+        self.glyph_cache.insert(
+            key,
+            CachedGlyph {
+                bitmap: bitmap.clone(),
+                last_used: self.cache_clock,
+            },
+        );
+        if let Some(pins) = self.scene_pins.as_mut() {
+            pins.insert(key);
+        }
         Ok(bitmap)
+    }
+
+    fn make_cache_room(&mut self, incoming_bytes: usize) -> Result<(), TextError> {
+        while self.glyph_cache.len() >= MAX_GLYPH_BITMAPS
+            || self
+                .glyph_cache_bytes
+                .checked_add(incoming_bytes)
+                .is_none_or(|bytes| bytes > MAX_GLYPH_BITMAP_BYTES)
+        {
+            let oldest = self
+                .glyph_cache
+                .iter()
+                .filter(|(key, _)| {
+                    !self
+                        .scene_pins
+                        .as_ref()
+                        .is_some_and(|pins| pins.contains(key))
+                })
+                .min_by_key(|(_, cached)| cached.last_used)
+                .map(|(key, _)| *key)
+                .ok_or(TextError::CapacityExceeded("glyph bitmap cache bytes"))?;
+            let removed = self
+                .glyph_cache
+                .remove(&oldest)
+                .ok_or(TextError::CapacityExceeded("glyph bitmap cache entries"))?;
+            self.glyph_cache_bytes = self
+                .glyph_cache_bytes
+                .checked_sub(removed.bitmap.coverage.len())
+                .ok_or(TextError::CapacityExceeded("glyph bitmap cache accounting"))?;
+            self.cache_evictions = self.cache_evictions.saturating_add(1);
+        }
+        Ok(())
     }
 
     fn resolve_face(
@@ -433,7 +566,17 @@ impl TextSystem {
             return Ok(*id);
         }
         if self.faces.len() >= MAX_FACES {
-            return Err(TextError::CapacityExceeded("font faces"));
+            tracing::debug!(
+                category = "capacity_pressure",
+                operation = "font_face_fallback",
+                limit = MAX_FACES,
+                "font face capacity reached; using primary face"
+            );
+            return self
+                .faces
+                .first()
+                .map(|face| face.id)
+                .ok_or(TextError::CapacityExceeded("font faces"));
         }
         let path_c = CString::new(path.as_bytes())
             .map_err(|_| TextError::FontData("font path contains NUL".into()))?;
@@ -656,8 +799,8 @@ fn metrics(face: ft::FT_Face) -> Result<CellMetrics, TextError> {
     }
     let value = unsafe { (*size).metrics };
     let width = ceil_26_6(value.max_advance)?.max(1);
-    let height = ceil_26_6(value.height)?.max(1);
     let baseline = ceil_26_6(value.ascender)?;
+    let height = cell_height_26_6(value.height, value.ascender, value.descender)?;
     let y_scale = value.y_scale;
     let underline = i64::from(unsafe { (*face).underline_position }) * y_scale / 65_536 / 64;
     let thickness =
@@ -688,6 +831,14 @@ fn ceil_26_6(value: i64) -> Result<i64, TextError> {
         .ok_or(TextError::CapacityExceeded("font metrics"))
 }
 
+fn cell_height_26_6(height: i64, ascender: i64, descender: i64) -> Result<i64, TextError> {
+    let line_height = ceil_26_6(height)?.max(1);
+    let glyph_extent = ceil_26_6(ascender)?
+        .checked_sub(descender.div_euclid(64))
+        .ok_or(TextError::CapacityExceeded("font metrics"))?;
+    Ok(line_height.max(glyph_extent).max(1))
+}
+
 fn checked_i16<T: TryInto<i16>>(value: T) -> Result<i16, TextError> {
     value
         .try_into()
@@ -711,6 +862,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cell_height_includes_the_complete_descender_pixel_extent() {
+        assert_eq!(cell_height_26_6(17 * 64, 14 * 64, -4 * 64).unwrap(), 18);
+    }
+
+    #[test]
+    fn underscore_bitmap_fits_inside_the_default_cell() {
+        let request = FontRequest::from_points("monospace", 11.0, 120, false).unwrap();
+        let mut system = TextSystem::new(request).unwrap();
+        let baseline = i32::from(system.metrics().baseline_px);
+        let cell_height = i32::from(system.metrics().height_px.get());
+        let shaped = system.shape_cluster("_", FontStyle::Regular).unwrap();
+
+        for asset in shaped.assets {
+            let top = baseline - i32::from(asset.bitmap.bearing_px[1]);
+            let bottom = top + i32::from(asset.bitmap.size_px[1]);
+            assert!(bottom <= cell_height, "underscore extends below its cell");
+        }
+    }
+
+    fn cached_glyph(id: u32, bytes: usize, last_used: u64) -> (GlyphKey, CachedGlyph) {
+        let key = GlyphKey {
+            font_generation: 1,
+            face: FaceId(0),
+            glyph_id: id,
+            synthetic_bold: false,
+            synthetic_italic: false,
+        };
+        let bitmap = GlyphBitmap {
+            size_px: [0, 0],
+            bearing_px: [0, 0],
+            advance_26_6: 0,
+            coverage: Arc::from(vec![0; bytes]),
+        };
+        (key, CachedGlyph { bitmap, last_used })
+    }
+
+    #[test]
     fn repeated_supported_clusters_reuse_the_loaded_face() {
         let request = FontRequest::from_points("monospace", 11.0, 120, false).unwrap();
         let mut system = TextSystem::new(request).unwrap();
@@ -719,5 +907,86 @@ mod tests {
             system.shape_cluster(cluster, FontStyle::Regular).unwrap();
         }
         assert_eq!(system.faces.len(), initial_faces);
+    }
+
+    #[test]
+    fn shaping_phase_does_not_populate_the_bitmap_cache() {
+        let request = FontRequest::from_points("monospace", 11.0, 120, false).unwrap();
+        let mut system = TextSystem::new(request).unwrap();
+
+        let shaped = system
+            .shape_cluster_only("two phase", FontStyle::Regular)
+            .unwrap();
+        assert!(!shaped.glyphs.is_empty());
+        assert_eq!(system.cache_stats().entries, 0);
+
+        system.begin_scene();
+        let keys = shaped
+            .glyphs
+            .iter()
+            .map(|glyph| glyph.key)
+            .collect::<Vec<_>>();
+        let assets = system.rasterize_working_set(&keys).unwrap();
+        assert_eq!(assets.len(), system.cache_stats().pinned);
+        assert_eq!(assets.len(), system.cache_stats().entries);
+        system.end_scene();
+    }
+
+    #[test]
+    fn working_set_rejects_stale_generation_before_rasterizing() {
+        let request = FontRequest::from_points("monospace", 11.0, 120, false).unwrap();
+        let mut system = TextSystem::new(request).unwrap();
+        let mut key = system
+            .shape_cluster_only("x", FontStyle::Regular)
+            .unwrap()
+            .glyphs[0]
+            .key;
+        key.font_generation = key.font_generation.saturating_add(1);
+
+        assert!(matches!(
+            system.rasterize_working_set(&[key]),
+            Err(TextError::StalePreparedState)
+        ));
+        assert_eq!(system.cache_stats().entries, 0);
+    }
+
+    #[test]
+    fn cache_pressure_evicts_the_oldest_entry_and_preserves_accounting() {
+        let request = FontRequest::from_points("monospace", 11.0, 120, false).unwrap();
+        let mut system = TextSystem::new(request).unwrap();
+        let (old_key, old) = cached_glyph(1, 1, 1);
+        let (new_key, new) = cached_glyph(2, 1, 2);
+        system.glyph_cache.insert(old_key, old);
+        system.glyph_cache.insert(new_key, new);
+        system.glyph_cache_bytes = 2;
+
+        system.make_cache_room(MAX_GLYPH_BITMAP_BYTES - 1).unwrap();
+
+        assert!(!system.glyph_cache.contains_key(&old_key));
+        assert!(system.glyph_cache.contains_key(&new_key));
+        assert_eq!(system.glyph_cache_bytes, 1);
+        assert_eq!(system.cache_evictions, 1);
+    }
+
+    #[test]
+    fn scene_pins_exclude_the_current_working_set_from_eviction() {
+        let request = FontRequest::from_points("monospace", 11.0, 120, false).unwrap();
+        let mut system = TextSystem::new(request).unwrap();
+        let (pinned_key, pinned) = cached_glyph(1, 1, 1);
+        let (other_key, other) = cached_glyph(2, 1, 2);
+        system.glyph_cache.insert(pinned_key, pinned);
+        system.glyph_cache.insert(other_key, other);
+        system.glyph_cache_bytes = 2;
+        system.scene_pins = Some(HashSet::from([pinned_key]));
+
+        system.make_cache_room(MAX_GLYPH_BITMAP_BYTES - 1).unwrap();
+        assert!(system.glyph_cache.contains_key(&pinned_key));
+        assert!(!system.glyph_cache.contains_key(&other_key));
+
+        assert!(matches!(
+            system.make_cache_room(MAX_GLYPH_BITMAP_BYTES),
+            Err(TextError::CapacityExceeded("glyph bitmap cache bytes"))
+        ));
+        assert!(system.glyph_cache.contains_key(&pinned_key));
     }
 }

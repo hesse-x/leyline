@@ -365,6 +365,7 @@ dependencies = [
  "freetype-sys",
  "harfbuzz-sys",
  "thiserror",
+ "tracing",
  "yeslogic-fontconfig-sys",
 ]
 
@@ -922,8 +923,6 @@ checksum = "accd4ea62f7bb7a82fe23066fb0957d48ef677f6eeb8215f372f52e48bb32426"
 [[package]]
 name = "vte"
 version = "0.15.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5924018406ce0063cd67f8e008104968b74b563ee1b85dde3ed1f7cb87d3dbd"
 dependencies = [
  "arrayvec",
  "bitflags",

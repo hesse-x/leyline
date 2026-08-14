@@ -16,21 +16,46 @@ pub struct AtlasRect {
     pub height: u16,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct ShelfPage {
     x: u16,
     y: u16,
     row_height: u16,
 }
 
+#[derive(Clone)]
 pub struct AtlasManager {
     pages: Vec<ShelfPage>,
     entries: HashMap<GlyphKey, AtlasRect>,
+    epoch: u64,
+    repacks: u64,
 }
 
 pub struct AtlasPreparation {
     pub uploads: Vec<(AtlasRect, GlyphAsset)>,
     pub instances: Vec<GlyphInstance>,
+    next: AtlasManager,
+    repacked: bool,
+}
+
+impl AtlasPreparation {
+    #[must_use]
+    pub const fn is_repack(&self) -> bool {
+        self.repacked
+    }
+
+    #[must_use]
+    pub fn instances(&self) -> &[GlyphInstance] {
+        &self.instances
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AtlasStats {
+    pub pages: usize,
+    pub entries: usize,
+    pub epoch: u64,
+    pub repacks: u64,
 }
 
 impl AtlasManager {
@@ -39,83 +64,83 @@ impl AtlasManager {
         Self {
             pages: vec![ShelfPage::default()],
             entries: HashMap::new(),
+            epoch: 0,
+            repacks: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn stats(&self) -> AtlasStats {
+        AtlasStats {
+            pages: self.pages.len(),
+            entries: self.entries.len(),
+            epoch: self.epoch,
+            repacks: self.repacks,
         }
     }
 
     #[allow(clippy::cast_precision_loss)]
     pub fn prepare(
-        &mut self,
+        &self,
         placements: &[GlyphPlacement],
         assets: &[GlyphAsset],
     ) -> Result<AtlasPreparation, AtlasError> {
+        let mut next = self.clone();
         let mut uploads = Vec::new();
         for asset in assets {
-            if asset.bitmap.size_px == [0, 0] || self.entries.contains_key(&asset.key) {
+            if asset.bitmap.size_px == [0, 0] || next.entries.contains_key(&asset.key) {
                 continue;
             }
-            let rect = self.allocate(asset.bitmap.size_px[0], asset.bitmap.size_px[1])?;
-            self.entries.insert(asset.key, rect);
+            let rect = match next.allocate(asset.bitmap.size_px[0], asset.bitmap.size_px[1]) {
+                Ok(rect) => rect,
+                Err(AtlasError::Full) => return self.prepare_repack(placements, assets),
+                Err(error) => return Err(error),
+            };
+            next.entries.insert(asset.key, rect);
             uploads.push((rect, asset.clone()));
         }
-        let mut instances = Vec::with_capacity(placements.len());
-        for placement in placements {
-            let Some(rect) = self.entries.get(&placement.key).copied() else {
-                continue;
-            };
-            let asset = assets
-                .iter()
-                .find(|asset| asset.key == placement.key)
-                .ok_or(AtlasError::MissingAsset)?;
-            let bitmap = &asset.bitmap;
-            let mut x = placement.origin_px[0];
-            let mut y = placement.origin_px[1];
-            let mut width = i32::from(bitmap.size_px[0]);
-            let mut height = i32::from(bitmap.size_px[1]);
-            let clip_x = i32::try_from(placement.clip_px[0]).map_err(|_| AtlasError::Overflow)?;
-            let clip_y = i32::try_from(placement.clip_px[1]).map_err(|_| AtlasError::Overflow)?;
-            let clip_right = clip_x.saturating_add(
-                i32::try_from(placement.clip_px[2]).map_err(|_| AtlasError::Overflow)?,
-            );
-            let clip_bottom = clip_y.saturating_add(
-                i32::try_from(placement.clip_px[3]).map_err(|_| AtlasError::Overflow)?,
-            );
-            let left_crop = (clip_x - x).clamp(0, width);
-            let top_crop = (clip_y - y).clamp(0, height);
-            x += left_crop;
-            y += top_crop;
-            width -= left_crop;
-            height -= top_crop;
-            width = width.min((clip_right - x).max(0));
-            height = height.min((clip_bottom - y).max(0));
-            if width == 0 || height == 0 {
+        let instances = build_instances(&next.entries, placements, assets)?;
+        Ok(AtlasPreparation {
+            uploads,
+            instances,
+            next,
+            repacked: false,
+        })
+    }
+
+    fn prepare_repack(
+        &self,
+        placements: &[GlyphPlacement],
+        assets: &[GlyphAsset],
+    ) -> Result<AtlasPreparation, AtlasError> {
+        let mut next = Self::new();
+        next.epoch = self.epoch.checked_add(1).ok_or(AtlasError::Overflow)?;
+        next.repacks = self.repacks.saturating_add(1);
+        let mut uploads = Vec::new();
+        for asset in assets {
+            if asset.bitmap.size_px == [0, 0] || next.entries.contains_key(&asset.key) {
                 continue;
             }
-            let atlas = f32::from(ATLAS_PAGE_SIZE);
-            instances.push(GlyphInstance {
-                origin_px: [x as f32, y as f32],
-                size_px: [width as f32, height as f32],
-                uv_min: [
-                    f32::from(rect.x + u16::try_from(left_crop).map_err(|_| AtlasError::Overflow)?)
-                        / atlas,
-                    f32::from(rect.y + u16::try_from(top_crop).map_err(|_| AtlasError::Overflow)?)
-                        / atlas,
-                ],
-                uv_max: [
-                    f32::from(
-                        rect.x
-                            + u16::try_from(left_crop + width).map_err(|_| AtlasError::Overflow)?,
-                    ) / atlas,
-                    f32::from(
-                        rect.y
-                            + u16::try_from(top_crop + height).map_err(|_| AtlasError::Overflow)?,
-                    ) / atlas,
-                ],
-                color: placement.color,
-                atlas_page: rect.page,
-            });
+            let rect = next.allocate(asset.bitmap.size_px[0], asset.bitmap.size_px[1])?;
+            next.entries.insert(asset.key, rect);
+            uploads.push((rect, asset.clone()));
         }
-        instances.sort_by_key(|glyph| glyph.atlas_page);
-        Ok(AtlasPreparation { uploads, instances })
+        let instances = build_instances(&next.entries, placements, assets)?;
+        Ok(AtlasPreparation {
+            uploads,
+            instances,
+            next,
+            repacked: true,
+        })
+    }
+
+    pub fn commit(&mut self, preparation: AtlasPreparation) -> AtlasCommit {
+        let result = AtlasCommit {
+            instances: preparation.instances,
+            repacked: preparation.repacked,
+        };
+        *self = preparation.next;
+        result
     }
 
     fn allocate(&mut self, width: u16, height: u16) -> Result<AtlasRect, AtlasError> {
@@ -155,6 +180,74 @@ impl AtlasManager {
     }
 }
 
+pub struct AtlasCommit {
+    pub instances: Vec<GlyphInstance>,
+    pub repacked: bool,
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn build_instances(
+    entries: &HashMap<GlyphKey, AtlasRect>,
+    placements: &[GlyphPlacement],
+    assets: &[GlyphAsset],
+) -> Result<Vec<GlyphInstance>, AtlasError> {
+    let mut instances = Vec::with_capacity(placements.len());
+    for placement in placements {
+        let Some(rect) = entries.get(&placement.key).copied() else {
+            continue;
+        };
+        let asset = assets
+            .iter()
+            .find(|asset| asset.key == placement.key)
+            .ok_or(AtlasError::MissingAsset)?;
+        let bitmap = &asset.bitmap;
+        let mut x = placement.origin_px[0];
+        let mut y = placement.origin_px[1];
+        let mut width = i32::from(bitmap.size_px[0]);
+        let mut height = i32::from(bitmap.size_px[1]);
+        let clip_x = i32::try_from(placement.clip_px[0]).map_err(|_| AtlasError::Overflow)?;
+        let clip_y = i32::try_from(placement.clip_px[1]).map_err(|_| AtlasError::Overflow)?;
+        let clip_right = clip_x
+            .saturating_add(i32::try_from(placement.clip_px[2]).map_err(|_| AtlasError::Overflow)?);
+        let clip_bottom = clip_y
+            .saturating_add(i32::try_from(placement.clip_px[3]).map_err(|_| AtlasError::Overflow)?);
+        let left_crop = (clip_x - x).clamp(0, width);
+        let top_crop = (clip_y - y).clamp(0, height);
+        x += left_crop;
+        y += top_crop;
+        width -= left_crop;
+        height -= top_crop;
+        width = width.min((clip_right - x).max(0));
+        height = height.min((clip_bottom - y).max(0));
+        if width == 0 || height == 0 {
+            continue;
+        }
+        let atlas = f32::from(ATLAS_PAGE_SIZE);
+        instances.push(GlyphInstance {
+            origin_px: [x as f32, y as f32],
+            size_px: [width as f32, height as f32],
+            uv_min: [
+                f32::from(rect.x + u16::try_from(left_crop).map_err(|_| AtlasError::Overflow)?)
+                    / atlas,
+                f32::from(rect.y + u16::try_from(top_crop).map_err(|_| AtlasError::Overflow)?)
+                    / atlas,
+            ],
+            uv_max: [
+                f32::from(
+                    rect.x + u16::try_from(left_crop + width).map_err(|_| AtlasError::Overflow)?,
+                ) / atlas,
+                f32::from(
+                    rect.y + u16::try_from(top_crop + height).map_err(|_| AtlasError::Overflow)?,
+                ) / atlas,
+            ],
+            color: placement.color,
+            atlas_page: rect.page,
+        });
+    }
+    instances.sort_by_key(|glyph| glyph.atlas_page);
+    Ok(instances)
+}
+
 impl Default for AtlasManager {
     fn default() -> Self {
         Self::new()
@@ -176,6 +269,40 @@ pub enum AtlasError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leyline_text::{FaceId, GlyphBitmap};
+    use std::sync::Arc;
+
+    fn asset(id: u32, size: [u16; 2]) -> GlyphAsset {
+        GlyphAsset {
+            key: GlyphKey {
+                font_generation: 1,
+                face: FaceId(0),
+                glyph_id: id,
+                synthetic_bold: false,
+                synthetic_italic: false,
+            },
+            bitmap: GlyphBitmap {
+                size_px: size,
+                bearing_px: [0, 0],
+                advance_26_6: 64,
+                coverage: Arc::from([]),
+            },
+        }
+    }
+
+    fn placement(asset: &GlyphAsset) -> GlyphPlacement {
+        GlyphPlacement {
+            key: asset.key,
+            origin_px: [0, 0],
+            clip_px: [
+                0,
+                0,
+                u32::from(asset.bitmap.size_px[0]),
+                u32::from(asset.bitmap.size_px[1]),
+            ],
+            color: crate::LinearColor::from_srgba8(0xffff_ffff),
+        }
+    }
     #[test]
     fn allocation_includes_transparent_gutter() {
         let mut atlas = AtlasManager::new();
@@ -191,5 +318,57 @@ mod tests {
             let _ = atlas.allocate(2046, 2046).unwrap();
         }
         assert!(matches!(atlas.allocate(2046, 2046), Err(AtlasError::Full)));
+    }
+
+    #[test]
+    fn prepare_is_atomic_until_explicit_commit() {
+        let mut atlas = AtlasManager::new();
+        let glyph = asset(1, [10, 10]);
+        let prepared = atlas.prepare(&[placement(&glyph)], &[glyph]).unwrap();
+        assert_eq!(atlas.stats().entries, 0);
+        atlas.commit(prepared);
+        assert_eq!(atlas.stats().entries, 1);
+    }
+
+    #[test]
+    fn full_atlas_repacks_only_the_current_working_set() {
+        let mut atlas = AtlasManager::new();
+        let initial: Vec<_> = (0..MAX_ATLAS_PAGES)
+            .map(|id| asset(u32::try_from(id).unwrap(), [2046, 2046]))
+            .collect();
+        let placements: Vec<_> = initial.iter().map(placement).collect();
+        let prepared = atlas.prepare(&placements, &initial).unwrap();
+        atlas.commit(prepared);
+        assert_eq!(atlas.stats().pages, MAX_ATLAS_PAGES);
+
+        let replacement = asset(99, [64, 64]);
+        let prepared = atlas
+            .prepare(&[placement(&replacement)], &[replacement])
+            .unwrap();
+        let commit = atlas.commit(prepared);
+        assert!(commit.repacked);
+        assert_eq!(atlas.stats().entries, 1);
+        assert_eq!(atlas.stats().pages, 1);
+        assert_eq!(atlas.stats().epoch, 1);
+    }
+
+    #[test]
+    fn failed_repack_preserves_the_active_epoch_and_entries() {
+        let mut atlas = AtlasManager::new();
+        let initial = asset(1, [64, 64]);
+        atlas.commit(
+            atlas
+                .prepare(&[placement(&initial)], std::slice::from_ref(&initial))
+                .unwrap(),
+        );
+        let before = atlas.stats();
+        let oversized: Vec<_> = (10..15).map(|id| asset(id, [2046, 2046])).collect();
+        let placements: Vec<_> = oversized.iter().map(placement).collect();
+
+        assert!(matches!(
+            atlas.prepare(&placements, &oversized),
+            Err(AtlasError::Full)
+        ));
+        assert_eq!(atlas.stats(), before);
     }
 }

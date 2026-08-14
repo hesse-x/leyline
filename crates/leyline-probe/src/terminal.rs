@@ -58,6 +58,7 @@ pub fn run(reporter: &mut Reporter, fixture: Option<&Path>) -> ProbeResult<()> {
     let mut term = Term::new(Config::default(), &size, listener);
     let mut parser: ansi::Processor = ansi::Processor::new();
     parser.advance(&mut term, &bytes);
+    let audit = parser.take_audit_delta();
 
     let visible: String = term
         .renderable_content()
@@ -83,10 +84,16 @@ pub fn run(reporter: &mut Reporter, fixture: Option<&Path>) -> ProbeResult<()> {
     }
     term.resize(TermSize::new(100, 30));
     let captured = events.borrow();
-    if !captured.contains(&"title") || !captured.contains(&"clipboard") {
+    if !captured.contains(&"title") || captured.contains(&"clipboard") {
         return Err(ProbeError::internal(
             "terminal.events",
-            format!("security-sensitive events not intercepted: {captured:?}"),
+            format!("security-sensitive event boundary was bypassed: {captured:?}"),
+        ));
+    }
+    if audit.rejected_actions == 0 {
+        return Err(ProbeError::internal(
+            "terminal.events",
+            "OSC 52 was not rejected by the parser boundary",
         ));
     }
     reporter.pass(
@@ -97,7 +104,11 @@ pub fn run(reporter: &mut Reporter, fixture: Option<&Path>) -> ProbeResult<()> {
             bytes.len()
         ),
     );
-    reporter.pass("terminal", "security-boundary", "OSC title and clipboard actions were emitted to the application listener without external side effects");
+    reporter.pass(
+        "terminal",
+        "security-boundary",
+        "OSC title was emitted to the application listener and OSC 52 was rejected before dispatch",
+    );
     Ok(())
 }
 

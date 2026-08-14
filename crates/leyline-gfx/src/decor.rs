@@ -7,7 +7,15 @@ use wayland_client::{
     protocol::{wl_seat, wl_surface},
 };
 
-use crate::LogicalSize;
+use crate::{LogicalSize, WindowState};
+
+const DEFAULT_CONTENT_SIZE: LogicalSize = LogicalSize {
+    width: 800,
+    height: 500,
+};
+const WINDOW_STATE_ACTIVE: u32 = 1 << 0;
+const WINDOW_STATE_MAXIMIZED: u32 = 1 << 1;
+const WINDOW_STATE_FULLSCREEN: u32 = 1 << 2;
 
 enum Context {}
 enum Frame {}
@@ -45,7 +53,8 @@ struct FrameInterface {
 #[derive(Default)]
 struct CallbackState {
     size: Option<LogicalSize>,
-    pending_size: Option<LogicalSize>,
+    window_state: Option<u32>,
+    pending_configure: Option<(LogicalSize, WindowState)>,
     close: bool,
     commit_requested: bool,
     fatal: Option<String>,
@@ -74,6 +83,10 @@ unsafe extern "C" {
         width: *mut c_int,
         height: *mut c_int,
     ) -> bool;
+    fn libdecor_configuration_get_window_state(
+        configuration: *mut Configuration,
+        window_state: *mut u32,
+    ) -> bool;
     fn libdecor_state_new(width: c_int, height: c_int) -> *mut DecorState;
     fn libdecor_state_free(state: *mut DecorState);
     fn libdecor_frame_commit(
@@ -97,22 +110,32 @@ unsafe extern "C" fn configure(
     let Some(callbacks) = (unsafe { user_data.cast::<CallbackState>().as_mut() }) else {
         return;
     };
-    let (mut width, mut height) = callbacks.size.map_or((800, 500), |size| {
-        (
-            i32::try_from(size.width).unwrap_or(i32::MAX),
-            i32::try_from(size.height).unwrap_or(i32::MAX),
-        )
-    });
-    unsafe {
+    let (mut width, mut height) = (0, 0);
+    let has_size = unsafe {
         libdecor_configuration_get_content_size(
             configuration,
             frame,
             &raw mut width,
             &raw mut height,
-        );
+        )
+    };
+    let suggested_size = has_size.then(|| LogicalSize {
+        width: u32::try_from(width.max(1)).expect("positive libdecor width"),
+        height: u32::try_from(height.max(1)).expect("positive libdecor height"),
+    });
+    let mut configured_state = 0;
+    let configured_state = unsafe {
+        libdecor_configuration_get_window_state(configuration, &raw mut configured_state)
     }
-    width = width.max(1);
-    height = height.max(1);
+    .then_some(configured_state);
+    let (size, raw_state, activation_only) = resolve_configuration(
+        callbacks.size,
+        callbacks.window_state,
+        suggested_size,
+        configured_state,
+    );
+    width = i32::try_from(size.width).unwrap_or(i32::MAX);
+    height = i32::try_from(size.height).unwrap_or(i32::MAX);
     let state = unsafe { libdecor_state_new(width, height) };
     if state.is_null() {
         callbacks.fatal = Some("libdecor_state_new returned null".into());
@@ -122,18 +145,48 @@ unsafe extern "C" fn configure(
         libdecor_frame_commit(frame, state, configuration);
         libdecor_state_free(state);
     }
-    let size = LogicalSize {
-        width: u32::try_from(width).expect("positive libdecor width"),
-        height: u32::try_from(height).expect("positive libdecor height"),
-    };
     tracing::debug!(
         category = "platform",
         width = size.width,
         height = size.height,
+        suggested_width = suggested_size.map(|value| value.width),
+        suggested_height = suggested_size.map(|value| value.height),
+        window_state = raw_state,
+        activation_only,
         "libdecor configured content"
     );
     callbacks.size = Some(size);
-    callbacks.pending_size = Some(size);
+    callbacks.window_state = Some(raw_state);
+    callbacks.pending_configure = Some((size, semantic_window_state(raw_state)));
+}
+
+fn resolve_configuration(
+    previous_size: Option<LogicalSize>,
+    previous_state: Option<u32>,
+    suggested_size: Option<LogicalSize>,
+    configured_state: Option<u32>,
+) -> (LogicalSize, u32, bool) {
+    let next_state = configured_state.or(previous_state).unwrap_or(0);
+    let activation_only = previous_state
+        .zip(configured_state)
+        .is_some_and(|(old, new)| old != new && old ^ new == WINDOW_STATE_ACTIVE);
+    // Activation changes do not alter geometry. Mutter/libdecor can nevertheless pair a
+    // deactivation configure with the original 800x500 height on a portrait maximized output.
+    let size = if activation_only {
+        previous_size.or(suggested_size)
+    } else {
+        suggested_size.or(previous_size)
+    }
+    .unwrap_or(DEFAULT_CONTENT_SIZE);
+    (size, next_state, activation_only)
+}
+
+const fn semantic_window_state(state: u32) -> WindowState {
+    WindowState {
+        maximized: state & WINDOW_STATE_MAXIMIZED != 0,
+        fullscreen: state & WINDOW_STATE_FULLSCREEN != 0,
+        activated: state & WINDOW_STATE_ACTIVE != 0,
+    }
 }
 
 unsafe extern "C" fn close(_: *mut Frame, user_data: *mut c_void) {
@@ -216,8 +269,8 @@ impl Libdecor {
         }
         Ok(())
     }
-    pub(crate) fn take_configured(&mut self) -> Option<LogicalSize> {
-        self.callbacks.pending_size.take()
+    pub(crate) fn take_configured(&mut self) -> Option<(LogicalSize, WindowState)> {
+        self.callbacks.pending_configure.take()
     }
     pub(crate) fn take_close(&mut self) -> bool {
         std::mem::take(&mut self.callbacks.close)
@@ -244,5 +297,56 @@ impl Drop for Libdecor {
             libdecor_frame_unref(self.frame);
             libdecor_unref(self.context);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MAXIMIZED_ACTIVE: u32 = WINDOW_STATE_MAXIMIZED | WINDOW_STATE_ACTIVE;
+
+    #[test]
+    fn activation_only_configure_preserves_maximized_geometry() {
+        let current = LogicalSize {
+            width: 1440,
+            height: 2523,
+        };
+        let stale_size = LogicalSize {
+            width: 1440,
+            height: 500,
+        };
+        let (size, state, activation_only) = resolve_configuration(
+            Some(current),
+            Some(MAXIMIZED_ACTIVE),
+            Some(stale_size),
+            Some(WINDOW_STATE_MAXIMIZED),
+        );
+
+        assert_eq!(size, current);
+        assert_eq!(state, WINDOW_STATE_MAXIMIZED);
+        assert!(activation_only);
+    }
+
+    #[test]
+    fn state_or_real_size_change_accepts_suggested_geometry() {
+        let current = LogicalSize {
+            width: 800,
+            height: 500,
+        };
+        let maximized = LogicalSize {
+            width: 1440,
+            height: 2523,
+        };
+        let (size, state, activation_only) = resolve_configuration(
+            Some(current),
+            Some(WINDOW_STATE_ACTIVE),
+            Some(maximized),
+            Some(MAXIMIZED_ACTIVE),
+        );
+
+        assert_eq!(size, maximized);
+        assert_eq!(state, MAXIMIZED_ACTIVE);
+        assert!(!activation_only);
     }
 }

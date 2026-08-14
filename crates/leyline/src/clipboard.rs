@@ -18,11 +18,11 @@ use rustix::{
     time::Timespec,
 };
 
-const MAX_CLIPBOARD_BYTES: usize = 8 * 1024 * 1024;
+use crate::security::MAX_CLIPBOARD_BYTES;
 const TRANSFER_QUEUE_CAPACITY: usize = 8;
 const TRANSFER_WORKERS: usize = 2;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
-const NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(10);
+const NO_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
 const ABSOLUTE_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,6 +139,17 @@ impl TransferWorkers {
         while let Ok(result) = self.results.try_recv() {
             consume(result);
         }
+    }
+
+    /// Drains at most one UI-round budget and reports whether retained results remain.
+    pub fn drain_round(&self, budget: usize, mut consume: impl FnMut(TransferResult)) -> bool {
+        for _ in 0..budget {
+            let Ok(result) = self.results.try_recv() else {
+                break;
+            };
+            consume(result);
+        }
+        !self.results.is_empty()
     }
 }
 
@@ -608,5 +619,28 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert_eq!(received, Some(Ok("slot reused".into())));
+    }
+
+    #[test]
+    fn result_drain_is_bounded_per_ui_round() {
+        let (jobs, _job_rx) = bounded::<TransferJob>(1);
+        let (result_tx, results) = bounded(TRANSFER_QUEUE_CAPACITY);
+        let workers = TransferWorkers {
+            jobs,
+            results,
+            control: Arc::new(TransferControl::default()),
+            handles: Vec::new(),
+        };
+        for _ in 0..3 {
+            result_tx
+                .send(TransferResult::WriteFailed(TransferError::Timeout))
+                .unwrap();
+        }
+
+        let mut drained = 0;
+        assert!(workers.drain_round(2, |_| drained += 1));
+        assert_eq!(drained, 2);
+        assert!(!workers.drain_round(2, |_| drained += 1));
+        assert_eq!(drained, 3);
     }
 }

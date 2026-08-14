@@ -1,7 +1,13 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use leyline_gfx::{GlyphPlacement, LinearColor, RectangleInstance, SceneData};
-use leyline_text::{FontStyle, GlyphAsset, GlyphKey, ShapedCluster, TextError, TextSystem};
+use leyline_text::{
+    CellMetrics, FontStyle, GlyphAsset, GlyphKey, MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS,
+    MAX_PREPARED_GLYPHS, ShapedRun, TextError, TextSystem,
+};
 
 use crate::{
     clipboard::{PasteConfirmationOverlay, PasteRisk, TransferTarget},
@@ -11,7 +17,10 @@ use crate::{
     terminal::{CellWidth, FrameSnapshot, TerminalColor},
 };
 
-pub const MAX_UNIQUE_GLYPHS: usize = 65_536;
+pub const MAX_UNIQUE_GLYPHS: usize = MAX_GLYPH_BITMAPS;
+
+type ShapedCache = HashMap<(String, FontStyle), ShapedRun>;
+type GlyphAssets = HashMap<GlyphKey, GlyphAsset>;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SelectionOverlay {
@@ -51,6 +60,26 @@ pub fn compose(
     colors: &ColorsConfig,
     cursor_style: CursorStyle,
 ) -> Result<SceneData, ComposeError> {
+    text.begin_scene();
+    let result = compose_active_scene(text, snapshot, overlays, layout, colors, cursor_style);
+    text.end_scene();
+    result
+}
+
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
+fn compose_active_scene(
+    text: &mut TextSystem,
+    snapshot: &FrameSnapshot,
+    overlays: FrameOverlays<'_>,
+    layout: &GridLayout,
+    colors: &ColorsConfig,
+    cursor_style: CursorStyle,
+) -> Result<SceneData, ComposeError> {
     if snapshot.grid != layout.grid
         || snapshot.cells.len() != snapshot.grid.columns() * snapshot.grid.lines()
     {
@@ -65,11 +94,35 @@ pub fn compose(
                 .iter()
                 .any(|range| point_in_range([column, line], *range))
     };
+    let (shaped_cache, mut assets) = prepare_glyph_working_set(
+        text,
+        snapshot,
+        overlays.paste_confirmation,
+        overlays.preedit,
+    )?;
     let mut rectangles = Vec::new();
     let mut glyphs = Vec::new();
-    let mut assets = HashMap::<GlyphKey, GlyphAsset>::new();
-    let mut shaped_cache = HashMap::<(String, FontStyle), ShapedCluster>::new();
     let metrics = text.metrics();
+    if let Some(confirmation) = overlays.paste_confirmation {
+        compose_paste_confirmation(
+            confirmation,
+            layout,
+            metrics,
+            &shaped_cache,
+            &mut rectangles,
+            &mut glyphs,
+            &mut assets,
+        )?;
+        validate_glyph_working_set(&glyphs, &assets)?;
+        return Ok(SceneData {
+            clear: LinearColor::from_srgba8(colors.background.0),
+            rectangles,
+            glyphs,
+            glyph_assets: assets.into_values().collect(),
+            source_generation: snapshot.generation,
+            font_generation: layout.font_generation,
+        });
+    }
     for line in 0..snapshot.grid.lines() {
         let mut background_start = 0_usize;
         let mut background_color = None;
@@ -129,22 +182,16 @@ pub fn compose(
                     (false, true) => FontStyle::Italic,
                     (false, false) => FontStyle::Regular,
                 };
-                let shaped = if let Some(shaped) = shaped_cache.get(&(cluster.clone(), style)) {
-                    shaped.clone()
-                } else {
-                    let shaped = text.shape_cluster(&cluster, style)?;
-                    shaped_cache.insert((cluster, style), shaped.clone());
-                    shaped
-                };
+                let shaped = shaped_cache
+                    .get(&(cluster, style))
+                    .ok_or(ComposeError::Snapshot("missing shaped cell cluster"))?;
                 let span = if cell.width == CellWidth::Wide { 2 } else { 1 };
                 let origin = cell_origin(layout, column, line);
                 let mut pen_x = 0_i32;
-                for glyph in shaped.glyphs {
-                    let bitmap = shaped
-                        .assets
-                        .iter()
-                        .find(|asset| asset.key == glyph.key)
-                        .ok_or(ComposeError::Snapshot("shaper omitted glyph asset"))?;
+                for glyph in &shaped.glyphs {
+                    let bitmap = assets
+                        .get(&glyph.key)
+                        .ok_or(ComposeError::Snapshot("rasterizer omitted glyph asset"))?;
                     if bitmap.bitmap.size_px != [0, 0] {
                         glyphs.push(GlyphPlacement {
                             key: glyph.key,
@@ -166,12 +213,6 @@ pub fn compose(
                         });
                     }
                     pen_x = pen_x.saturating_add(glyph.advance_26_6[0]);
-                }
-                for asset in shaped.assets {
-                    assets.entry(asset.key).or_insert(asset);
-                }
-                if assets.len() > MAX_UNIQUE_GLYPHS {
-                    return Err(ComposeError::Capacity("unique glyphs"));
                 }
             }
             if cell.flags.underline || cell.flags.strikeout {
@@ -253,14 +294,14 @@ pub fn compose(
             usize::from(preedit.anchor[0]),
             usize::from(preedit.anchor[1]),
         );
-        let shaped = text.shape_cluster(&preedit.text, FontStyle::Regular)?;
+        let shaped = shaped_cache
+            .get(&(preedit.text.to_string(), FontStyle::Regular))
+            .ok_or(ComposeError::Snapshot("missing shaped preedit cluster"))?;
         let mut pen_x = 0_i32;
-        for glyph in shaped.glyphs {
-            let bitmap = shaped
-                .assets
-                .iter()
-                .find(|asset| asset.key == glyph.key)
-                .ok_or(ComposeError::Snapshot("shaper omitted preedit glyph asset"))?;
+        for glyph in &shaped.glyphs {
+            let bitmap = assets.get(&glyph.key).ok_or(ComposeError::Snapshot(
+                "rasterizer omitted preedit glyph asset",
+            ))?;
             if bitmap.bitmap.size_px != [0, 0] {
                 glyphs.push(GlyphPlacement {
                     key: glyph.key,
@@ -283,12 +324,6 @@ pub fn compose(
             }
             pen_x = pen_x.saturating_add(glyph.advance_26_6[0]);
         }
-        for asset in shaped.assets {
-            assets.entry(asset.key).or_insert(asset);
-        }
-        if assets.len() > MAX_UNIQUE_GLYPHS {
-            return Err(ComposeError::Capacity("unique glyphs"));
-        }
         let underline_width = u32::try_from((pen_x.max(64) + 63) / 64).unwrap_or(u32::MAX);
         rectangles.push(RectangleInstance {
             origin_px: [
@@ -299,16 +334,7 @@ pub fn compose(
             color: LinearColor::from_srgba8(colors.foreground.0),
         });
     }
-    if let Some(confirmation) = overlays.paste_confirmation {
-        compose_paste_confirmation(
-            text,
-            confirmation,
-            layout,
-            &mut rectangles,
-            &mut glyphs,
-            &mut assets,
-        )?;
-    }
+    validate_glyph_working_set(&glyphs, &assets)?;
     Ok(SceneData {
         clear: LinearColor::from_srgba8(colors.background.0),
         rectangles,
@@ -319,32 +345,169 @@ pub fn compose(
     })
 }
 
+fn prepare_glyph_working_set(
+    text: &mut TextSystem,
+    snapshot: &FrameSnapshot,
+    paste_confirmation: Option<&PasteConfirmationOverlay>,
+    preedit: Option<&PreeditOverlay>,
+) -> Result<(ShapedCache, GlyphAssets), ComposeError> {
+    let mut request_set = HashSet::<(String, FontStyle)>::new();
+    let mut requests = Vec::<(String, FontStyle)>::new();
+    let mut request = |cluster: String, style: FontStyle| {
+        if request_set.insert((cluster.clone(), style)) {
+            requests.push((cluster, style));
+        }
+    };
+    if let Some(confirmation) = paste_confirmation {
+        for line in paste_confirmation_lines(confirmation) {
+            request(line, FontStyle::Regular);
+        }
+    } else {
+        for cell in snapshot.cells.iter() {
+            if matches!(cell.width, CellWidth::Spacer | CellWidth::LeadingSpacer)
+                || cell.flags.hidden
+                || (cell.ch == ' ' && cell.zerowidth.is_none())
+            {
+                continue;
+            }
+            let mut cluster = String::from(cell.ch);
+            if let Some(zero) = &cell.zerowidth {
+                cluster.extend(zero.iter());
+            }
+            let style = match (cell.flags.bold, cell.flags.italic) {
+                (true, true) => FontStyle::BoldItalic,
+                (true, false) => FontStyle::Bold,
+                (false, true) => FontStyle::Italic,
+                (false, false) => FontStyle::Regular,
+            };
+            request(cluster, style);
+        }
+        if let Some(preedit) = preedit
+            && preedit.snapshot_generation == snapshot.generation
+            && !preedit.text.is_empty()
+        {
+            request(preedit.text.to_string(), FontStyle::Regular);
+        }
+    }
+
+    let mut shaped = HashMap::with_capacity(requests.len());
+    let mut key_set = HashSet::new();
+    let mut keys = Vec::new();
+    for (cluster, style) in requests {
+        let run = text.shape_cluster_only(&cluster, style)?;
+        for key in run.glyphs.iter().map(|glyph| glyph.key) {
+            if key_set.insert(key) {
+                keys.push(key);
+            }
+        }
+        if keys.len() > MAX_UNIQUE_GLYPHS {
+            return Err(ComposeError::Capacity("unique glyphs"));
+        }
+        shaped.insert((cluster, style), run);
+    }
+    let placements = count_prepared_placements(snapshot, paste_confirmation, preedit, &shaped);
+    if placements.is_none_or(|count| count > MAX_PREPARED_GLYPHS) {
+        return Err(ComposeError::Capacity("glyph placements"));
+    }
+    let assets = text
+        .rasterize_working_set(&keys)?
+        .into_iter()
+        .map(|asset| (asset.key, asset))
+        .collect();
+    Ok((shaped, assets))
+}
+
+fn count_prepared_placements(
+    snapshot: &FrameSnapshot,
+    paste_confirmation: Option<&PasteConfirmationOverlay>,
+    preedit: Option<&PreeditOverlay>,
+    shaped: &ShapedCache,
+) -> Option<usize> {
+    if let Some(confirmation) = paste_confirmation {
+        paste_confirmation_lines(confirmation)
+            .iter()
+            .try_fold(0_usize, |total, line| {
+                let count = shaped
+                    .get(&(line.clone(), FontStyle::Regular))
+                    .map_or(0, |run| run.glyphs.len());
+                total.checked_add(count)
+            })
+    } else {
+        let mut total = 0_usize;
+        for cell in snapshot.cells.iter().filter(|cell| {
+            !matches!(cell.width, CellWidth::Spacer | CellWidth::LeadingSpacer)
+                && !cell.flags.hidden
+                && (cell.ch != ' ' || cell.zerowidth.is_some())
+        }) {
+            let mut cluster = String::from(cell.ch);
+            if let Some(zero) = &cell.zerowidth {
+                cluster.extend(zero.iter());
+            }
+            let style = match (cell.flags.bold, cell.flags.italic) {
+                (true, true) => FontStyle::BoldItalic,
+                (true, false) => FontStyle::Bold,
+                (false, true) => FontStyle::Italic,
+                (false, false) => FontStyle::Regular,
+            };
+            total = total.checked_add(
+                shaped
+                    .get(&(cluster, style))
+                    .map_or(0, |run| run.glyphs.len()),
+            )?;
+        }
+        if let Some(preedit) = preedit
+            && preedit.snapshot_generation == snapshot.generation
+            && usize::from(preedit.anchor[0]) < snapshot.grid.columns()
+            && usize::from(preedit.anchor[1]) < snapshot.grid.lines()
+            && !preedit.text.is_empty()
+        {
+            let count = shaped
+                .get(&(preedit.text.to_string(), FontStyle::Regular))
+                .map_or(0, |run| run.glyphs.len());
+            total = total.checked_add(count)?;
+        }
+        Some(total)
+    }
+}
+
+fn validate_glyph_working_set(
+    glyphs: &[GlyphPlacement],
+    assets: &GlyphAssets,
+) -> Result<(), ComposeError> {
+    let bitmap_bytes = assets.values().try_fold(0_usize, |total, asset| {
+        total.checked_add(asset.bitmap.coverage.len())
+    });
+    validate_glyph_budget(glyphs.len(), assets.len(), bitmap_bytes)
+}
+
+fn validate_glyph_budget(
+    placements: usize,
+    unique_bitmaps: usize,
+    bitmap_bytes: Option<usize>,
+) -> Result<(), ComposeError> {
+    if placements > MAX_PREPARED_GLYPHS {
+        return Err(ComposeError::Capacity("glyph placements"));
+    }
+    if unique_bitmaps > MAX_UNIQUE_GLYPHS {
+        return Err(ComposeError::Capacity("unique glyphs"));
+    }
+    if bitmap_bytes.is_none_or(|bytes| bytes > MAX_GLYPH_BITMAP_BYTES) {
+        return Err(ComposeError::Capacity("glyph bitmap bytes"));
+    }
+    Ok(())
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn compose_paste_confirmation(
-    text: &mut TextSystem,
     confirmation: &PasteConfirmationOverlay,
     layout: &GridLayout,
+    metrics: CellMetrics,
+    shaped_cache: &ShapedCache,
     rectangles: &mut Vec<RectangleInstance>,
     glyphs: &mut Vec<GlyphPlacement>,
-    assets: &mut HashMap<GlyphKey, GlyphAsset>,
+    assets: &mut GlyphAssets,
 ) -> Result<(), ComposeError> {
-    let source = match confirmation.source {
-        TransferTarget::Clipboard => "Clipboard",
-        TransferTarget::Primary => "Primary selection",
-    };
-    let risk = match confirmation.risk {
-        PasteRisk::Multiline => "Multiple lines may execute commands",
-        PasteRisk::ControlCharacters => "Control characters may alter terminal state",
-    };
-    let lines = [
-        "PASTE REQUIRES CONFIRMATION".to_owned(),
-        format!(
-            "Source: {source}   {} bytes   {} lines",
-            confirmation.bytes, confirmation.lines
-        ),
-        format!("Risk: {risk}"),
-        "Enter / Y  Paste     Esc / N  Cancel".to_owned(),
-    ];
+    let lines = paste_confirmation_lines(confirmation);
     let cell_width = u32::from(layout.cell_px[0].get());
     let cell_height = u32::from(layout.cell_px[1].get());
     let margin = cell_width.saturating_mul(2);
@@ -361,7 +524,6 @@ fn compose_paste_confirmation(
 
     // The modal card deliberately hides terminal content and never receives clipboard text.
     glyphs.clear();
-    assets.clear();
     rectangles.push(RectangleInstance {
         origin_px: [0.0, 0.0],
         size_px: [
@@ -390,12 +552,13 @@ fn compose_paste_confirmation(
         ];
         let color = if index == 0 { 0xf2b8_4bff } else { 0xf4f1_e8ff };
         append_overlay_text(
-            text,
             line,
             origin,
             panel_origin,
             [panel_width, panel_height],
             color,
+            metrics,
+            shaped_cache,
             glyphs,
             assets,
         )?;
@@ -405,24 +568,24 @@ fn compose_paste_confirmation(
 
 #[allow(clippy::too_many_arguments, clippy::cast_possible_wrap)]
 fn append_overlay_text(
-    text: &mut TextSystem,
     value: &str,
     origin: [u32; 2],
     panel_origin: [u32; 2],
     panel_size: [u32; 2],
     color: u32,
+    metrics: CellMetrics,
+    shaped_cache: &ShapedCache,
     glyphs: &mut Vec<GlyphPlacement>,
-    assets: &mut HashMap<GlyphKey, GlyphAsset>,
+    assets: &mut GlyphAssets,
 ) -> Result<(), ComposeError> {
-    let shaped = text.shape_cluster(value, FontStyle::Regular)?;
-    let metrics = text.metrics();
+    let shaped = shaped_cache
+        .get(&(value.to_owned(), FontStyle::Regular))
+        .ok_or(ComposeError::Snapshot("missing shaped overlay cluster"))?;
     let mut pen_x = 0_i32;
-    for glyph in shaped.glyphs {
-        let bitmap = shaped
-            .assets
-            .iter()
-            .find(|asset| asset.key == glyph.key)
-            .ok_or(ComposeError::Snapshot("shaper omitted overlay glyph asset"))?;
+    for glyph in &shaped.glyphs {
+        let bitmap = assets.get(&glyph.key).ok_or(ComposeError::Snapshot(
+            "rasterizer omitted overlay glyph asset",
+        ))?;
         if bitmap.bitmap.size_px != [0, 0] {
             glyphs.push(GlyphPlacement {
                 key: glyph.key,
@@ -445,13 +608,27 @@ fn append_overlay_text(
         }
         pen_x = pen_x.saturating_add(glyph.advance_26_6[0]);
     }
-    for asset in shaped.assets {
-        assets.entry(asset.key).or_insert(asset);
-    }
-    if assets.len() > MAX_UNIQUE_GLYPHS {
-        return Err(ComposeError::Capacity("unique glyphs"));
-    }
     Ok(())
+}
+
+fn paste_confirmation_lines(confirmation: &PasteConfirmationOverlay) -> [String; 4] {
+    let source = match confirmation.source {
+        TransferTarget::Clipboard => "Clipboard",
+        TransferTarget::Primary => "Primary selection",
+    };
+    let risk = match confirmation.risk {
+        PasteRisk::Multiline => "Multiple lines may execute commands",
+        PasteRisk::ControlCharacters => "Control characters may alter terminal state",
+    };
+    [
+        "PASTE REQUIRES CONFIRMATION".to_owned(),
+        format!(
+            "Source: {source}   {} bytes   {} lines",
+            confirmation.bytes, confirmation.lines
+        ),
+        format!("Risk: {risk}"),
+        "Enter / Y  Paste     Esc / N  Cancel".to_owned(),
+    ]
 }
 
 fn validate_widths(snapshot: &FrameSnapshot) -> Result<(), ComposeError> {
@@ -609,8 +786,9 @@ pub enum ComposeError {
 
 #[cfg(test)]
 mod tests {
-    use super::cursor_glyph_color;
+    use super::{cursor_glyph_color, validate_glyph_budget};
     use crate::config::CursorStyle;
+    use leyline_text::{MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS, MAX_PREPARED_GLYPHS};
 
     #[test]
     fn block_cursor_preserves_the_character_with_contrasting_color() {
@@ -628,5 +806,21 @@ mod tests {
             cursor_glyph_color(foreground, background, CursorStyle::Block, false),
             foreground
         );
+    }
+
+    #[test]
+    fn glyph_working_set_limits_are_independent_and_inclusive() {
+        assert!(
+            validate_glyph_budget(
+                MAX_PREPARED_GLYPHS,
+                MAX_GLYPH_BITMAPS,
+                Some(MAX_GLYPH_BITMAP_BYTES),
+            )
+            .is_ok()
+        );
+        assert!(validate_glyph_budget(MAX_PREPARED_GLYPHS + 1, 0, Some(0)).is_err());
+        assert!(validate_glyph_budget(0, MAX_GLYPH_BITMAPS + 1, Some(0)).is_err());
+        assert!(validate_glyph_budget(0, 0, Some(MAX_GLYPH_BITMAP_BYTES + 1)).is_err());
+        assert!(validate_glyph_budget(0, 0, None).is_err());
     }
 }

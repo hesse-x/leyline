@@ -10,6 +10,8 @@ mod vulkan;
 mod wake;
 mod wayland;
 
+pub use atlas::AtlasStats;
+
 pub use input::{
     InputSerial, LogicalKey, ModifierMask, SeatToken, SerialKind, keysym_character,
     logical_key_from_keysym,
@@ -20,5 +22,6 @@ pub use model::{
     RectangleInstance, RenderOutcome, RenderScene, Scale120, SceneData, SelectionTarget,
     TextInputEvent, TextInputRectangle, WindowState,
 };
-pub use runtime::{GfxError, GfxInitError, GfxOptions, GfxRuntime};
+pub use runtime::{GfxError, GfxInitError, GfxOptions, GfxRuntime, MAX_WINDOW_TITLE_BYTES};
+pub use vulkan::{RendererFault, RendererOperation};
 pub use wake::{EventWake, WakeError};

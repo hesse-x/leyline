@@ -3,7 +3,9 @@ mod debug_grid;
 mod input;
 mod snapshot;
 
-pub use core::{TerminalAction, TerminalCoreAdapter, TerminalDelta, TerminalError};
+pub use core::{
+    ParseAuditDelta, TerminalAction, TerminalCoreAdapter, TerminalDelta, TerminalError,
+};
 pub use debug_grid::format_debug_grid;
 pub use input::{
     ButtonState, InputError, MAX_PASTE_BODY_BYTES, MAX_TRANSACTION_BYTES, Modifiers, MouseButton,

@@ -63,6 +63,7 @@ struct GlyphResources {
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     pending: Vec<(AtlasRect, GlyphAsset)>,
+    pending_repack: bool,
 }
 
 #[repr(C)]
@@ -80,7 +81,69 @@ pub(crate) enum RenderStatus {
     Rendered,
     Deferred,
     OutOfDate,
+    SubmittedOutOfDate,
     Suboptimal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RendererOperation {
+    Upload,
+    Fence,
+    Acquire,
+    Recreate,
+    Submit,
+    Present,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+pub enum RendererFault {
+    #[error("swapchain is out of date")]
+    OutOfDate,
+    #[error("swapchain is suboptimal")]
+    Suboptimal,
+    #[error("renderer is not ready")]
+    NotReady,
+    #[error("surface was lost during {operation:?}")]
+    SurfaceLost { operation: RendererOperation },
+    #[error("device was lost during {operation:?}")]
+    DeviceLost { operation: RendererOperation },
+    #[error("host memory was exhausted during {operation:?}")]
+    OutOfHostMemory { operation: RendererOperation },
+    #[error("device memory was exhausted during {operation:?}")]
+    OutOfDeviceMemory { operation: RendererOperation },
+    #[error("Vulkan operation timed out during {operation:?}")]
+    Timeout { operation: RendererOperation },
+    #[error("Vulkan {operation:?} failed with code {code}")]
+    Fatal {
+        operation: RendererOperation,
+        code: i32,
+    },
+    #[error("renderer invariant failed: {0}")]
+    Invariant(String),
+}
+
+#[derive(Default)]
+struct RendererHealth {
+    poisoned: Option<RendererFault>,
+}
+
+impl RendererHealth {
+    fn guard(&self) -> Result<(), RendererFault> {
+        self.poisoned.clone().map_or(Ok(()), Err)
+    }
+
+    fn observe<T>(&mut self, result: Result<T, RendererFault>) -> Result<T, RendererFault> {
+        if let Err(fault @ RendererFault::DeviceLost { .. }) = &result
+            && self.poisoned.is_none()
+        {
+            self.poisoned = Some(fault.clone());
+        }
+        result
+    }
+
+    const fn is_poisoned(&self) -> bool {
+        self.poisoned.is_some()
+    }
 }
 
 struct FrameSlot {
@@ -130,6 +193,7 @@ pub(crate) struct VulkanRenderer {
     current_frame: usize,
     acquired: Option<AcquiredImage>,
     retired: Vec<RetiredSwapchain>,
+    health: RendererHealth,
 }
 
 impl VulkanRenderer {
@@ -236,6 +300,7 @@ impl VulkanRenderer {
             current_frame: 0,
             acquired: None,
             retired: Vec::new(),
+            health: RendererHealth::default(),
         };
         renderer.allocator = Some(
             Allocator::new(&AllocatorCreateDesc {
@@ -254,7 +319,10 @@ impl VulkanRenderer {
                 .map_err(GfxInitError::Device)?,
         );
         renderer.frames = renderer.create_frames().map_err(GfxInitError::Device)?;
-        if !renderer.recreate(target).map_err(GfxInitError::Device)? {
+        if !renderer
+            .recreate(target)
+            .map_err(|error| GfxInitError::Device(error.to_string()))?
+        {
             return Err(GfxInitError::Device(
                 "initial swapchain creation was unexpectedly deferred".into(),
             ));
@@ -270,24 +338,47 @@ impl VulkanRenderer {
     pub(crate) fn upload_glyphs(
         &mut self,
         uploads: &[(AtlasRect, GlyphAsset)],
-    ) -> Result<(), String> {
+        replace_pending: bool,
+    ) -> Result<(), RendererFault> {
+        self.health.guard()?;
+        let retained_bytes = if replace_pending {
+            0
+        } else {
+            self.glyph
+                .as_ref()
+                .expect("glyph resources")
+                .pending
+                .iter()
+                .try_fold(0usize, |total, (_, asset)| {
+                    total.checked_add(asset.bitmap.coverage.len())
+                })
+                .ok_or_else(|| RendererFault::Invariant("glyph upload size overflow".into()))?
+        };
         let bytes = uploads
             .iter()
-            .try_fold(0usize, |total, (_, asset)| {
+            .try_fold(retained_bytes, |total, (_, asset)| {
                 total.checked_add(asset.bitmap.coverage.len())
             })
-            .ok_or("glyph upload size overflow")?;
+            .ok_or_else(|| RendererFault::Invariant("glyph upload size overflow".into()))?;
         if bytes > GLYPH_STAGING_PER_SLOT {
-            return Err(format!(
-                "glyph upload {bytes} exceeds bounded staging partition"
-            ));
+            return Err(RendererFault::Invariant(format!(
+                "glyph upload byte count {bytes} exceeds its bounded staging partition"
+            )));
         }
-        self.glyph
-            .as_mut()
-            .expect("glyph resources")
-            .pending
-            .extend_from_slice(uploads);
+        let glyphs = self.glyph.as_mut().expect("glyph resources");
+        if replace_pending {
+            glyphs.pending.clear();
+            glyphs.pending_repack = true;
+        }
+        glyphs.pending.extend_from_slice(uploads);
         Ok(())
+    }
+
+    pub(crate) fn discard_pending_glyphs(&mut self) {
+        if let Some(glyphs) = self.glyph.as_mut() {
+            glyphs.pending.clear();
+            glyphs.pending_repack = false;
+        }
     }
 
     fn create_frames(&self) -> Result<Vec<FrameSlot>, String> {
@@ -560,6 +651,7 @@ impl VulkanRenderer {
             pipeline_layout,
             pipeline,
             pending: Vec::new(),
+            pending_repack: false,
         })
     }
 
@@ -709,24 +801,28 @@ impl VulkanRenderer {
     fn create_pipeline(
         &self,
         format: vk::Format,
-    ) -> Result<(vk::PipelineLayout, vk::Pipeline), String> {
+    ) -> Result<(vk::PipelineLayout, vk::Pipeline), RendererFault> {
         let vertex_code = ash::util::read_spv(&mut Cursor::new(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/rectangle.vert"
         ))))
-        .map_err(|error| format!("read rectangle vertex shader: {error}"))?;
+        .map_err(|error| {
+            RendererFault::Invariant(format!("read rectangle vertex shader: {error}"))
+        })?;
         let fragment_code = ash::util::read_spv(&mut Cursor::new(include_bytes!(concat!(
             env!("OUT_DIR"),
             "/rectangle.frag"
         ))))
-        .map_err(|error| format!("read rectangle fragment shader: {error}"))?;
+        .map_err(|error| {
+            RendererFault::Invariant(format!("read rectangle fragment shader: {error}"))
+        })?;
         let vertex = unsafe {
             self.device.create_shader_module(
                 &vk::ShaderModuleCreateInfo::default().code(&vertex_code),
                 None,
             )
         }
-        .map_err(vk_error("create rectangle vertex shader"))?;
+        .map_err(|error| classify_vk(RendererOperation::Recreate, error))?;
         let fragment = match unsafe {
             self.device.create_shader_module(
                 &vk::ShaderModuleCreateInfo::default().code(&fragment_code),
@@ -736,9 +832,7 @@ impl VulkanRenderer {
             Ok(module) => module,
             Err(error) => {
                 unsafe { self.device.destroy_shader_module(vertex, None) };
-                return Err(format!(
-                    "create rectangle fragment shader failed: {error:?}"
-                ));
+                return Err(classify_vk(RendererOperation::Recreate, error));
             }
         };
         let push = [vk::PushConstantRange::default()
@@ -750,7 +844,7 @@ impl VulkanRenderer {
                 None,
             )
         }
-        .map_err(vk_error("create rectangle pipeline layout"))?;
+        .map_err(|error| classify_vk(RendererOperation::Recreate, error))?;
         let entry = c"main";
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
@@ -830,7 +924,7 @@ impl VulkanRenderer {
             self.device
                 .create_graphics_pipelines(vk::PipelineCache::null(), &[info], None)
         }
-        .map_err(|(_, error)| format!("create rectangle graphics pipeline failed: {error:?}"))?[0];
+        .map_err(|(_, error)| classify_vk(RendererOperation::Recreate, error))?[0];
         unsafe {
             self.device.destroy_shader_module(fragment, None);
             self.device.destroy_shader_module(vertex, None);
@@ -859,10 +953,18 @@ impl VulkanRenderer {
         }
     }
 
+    pub(crate) fn recreate(&mut self, target: PixelSize) -> Result<bool, RendererFault> {
+        self.health.guard()?;
+        let result = self.recreate_inner(target);
+        self.latch_device_lost(result)
+    }
+
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn recreate(&mut self, target: PixelSize) -> Result<bool, String> {
+    fn recreate_inner(&mut self, target: PixelSize) -> Result<bool, RendererFault> {
         if self.acquired.is_some() {
-            return Err("cannot recreate the swapchain while an acquired image is pending".into());
+            return Err(RendererFault::Invariant(
+                "cannot recreate the swapchain while an acquired image is pending".into(),
+            ));
         }
         self.collect_retired()?;
         if self.retired.len() >= MAX_RETIRED_GENERATIONS {
@@ -872,31 +974,33 @@ impl VulkanRenderer {
             self.surface_loader
                 .get_physical_device_surface_capabilities(self.physical, self.surface)
         }
-        .map_err(vk_error("query surface capabilities"))?;
+        .map_err(|error| classify_vk(RendererOperation::Recreate, error))?;
         if !capabilities
             .supported_usage_flags
             .contains(vk::ImageUsageFlags::COLOR_ATTACHMENT)
         {
-            return Err("Vulkan surface does not support color attachment usage".into());
+            return Err(RendererFault::Invariant(
+                "Vulkan surface does not support color attachment usage".into(),
+            ));
         }
         let formats = unsafe {
             self.surface_loader
                 .get_physical_device_surface_formats(self.physical, self.surface)
         }
-        .map_err(vk_error("query surface formats"))?;
+        .map_err(|error| classify_vk(RendererOperation::Recreate, error))?;
         let modes = unsafe {
             self.surface_loader
                 .get_physical_device_surface_present_modes(self.physical, self.surface)
         }
-        .map_err(vk_error("query present modes"))?;
+        .map_err(|error| classify_vk(RendererOperation::Recreate, error))?;
         let format = select::surface_format(&formats)
-            .ok_or("Vulkan surface exposes no supported 8-bit sRGB format")?;
+            .ok_or_else(|| RendererFault::Invariant("no supported 8-bit sRGB format".into()))?;
         let mode = select::present_mode(&modes)
-            .ok_or("Vulkan surface exposes neither MAILBOX nor FIFO")?;
+            .ok_or_else(|| RendererFault::Invariant("no supported present mode".into()))?;
         let alpha = select::composite_alpha(capabilities.supported_composite_alpha)
-            .ok_or("Vulkan surface exposes no composite alpha mode")?;
-        let extent =
-            select::extent(capabilities, target).ok_or("Vulkan surface has zero extent")?;
+            .ok_or_else(|| RendererFault::Invariant("no supported composite alpha mode".into()))?;
+        let extent = select::extent(capabilities, target)
+            .ok_or_else(|| RendererFault::Invariant("Vulkan surface has zero extent".into()))?;
         let create = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
             .min_image_count(select::image_count(
@@ -915,9 +1019,9 @@ impl VulkanRenderer {
             .clipped(true)
             .old_swapchain(self.swapchain);
         let new_swapchain = unsafe { self.swapchain_loader.create_swapchain(&create, None) }
-            .map_err(vk_error("create swapchain"))?;
+            .map_err(|error| classify_vk(RendererOperation::Recreate, error))?;
         let images = unsafe { self.swapchain_loader.get_swapchain_images(new_swapchain) }
-            .map_err(vk_error("get swapchain images"))?;
+            .map_err(|error| classify_vk(RendererOperation::Recreate, error))?;
         let mut views = Vec::with_capacity(images.len());
         for image in &images {
             let view = unsafe {
@@ -935,7 +1039,7 @@ impl VulkanRenderer {
                     None,
                 )
             }
-            .map_err(vk_error("create swapchain image view"))?;
+            .map_err(|error| classify_vk(RendererOperation::Recreate, error))?;
             views.push(view);
         }
         if self.swapchain != vk::SwapchainKHR::null() {
@@ -975,7 +1079,25 @@ impl VulkanRenderer {
         Ok(true)
     }
 
-    pub(crate) fn render(&mut self, scene: &RenderScene<'_>) -> Result<RenderStatus, String> {
+    pub(crate) fn render(
+        &mut self,
+        scene: &RenderScene<'_>,
+    ) -> Result<RenderStatus, RendererFault> {
+        self.health.guard()?;
+        let result = self.render_inner(scene);
+        self.latch_device_lost(result)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn render_inner(&mut self, scene: &RenderScene<'_>) -> Result<RenderStatus, RendererFault> {
+        if self
+            .glyph
+            .as_ref()
+            .is_some_and(|glyphs| glyphs.pending_repack)
+            && !self.all_frame_fences_ready()?
+        {
+            return Ok(RenderStatus::Deferred);
+        }
         let acquired = if let Some(acquired) = self.acquired {
             acquired
         } else {
@@ -985,7 +1107,7 @@ impl VulkanRenderer {
             match unsafe { self.device.get_fence_status(slot_fence) } {
                 Ok(true) => {}
                 Ok(false) => return Ok(RenderStatus::Deferred),
-                Err(error) => return Err(format!("query frame fence failed: {error:?}")),
+                Err(error) => return Err(classify_vk(RendererOperation::Fence, error)),
             }
             // Retired generations referencing this signaled fence must be destroyed before the
             // frame slot resets it for unrelated work.
@@ -1004,7 +1126,7 @@ impl VulkanRenderer {
                     return Ok(RenderStatus::Deferred);
                 }
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => return Ok(RenderStatus::OutOfDate),
-                Err(error) => return Err(format!("acquire swapchain image failed: {error:?}")),
+                Err(error) => return Err(classify_vk(RendererOperation::Acquire, error)),
             };
             let acquired = AcquiredImage {
                 slot: slot_index,
@@ -1023,7 +1145,7 @@ impl VulkanRenderer {
         let old_fence = self.image_fences[image_index as usize];
         if old_fence != vk::Fence::null()
             && !unsafe { self.device.get_fence_status(old_fence) }
-                .map_err(vk_error("query image fence"))?
+                .map_err(|error| classify_vk(RendererOperation::Fence, error))?
         {
             // The acquire semaphore and image remain owned by this slot. A later timer retry
             // resumes here without acquiring again, so the UI thread remains responsive.
@@ -1032,13 +1154,15 @@ impl VulkanRenderer {
         unsafe {
             self.device
                 .reset_fences(&[slot_fence])
-                .map_err(vk_error("reset frame fence"))?;
+                .map_err(|error| classify_vk(RendererOperation::Submit, error))?;
             self.device
                 .reset_command_pool(slot_pool, vk::CommandPoolResetFlags::empty())
-                .map_err(vk_error("reset command pool"))?;
+                .map_err(|error| classify_vk(RendererOperation::Submit, error))?;
         }
-        self.upload_rectangles(acquired.slot, scene.rectangles)?;
-        self.upload_glyph_instances(acquired.slot, scene.glyphs)?;
+        self.upload_rectangles(acquired.slot, scene.rectangles)
+            .map_err(RendererFault::Invariant)?;
+        self.upload_glyph_instances(acquired.slot, scene.glyphs)
+            .map_err(RendererFault::Invariant)?;
         self.record(slot_command, acquired.slot, image_index as usize, scene)?;
         let wait = [vk::SemaphoreSubmitInfo::default()
             .semaphore(slot_available)
@@ -1052,7 +1176,14 @@ impl VulkanRenderer {
             .command_buffer_infos(&commands)
             .signal_semaphore_infos(&signal)];
         unsafe { self.device.queue_submit2(self.queue, &submits, slot_fence) }
-            .map_err(vk_error("submit frame"))?;
+            .map_err(|error| classify_vk(RendererOperation::Submit, error))?;
+        if let Some(glyphs) = self.glyph.as_mut() {
+            for (rect, _) in &glyphs.pending {
+                glyphs.pages[usize::from(rect.page)].initialized = true;
+            }
+            glyphs.pending.clear();
+            glyphs.pending_repack = false;
+        }
         self.acquired = None;
         self.image_fences[image_index as usize] = slot_fence;
         let waits = [slot_finished];
@@ -1067,9 +1198,9 @@ impl VulkanRenderer {
                 Ok(value) => value,
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                     self.current_frame = (acquired.slot + 1) % self.frames.len();
-                    return Ok(RenderStatus::OutOfDate);
+                    return Ok(RenderStatus::SubmittedOutOfDate);
                 }
-                Err(error) => return Err(format!("present frame failed: {error:?}")),
+                Err(error) => return Err(classify_vk(RendererOperation::Present, error)),
             };
         self.current_frame = (acquired.slot + 1) % self.frames.len();
         if acquired.suboptimal || present_suboptimal {
@@ -1079,6 +1210,21 @@ impl VulkanRenderer {
         Ok(RenderStatus::Rendered)
     }
 
+    fn all_frame_fences_ready(&self) -> Result<bool, RendererFault> {
+        self.frames.iter().try_fold(true, |ready, slot| {
+            unsafe { self.device.get_fence_status(slot.fence) }
+                .map(|signaled| ready && signaled)
+                .map_err(|error| classify_vk(RendererOperation::Fence, error))
+        })
+    }
+
+    fn latch_device_lost<T>(
+        &mut self,
+        result: Result<T, RendererFault>,
+    ) -> Result<T, RendererFault> {
+        self.health.observe(result)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn record(
         &mut self,
@@ -1086,7 +1232,7 @@ impl VulkanRenderer {
         slot: usize,
         image_index: usize,
         scene: &RenderScene<'_>,
-    ) -> Result<(), String> {
+    ) -> Result<(), RendererFault> {
         unsafe {
             self.device.begin_command_buffer(
                 command,
@@ -1094,8 +1240,9 @@ impl VulkanRenderer {
                     .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
             )
         }
-        .map_err(vk_error("begin command buffer"))?;
-        self.upload_glyph_data(slot, command)?;
+        .map_err(|error| classify_vk(RendererOperation::Submit, error))?;
+        self.upload_glyph_data(slot, command)
+            .map_err(RendererFault::Invariant)?;
         transition(
             &self.device,
             command,
@@ -1218,7 +1365,8 @@ impl VulkanRenderer {
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
             vk::AccessFlags2::empty(),
         );
-        unsafe { self.device.end_command_buffer(command) }.map_err(vk_error("end command buffer"))
+        unsafe { self.device.end_command_buffer(command) }
+            .map_err(|error| classify_vk(RendererOperation::Submit, error))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1232,7 +1380,7 @@ impl VulkanRenderer {
             .mapped_slice_mut()
             .ok_or("glyph staging memory is not mapped")?;
         let mut copies = Vec::new();
-        for (rect, asset) in glyphs.pending.drain(..) {
+        for (rect, asset) in &glyphs.pending {
             let bytes = asset.bitmap.coverage.as_ref();
             let end = staging_offset
                 .checked_add(bytes.len())
@@ -1241,12 +1389,14 @@ impl VulkanRenderer {
                 return Err("glyph uploads exceed staging partition".into());
             }
             mapped[staging_offset..end].copy_from_slice(bytes);
-            copies.push((rect, (staging_offset - start_offset) as u64));
+            copies.push((*rect, (staging_offset - start_offset) as u64));
             staging_offset = end;
         }
+        let mut prepared_pages = HashSet::new();
+        let repacking = glyphs.pending_repack;
         for (rect, offset) in copies {
             let page = &mut glyphs.pages[usize::from(rect.page)];
-            let was_initialized = page.initialized;
+            let was_initialized = page.initialized || prepared_pages.contains(&rect.page);
             transition(
                 &self.device,
                 command,
@@ -1270,7 +1420,7 @@ impl VulkanRenderer {
                 },
                 vk::AccessFlags2::TRANSFER_WRITE,
             );
-            if !was_initialized {
+            if !prepared_pages.contains(&rect.page) && (!page.initialized || repacking) {
                 let range = vk::ImageSubresourceRange {
                     aspect_mask: vk::ImageAspectFlags::COLOR,
                     level_count: 1,
@@ -1324,7 +1474,7 @@ impl VulkanRenderer {
                 vk::AccessFlags2::TRANSFER_WRITE,
                 vk::AccessFlags2::SHADER_SAMPLED_READ,
             );
-            page.initialized = true;
+            prepared_pages.insert(rect.page);
         }
         Ok(())
     }
@@ -1400,7 +1550,7 @@ impl VulkanRenderer {
         Ok(())
     }
 
-    fn wait_frames(&self) -> Result<(), String> {
+    fn wait_frames(&self) -> Result<(), RendererFault> {
         let fences: Vec<_> = self.frames.iter().map(|slot| slot.fence).collect();
         if fences.is_empty() {
             return Ok(());
@@ -1409,10 +1559,10 @@ impl VulkanRenderer {
             self.device
                 .wait_for_fences(&fences, true, FENCE_TIMEOUT.as_nanos() as u64)
         }
-        .map_err(vk_error("wait for frame retirement"))
+        .map_err(|error| classify_vk(RendererOperation::Fence, error))
     }
 
-    fn collect_retired(&mut self) -> Result<(), String> {
+    fn collect_retired(&mut self) -> Result<(), RendererFault> {
         let mut index = 0;
         while index < self.retired.len() {
             let ready = self.retired[index]
@@ -1421,7 +1571,7 @@ impl VulkanRenderer {
                 .try_fold(true, |ready, fence| {
                     unsafe { self.device.get_fence_status(*fence) }
                         .map(|signaled| ready && signaled)
-                        .map_err(vk_error("query retired swapchain fence"))
+                        .map_err(|error| classify_vk(RendererOperation::Fence, error))
                 })?;
             if ready {
                 let generation = self.retired.swap_remove(index);
@@ -1447,7 +1597,9 @@ impl VulkanRenderer {
 
 impl Drop for VulkanRenderer {
     fn drop(&mut self) {
-        let _ = self.wait_frames();
+        if !self.health.is_poisoned() {
+            let _ = self.wait_frames();
+        }
         for generation in self.retired.drain(..) {
             for view in generation.views {
                 unsafe { self.device.destroy_image_view(view, None) };
@@ -1647,9 +1799,41 @@ fn vk_error(context: &'static str) -> impl FnOnce(vk::Result) -> String {
     move |error| format!("{context}: {error:?}")
 }
 
+fn classify_vk(operation: RendererOperation, error: vk::Result) -> RendererFault {
+    match error {
+        vk::Result::ERROR_OUT_OF_DATE_KHR => RendererFault::OutOfDate,
+        vk::Result::SUBOPTIMAL_KHR => RendererFault::Suboptimal,
+        vk::Result::NOT_READY => RendererFault::NotReady,
+        vk::Result::TIMEOUT => RendererFault::Timeout { operation },
+        vk::Result::ERROR_SURFACE_LOST_KHR => RendererFault::SurfaceLost { operation },
+        vk::Result::ERROR_DEVICE_LOST => RendererFault::DeviceLost { operation },
+        vk::Result::ERROR_OUT_OF_HOST_MEMORY => RendererFault::OutOfHostMemory { operation },
+        vk::Result::ERROR_OUT_OF_DEVICE_MEMORY => RendererFault::OutOfDeviceMemory { operation },
+        _ => RendererFault::Fatal {
+            operation,
+            code: error.as_raw(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod state_tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    struct ScriptedBackend {
+        outcomes: VecDeque<(RendererOperation, Result<(), vk::Result>)>,
+        executed: usize,
+    }
+
+    impl ScriptedBackend {
+        fn execute_next(&mut self, health: &mut RendererHealth) -> Result<(), RendererFault> {
+            health.guard()?;
+            let (operation, result) = self.outcomes.pop_front().expect("scripted operation");
+            self.executed += 1;
+            health.observe(result.map_err(|error| classify_vk(operation, error)))
+        }
+    }
 
     #[test]
     fn acquired_image_retains_slot_image_and_suboptimal_state() {
@@ -1678,5 +1862,124 @@ mod state_tests {
             FRAME_SLOTS * RECTANGLES_PER_SLOT * size_of::<GpuRectangle>()
         );
         assert!(region > 0);
+    }
+
+    #[test]
+    fn vulkan_fault_mapping_preserves_recovery_categories() {
+        let cases = [
+            (vk::Result::ERROR_OUT_OF_DATE_KHR, RendererFault::OutOfDate),
+            (vk::Result::SUBOPTIMAL_KHR, RendererFault::Suboptimal),
+            (vk::Result::NOT_READY, RendererFault::NotReady),
+            (
+                vk::Result::TIMEOUT,
+                RendererFault::Timeout {
+                    operation: RendererOperation::Recreate,
+                },
+            ),
+            (
+                vk::Result::ERROR_SURFACE_LOST_KHR,
+                RendererFault::SurfaceLost {
+                    operation: RendererOperation::Recreate,
+                },
+            ),
+            (
+                vk::Result::ERROR_DEVICE_LOST,
+                RendererFault::DeviceLost {
+                    operation: RendererOperation::Recreate,
+                },
+            ),
+            (
+                vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+                RendererFault::OutOfHostMemory {
+                    operation: RendererOperation::Recreate,
+                },
+            ),
+            (
+                vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+                RendererFault::OutOfDeviceMemory {
+                    operation: RendererOperation::Recreate,
+                },
+            ),
+            (
+                vk::Result::ERROR_UNKNOWN,
+                RendererFault::Fatal {
+                    operation: RendererOperation::Recreate,
+                    code: vk::Result::ERROR_UNKNOWN.as_raw(),
+                },
+            ),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(classify_vk(RendererOperation::Recreate, raw), expected);
+        }
+    }
+
+    #[test]
+    fn first_device_lost_fault_poison_is_stable() {
+        let first = RendererFault::DeviceLost {
+            operation: RendererOperation::Submit,
+        };
+        let second = RendererFault::DeviceLost {
+            operation: RendererOperation::Present,
+        };
+        let mut health = RendererHealth::default();
+        assert_eq!(health.observe::<()>(Err(first.clone())), Err(first.clone()));
+        let _ = health.observe::<()>(Err(second));
+        assert_eq!(health.guard(), Err(first));
+    }
+
+    #[test]
+    fn scripted_operations_map_faults_and_stop_after_device_lost() {
+        let mut backend = ScriptedBackend {
+            outcomes: VecDeque::from([
+                (RendererOperation::Fence, Err(vk::Result::NOT_READY)),
+                (
+                    RendererOperation::Acquire,
+                    Err(vk::Result::ERROR_OUT_OF_DATE_KHR),
+                ),
+                (
+                    RendererOperation::Upload,
+                    Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
+                ),
+                (
+                    RendererOperation::Present,
+                    Err(vk::Result::ERROR_SURFACE_LOST_KHR),
+                ),
+                (
+                    RendererOperation::Submit,
+                    Err(vk::Result::ERROR_DEVICE_LOST),
+                ),
+                (RendererOperation::Present, Ok(())),
+            ]),
+            executed: 0,
+        };
+        let mut health = RendererHealth::default();
+
+        assert_eq!(
+            backend.execute_next(&mut health),
+            Err(RendererFault::NotReady)
+        );
+        assert_eq!(
+            backend.execute_next(&mut health),
+            Err(RendererFault::OutOfDate)
+        );
+        assert_eq!(
+            backend.execute_next(&mut health),
+            Err(RendererFault::OutOfDeviceMemory {
+                operation: RendererOperation::Upload
+            })
+        );
+        assert_eq!(
+            backend.execute_next(&mut health),
+            Err(RendererFault::SurfaceLost {
+                operation: RendererOperation::Present
+            })
+        );
+        let device_lost = RendererFault::DeviceLost {
+            operation: RendererOperation::Submit,
+        };
+        assert_eq!(backend.execute_next(&mut health), Err(device_lost.clone()));
+        assert_eq!(backend.execute_next(&mut health), Err(device_lost));
+        assert_eq!(backend.executed, 5);
+        assert_eq!(backend.outcomes.len(), 1);
     }
 }
