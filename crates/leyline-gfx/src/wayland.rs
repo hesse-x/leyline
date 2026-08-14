@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     env,
     ffi::c_void,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
@@ -419,6 +419,7 @@ impl WaylandWindow {
                 modifiers: ModifiersState::default(),
                 pressed_modifiers: PressedModifiers::default(),
                 key_repeat: KeyRepeatState::default(),
+                shortcut_digit_rows: HashMap::new(),
                 logical_size: DEFAULT_SIZE,
                 scale: Scale120::ONE,
                 pending: PendingEvents::default(),
@@ -847,6 +848,7 @@ pub(crate) struct WaylandState {
     modifiers: ModifiersState,
     pressed_modifiers: PressedModifiers,
     key_repeat: KeyRepeatState,
+    shortcut_digit_rows: HashMap<u32, std::num::NonZeroU8>,
     logical_size: LogicalSize,
     scale: Scale120,
     pending: PendingEvents,
@@ -1065,8 +1067,9 @@ impl KeyboardHandler for WaylandState {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
-        _: Keymap<'_>,
+        keymap: Keymap<'_>,
     ) {
+        self.shortcut_digit_rows = parse_digit_row_keycodes(&keymap.as_string());
         tracing::debug!("Wayland keyboard keymap initialized");
     }
 
@@ -1079,6 +1082,30 @@ impl KeyboardHandler for WaylandState {
     ) {
         self.key_repeat.update_info(info);
     }
+}
+
+fn parse_digit_row_keycodes(keymap: &str) -> HashMap<u32, std::num::NonZeroU8> {
+    let mut result = HashMap::new();
+    for line in keymap.lines() {
+        for digit in 1_u8..=9 {
+            let name = format!("<AE0{digit}>");
+            let Some(rest) = line.trim().strip_prefix(&name) else {
+                continue;
+            };
+            let Some(code) = rest
+                .trim_start()
+                .strip_prefix('=')
+                .and_then(|value| value.trim().trim_end_matches(';').parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if let (Some(raw), Some(digit)) = (code.checked_sub(8), std::num::NonZeroU8::new(digit))
+            {
+                result.insert(raw, digit);
+            }
+        }
+    }
+    result
 }
 
 impl WaylandState {
@@ -1124,6 +1151,7 @@ impl WaylandState {
             },
             time_ms: event.time,
             physical_keycode: event.raw_code,
+            shortcut_digit_row: self.shortcut_digit_rows.get(&event.raw_code).copied(),
             utf8: event.utf8,
             modifiers,
             shortcut_modifiers: shortcut_modifiers(modifiers, self.pressed_modifiers),
@@ -1373,7 +1401,7 @@ mod key_repeat_tests {
 
     use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, RepeatInfo};
 
-    use super::KeyRepeatState;
+    use super::{KeyRepeatState, parse_digit_row_keycodes};
 
     fn key(raw_code: u32, keysym: u32) -> KeyEvent {
         KeyEvent {
@@ -1426,6 +1454,13 @@ mod key_repeat_tests {
         });
         repeat.press(7, key(42, 0xffe1), std::time::Instant::now());
         assert!(repeat.deadline().is_none());
+    }
+
+    #[test]
+    fn xkb_key_names_normalize_digit_row_independently_of_symbols() {
+        let parsed = parse_digit_row_keycodes("xkb_keycodes {\n <AE01> = 10;\n <AE09> = 18;\n};");
+        assert_eq!(parsed.get(&2).map(|value| value.get()), Some(1));
+        assert_eq!(parsed.get(&10).map(|value| value.get()), Some(9));
     }
 }
 

@@ -69,6 +69,7 @@ struct InputTransaction {
 
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct TerminalSession {
     core: TerminalCoreAdapter,
     process: Option<PtyProcess>,
@@ -78,12 +79,19 @@ pub struct TerminalSession {
     hold_after_exit: bool,
     dirty: bool,
     latest_snapshot: Option<FrameSnapshot>,
-    pending_title: Option<Arc<str>>,
+    pending_title: Option<SessionTitleDelta>,
+    pending_bell: bool,
     pending_input: VecDeque<InputTransaction>,
     pending_input_bytes: usize,
     shutdown_deadline: Option<Instant>,
     security_audit: ParseAuditDelta,
     audit_log_limiter: MetadataRateLimiter,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionTitleDelta {
+    Set(Arc<str>),
+    Reset,
 }
 
 #[allow(clippy::missing_errors_doc)]
@@ -149,6 +157,7 @@ impl TerminalSession {
             dirty: true,
             latest_snapshot: None,
             pending_title: None,
+            pending_bell: false,
             pending_input: VecDeque::new(),
             pending_input_bytes: 0,
             shutdown_deadline: None,
@@ -230,7 +239,16 @@ impl TerminalSession {
     }
 
     pub fn end_drain_round(&mut self) -> Result<Option<FrameSnapshot>, SessionError> {
+        self.finish_io_round()?;
+        self.snapshot_if_dirty()
+    }
+
+    pub fn finish_io_round(&mut self) -> Result<(), SessionError> {
         self.flush_input(64 * 1024)?;
+        Ok(())
+    }
+
+    pub fn snapshot_if_dirty(&mut self) -> Result<Option<FrameSnapshot>, SessionError> {
         if !self.dirty {
             return Ok(None);
         }
@@ -400,8 +418,16 @@ impl TerminalSession {
             );
         }
     }
-    pub fn take_title(&mut self) -> Option<Arc<str>> {
+    pub fn take_title(&mut self) -> Option<SessionTitleDelta> {
         self.pending_title.take()
+    }
+    pub fn take_bell(&mut self) -> bool {
+        std::mem::take(&mut self.pending_bell)
+    }
+    pub fn mark_failed(&mut self) {
+        self.state = SessionState::Failed;
+        self.pending_input.clear();
+        self.pending_input_bytes = 0;
     }
     pub fn begin_shutdown(&mut self) {
         if self.shutdown_deadline.is_some() || self.state == SessionState::Closed {
@@ -456,10 +482,12 @@ impl TerminalSession {
                 TerminalAction::WriteToPty(bytes) => {
                     self.queue_transaction(QueueClass::ParserReply, bytes)?;
                 }
-                TerminalAction::SetTitle(title) => self.pending_title = Some(title),
-                TerminalAction::Bell
-                | TerminalAction::ClipboardRequestRejected
-                | TerminalAction::UnsupportedSequence => {}
+                TerminalAction::SetTitle(title) => {
+                    self.pending_title = Some(SessionTitleDelta::Set(title));
+                }
+                TerminalAction::ResetTitle => self.pending_title = Some(SessionTitleDelta::Reset),
+                TerminalAction::Bell => self.pending_bell = true,
+                TerminalAction::ClipboardRequestRejected | TerminalAction::UnsupportedSequence => {}
             }
         }
         Ok(())
@@ -474,6 +502,15 @@ impl TerminalSession {
         class: QueueClass,
         bytes: Vec<u8>,
     ) -> Result<(), SessionError> {
+        if matches!(
+            self.state,
+            SessionState::Held
+                | SessionState::Failed
+                | SessionState::Closing
+                | SessionState::Closed
+        ) {
+            return Ok(());
+        }
         if bytes.is_empty() {
             return Ok(());
         }

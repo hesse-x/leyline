@@ -1,7 +1,7 @@
 # Leyline
 
 Leyline is a native Wayland terminal written in Rust. The current implementation opens a real
-Wayland/Vulkan window, starts one shell or `-e` command in a real PTY, parses terminal output into
+Wayland/Vulkan window, runs independent shell or `-e` command PTYs in tabs, parses terminal output into
 an immutable renderer-independent snapshot, and renders that snapshot through Fontconfig,
 FreeType, HarfBuzz, and a bounded Vulkan glyph atlas.
 
@@ -69,7 +69,7 @@ line_spacing = 1.0          # logical pixels, 0.0..=8.0
 [colors]
 foreground = "#d8dcd8"
 # The final byte controls opacity; the compositor shows the desktop behind the window.
-background = "#2e3436e6"
+background = "#2e3436f2"
 cursor = "#d8dcd8"
 selection_foreground = "#f4f6f4"
 selection_background = "#58656dcc"
@@ -81,8 +81,8 @@ ansi = [
 ]
 
 [window]
-padding_x = 12
-padding_y = 10
+padding_x = 0
+padding_y = 5
 
 [scrolling]
 history_lines = 10000
@@ -103,6 +103,13 @@ style = "block"
 hold_after_exit = false
 confirm_multiline_paste = true
 
+[tabs]
+max_count = 32
+bar_height = 32
+min_width = 80
+max_width = 240
+show_close_button = true
+
 [[keybindings]]
 key = "PageUp"
 mods = ["Shift"]
@@ -111,6 +118,12 @@ action = "ScrollPageUp"
 
 Selecting text publishes the primary selection; paste it with the middle mouse button or
 `Shift+Insert`.
+
+Tabs are always visible. `Ctrl+Shift+N` creates and activates a tab, `Ctrl+Shift+W` closes it,
+`Ctrl+Shift+Left/Right` cycles, and `Ctrl+Shift+1..9` activates an ordinal tab. Mouse clicks switch
+tabs; a close button or middle click closes one. New tabs repeat the startup launch request and
+inherit Leyline's startup directory. User `[[keybindings]]` entries can override the actions
+`NewTab`, `CloseTab`, `PreviousTab`, `NextTab`, and `ActivateTab1` through `ActivateTab9`.
 
 [`config/reference.toml`](config/reference.toml) fixes the Ubuntu Sans Mono 13 opaque screenshot
 baseline. [`config/legacy.toml`](config/legacy.toml) restores the previous font metrics, palette,
@@ -129,8 +142,8 @@ scrollbar geometry, padding, and scrollback are bounded to prevent accidental re
 `hidden` removes the gutter. Gutter clicks, drags, and wheel events are consumed by window chrome and
 are never encoded as terminal mouse reports.
 
-`behavior.hold_after_exit = false` closes the window only after both the child status and PTY EOF
-have been observed, so trailing output is parsed first. Setting it to `true` retains the final
+`behavior.hold_after_exit = false` closes only the completed tab after both the child status and PTY EOF
+have been observed, so trailing output is parsed first; the last completed tab closes the window. Setting it to `true` retains the final
 terminal snapshot while releasing the PTY worker and file descriptor.
 Closing a running session targets the child through a Linux pidfd, requests `SIGTERM`, and escalates
 after a short grace period, so an uncooperative child cannot indefinitely block window shutdown.

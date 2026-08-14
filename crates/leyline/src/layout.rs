@@ -37,7 +37,7 @@ impl GridLayout {
         Some([u16::try_from(column).ok()?, u16::try_from(line).ok()?])
     }
 
-    /// Calculates a deterministic physical grid and centers its unused remainder.
+    /// Calculates a deterministic physical grid, left-aligning columns and centering rows.
     ///
     /// # Errors
     /// Returns [`LayoutError::Overflow`] when fixed-point scaling or bounds fail.
@@ -96,14 +96,10 @@ impl GridLayout {
             u16::try_from(lines).map_err(|_| LayoutError::Overflow)?,
         )
         .map_err(|_| LayoutError::Overflow)?;
-        let used_width = columns * u32::from(metrics.width_px.get());
         let used_height = lines * u32::from(metrics.height_px.get());
         Ok(Self {
             viewport_px,
-            content_origin_px: [
-                left + available_width.saturating_sub(used_width) / 2,
-                top + available_height.saturating_sub(used_height) / 2,
-            ],
+            content_origin_px: [left, top + available_height.saturating_sub(used_height) / 2],
             cell_px: [metrics.width_px, metrics.height_px],
             cell_metrics: metrics,
             grid,
@@ -195,7 +191,7 @@ mod tests {
         assert_eq!((tiny.grid.columns(), tiny.grid.lines()), (1, 1));
         let normal = GridLayout::calculate(
             LogicalSize {
-                width: 800,
+                width: 805,
                 height: 500,
             },
             Scale120::ONE,
@@ -278,6 +274,6 @@ mod tests {
         .unwrap();
         assert_eq!(layout.cell_px[1].get(), 20);
         assert_eq!(layout.cell_metrics.baseline_px, 15);
-        assert!(layout.content_origin_px[0] >= 12);
+        assert_eq!(layout.content_origin_px[0], 12);
     }
 }

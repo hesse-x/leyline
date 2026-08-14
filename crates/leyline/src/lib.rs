@@ -14,6 +14,7 @@ pub mod logging;
 pub mod security;
 pub mod selection;
 pub mod session;
+pub mod tab;
 pub mod terminal;
 pub mod ui_runtime;
 

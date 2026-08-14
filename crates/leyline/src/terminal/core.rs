@@ -26,6 +26,7 @@ use crate::{
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminalAction {
     SetTitle(Arc<str>),
+    ResetTitle,
     Bell,
     WriteToPty(Vec<u8>),
     ClipboardRequestRejected,
@@ -394,6 +395,7 @@ impl TerminalCoreAdapter {
                 }
                 Event::ResetTitle => {
                     self.title = None;
+                    self.actions.push(TerminalAction::ResetTitle);
                 }
                 Event::Bell => self.actions.push(TerminalAction::Bell),
                 Event::PtyWrite(text) if text.len() <= MAX_PTY_REPLY_BYTES => {

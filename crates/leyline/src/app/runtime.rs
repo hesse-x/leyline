@@ -178,6 +178,10 @@ impl AppRuntime {
     pub fn inbox(&mut self) -> &mut AppInbox {
         &mut self.inbox
     }
+    #[must_use]
+    pub const fn inbox_ref(&self) -> &AppInbox {
+        &self.inbox
+    }
     pub fn fast_cancel(&mut self) {
         self.cancel_tx.take();
     }
@@ -264,8 +268,17 @@ pub struct AppInbox {
 }
 impl AppInbox {
     pub fn drain_round(&mut self, mut consume: impl FnMut(AppEvent)) -> DrainResult {
+        self.drain_round_limited(usize::MAX, usize::MAX, &mut consume)
+    }
+
+    pub fn drain_round_limited(
+        &mut self,
+        max_events: usize,
+        max_bytes: usize,
+        mut consume: impl FnMut(AppEvent),
+    ) -> DrainResult {
         let mut result = DrainResult::default();
-        for _ in 0..self.policy.control_budget {
+        for _ in 0..self.policy.control_budget.min(max_events) {
             match self.control_rx.try_recv() {
                 Ok(event) => {
                     result.control += 1;
@@ -278,7 +291,11 @@ impl AppInbox {
                 }
             }
         }
-        for _ in 0..self.policy.bulk_event_budget {
+        let bulk_limit = self
+            .policy
+            .bulk_event_budget
+            .min(max_events.saturating_sub(result.control));
+        for _ in 0..bulk_limit {
             match self.bulk_rx.try_recv() {
                 Ok(event) => {
                     let bytes = match &event {
@@ -288,7 +305,9 @@ impl AppInbox {
                     result.bulk += 1;
                     result.bulk_bytes += bytes;
                     consume(bulk_to_app(event));
-                    if result.bulk_bytes >= self.policy.bulk_byte_budget {
+                    if result.bulk_bytes >= self.policy.bulk_byte_budget
+                        || result.bulk_bytes >= max_bytes
+                    {
                         break;
                     }
                 }

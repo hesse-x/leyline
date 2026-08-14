@@ -743,11 +743,13 @@ fn font_match(
             fc::constants::FC_FAMILY.as_ptr(),
             family.as_ptr().cast(),
         );
-        (fc.FcPatternAddInteger)(
-            pattern.1,
-            fc::constants::FC_SPACING.as_ptr(),
-            fc::constants::FC_MONO,
-        );
+        if request.monospace {
+            (fc.FcPatternAddInteger)(
+                pattern.1,
+                fc::constants::FC_SPACING.as_ptr(),
+                fc::constants::FC_MONO,
+            );
+        }
         (fc.FcPatternAddInteger)(
             pattern.1,
             fc::constants::FC_WEIGHT.as_ptr(),

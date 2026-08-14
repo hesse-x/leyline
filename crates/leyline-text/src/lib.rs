@@ -65,6 +65,7 @@ pub struct ResolvedFace {
 pub struct FontRequest {
     pub family: Arc<str>,
     pub style: FontStyle,
+    pub monospace: bool,
     pub logical_size_milli_pt: u32,
     pub scale_120: u32,
     pub ligatures: bool,
@@ -95,6 +96,7 @@ impl FontRequest {
         Ok(Self {
             family,
             style: FontStyle::Regular,
+            monospace: true,
             logical_size_milli_pt,
             scale_120,
             ligatures,
@@ -111,6 +113,12 @@ impl FontRequest {
     ) -> Self {
         self.hinting = hinting;
         self.antialiasing = antialiasing;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_monospace(mut self, monospace: bool) -> Self {
+        self.monospace = monospace;
         self
     }
 

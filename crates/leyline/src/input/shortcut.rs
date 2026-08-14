@@ -80,7 +80,9 @@ pub fn resolve(bindings: &[crate::config::KeyBinding], key: &KeyInput) -> Shortc
         .rev()
         .find(|binding| {
             binding.chord.modifiers == key.shortcut_modifiers
-                && binding.chord.key.matches(key.logical_key)
+                && (binding.chord.key.matches(key.logical_key)
+                    || matches!(binding.origin, BindingOrigin::Default)
+                        && matches!(binding.action, Action::ActivateTab(number) if key.shortcut_digit_row.is_some_and(|digit| digit.get() == number)))
         })
         .map_or(ShortcutResult::NotMatched, |binding| {
             ShortcutResult::Matched(binding.action)
@@ -137,6 +139,27 @@ pub fn parse_key(value: &str) -> Result<LogicalKeyPattern, ParseKeyError> {
 mod tests {
     use super::*;
 
+    fn input(logical_key: LogicalKey, digit: Option<u8>) -> KeyInput {
+        let mut shortcut_modifiers = ModifierMask::CONTROL;
+        shortcut_modifiers.insert(ModifierMask::SHIFT);
+        KeyInput {
+            serial: leyline_gfx::InputSerial {
+                seat: leyline_gfx::SeatToken::new(0, 1),
+                value: 1,
+                kind: leyline_gfx::SerialKind::Keyboard,
+            },
+            time_ms: 1,
+            physical_keycode: 2,
+            shortcut_digit_row: digit.and_then(std::num::NonZeroU8::new),
+            utf8: None,
+            modifiers: leyline_gfx::ModifiersState::default(),
+            shortcut_modifiers,
+            logical_key,
+            state: KeyState::Pressed,
+            repeat: false,
+        }
+    }
+
     #[test]
     fn parser_has_finite_named_vocabulary_and_unicode_scalars() {
         assert_eq!(parse_key("Insert"), Ok(LogicalKeyPattern::Insert));
@@ -144,5 +167,41 @@ mod tests {
         assert_eq!(parse_key("中"), Ok(LogicalKeyPattern::Character('中')));
         assert_eq!(parse_key("not-a-key"), Err(ParseKeyError));
         assert_eq!(parse_key("F13"), Err(ParseKeyError));
+    }
+
+    #[test]
+    fn default_digit_action_uses_xkb_row_without_stealing_user_character_binding() {
+        let mut chord_modifiers = ModifierMask::CONTROL;
+        chord_modifiers.insert(ModifierMask::SHIFT);
+        let default = crate::config::KeyBinding {
+            chord: KeyChord {
+                key: LogicalKeyPattern::Character('1'),
+                modifiers: chord_modifiers,
+            },
+            action: Action::ActivateTab(1),
+            origin: BindingOrigin::Default,
+        };
+        assert_eq!(
+            resolve(
+                std::slice::from_ref(&default),
+                &input(LogicalKey::Character('!'), Some(1))
+            ),
+            ShortcutResult::Matched(Action::ActivateTab(1))
+        );
+        let user = crate::config::KeyBinding {
+            chord: KeyChord {
+                key: LogicalKeyPattern::Character('!'),
+                modifiers: chord_modifiers,
+            },
+            action: Action::ScrollPageUp,
+            origin: BindingOrigin::User { index: 0 },
+        };
+        assert_eq!(
+            resolve(
+                &[default, user],
+                &input(LogicalKey::Character('!'), Some(1))
+            ),
+            ShortcutResult::Matched(Action::ScrollPageUp)
+        );
     }
 }

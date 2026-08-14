@@ -365,6 +365,7 @@ mod tests {
             },
             time_ms: 1,
             physical_keycode: 1,
+            shortcut_digit_row: None,
             utf8: Some("x".into()),
             modifiers: leyline_gfx::ModifiersState::default(),
             shortcut_modifiers: leyline_gfx::ModifierMask::empty(),

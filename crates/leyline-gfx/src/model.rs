@@ -154,6 +154,7 @@ pub struct KeyInput {
     pub serial: crate::InputSerial,
     pub time_ms: u32,
     pub physical_keycode: u32,
+    pub shortcut_digit_row: Option<std::num::NonZeroU8>,
     pub utf8: Option<String>,
     pub modifiers: ModifiersState,
     pub shortcut_modifiers: crate::ModifierMask,

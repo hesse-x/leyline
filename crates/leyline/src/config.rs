@@ -21,7 +21,19 @@ pub struct EffectiveConfig {
     pub scrollbar: ScrollbarConfig,
     pub cursor: CursorConfig,
     pub behavior: BehaviorConfig,
+    pub tabs: TabsConfig,
     pub keybindings: Vec<KeyBinding>,
+}
+
+pub const MAX_TABS: u8 = 32;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TabsConfig {
+    pub max_count: u8,
+    pub bar_height: u16,
+    pub min_width: u16,
+    pub max_width: u16,
+    pub show_close_button: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -150,6 +162,11 @@ pub enum Action {
     ResetFontSize,
     ScrollPageUp,
     ScrollPageDown,
+    NewTab,
+    CloseTab,
+    PreviousTab,
+    NextTab,
+    ActivateTab(u8),
 }
 
 impl Default for EffectiveConfig {
@@ -165,15 +182,15 @@ impl Default for EffectiveConfig {
             },
             colors: ColorsConfig {
                 foreground: Color(0xd8dc_d8ff),
-                background: Color(0x2e34_36e6),
+                background: Color(0x2e34_36f2),
                 cursor: Color(0xd8dc_d8ff),
                 selection_foreground: Color(0xf4f6_f4ff),
                 selection_background: Color(0x5865_6dcc),
                 ansi: DEFAULT_ANSI_PALETTE,
             },
             window: WindowConfig {
-                padding_x: 12,
-                padding_y: 10,
+                padding_x: 0,
+                padding_y: 5,
             },
             scrolling: ScrollingConfig {
                 history_lines: 10_000,
@@ -194,6 +211,13 @@ impl Default for EffectiveConfig {
                 hold_after_exit: false,
                 confirm_multiline_paste: true,
             },
+            tabs: TabsConfig {
+                max_count: MAX_TABS,
+                bar_height: 32,
+                min_width: 80,
+                max_width: 240,
+                show_close_button: true,
+            },
             keybindings: default_keybindings(),
         }
     }
@@ -202,8 +226,8 @@ impl Default for EffectiveConfig {
 fn default_keybindings() -> Vec<KeyBinding> {
     use crate::input::shortcut::{BindingOrigin, KeyChord, LogicalKeyPattern};
     use Action::{
-        DecreaseFontSize, IncreaseFontSize, PastePrimary, ResetFontSize, ScrollPageDown,
-        ScrollPageUp,
+        CloseTab, DecreaseFontSize, IncreaseFontSize, NewTab, NextTab, PastePrimary, PreviousTab,
+        ResetFontSize, ScrollPageDown, ScrollPageUp,
     };
     use leyline_gfx::ModifierMask;
     [
@@ -234,6 +258,26 @@ fn default_keybindings() -> Vec<KeyBinding> {
             ModifierMask::SHIFT,
             ScrollPageDown,
         ),
+        (
+            LogicalKeyPattern::Character('N'),
+            modifier_mask(&[Modifier::Control, Modifier::Shift]),
+            NewTab,
+        ),
+        (
+            LogicalKeyPattern::Character('W'),
+            modifier_mask(&[Modifier::Control, Modifier::Shift]),
+            CloseTab,
+        ),
+        (
+            LogicalKeyPattern::ArrowLeft,
+            modifier_mask(&[Modifier::Control, Modifier::Shift]),
+            PreviousTab,
+        ),
+        (
+            LogicalKeyPattern::ArrowRight,
+            modifier_mask(&[Modifier::Control, Modifier::Shift]),
+            NextTab,
+        ),
     ]
     .into_iter()
     .map(|(key, modifiers, action)| KeyBinding {
@@ -241,6 +285,16 @@ fn default_keybindings() -> Vec<KeyBinding> {
         action,
         origin: BindingOrigin::Default,
     })
+    .collect::<Vec<_>>()
+    .into_iter()
+    .chain((1_u8..=9).map(|number| KeyBinding {
+        chord: KeyChord {
+            key: LogicalKeyPattern::Character(char::from(b'0' + number)),
+            modifiers: modifier_mask(&[Modifier::Control, Modifier::Shift]),
+        },
+        action: Action::ActivateTab(number),
+        origin: BindingOrigin::Default,
+    }))
     .collect()
 }
 
@@ -423,7 +477,20 @@ struct RawConfig {
     scrollbar: RawScrollbar,
     cursor: RawCursor,
     behavior: RawBehavior,
+    tabs: RawTabs,
     keybindings: Option<Vec<RawKeyBinding>>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawTabs {
+    max_count: Option<i64>,
+    bar_height: Option<i64>,
+    min_width: Option<i64>,
+    max_width: Option<i64>,
+    show_close_button: Option<bool>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -584,6 +651,19 @@ impl RawConfig {
             "behavior",
             &self.behavior.unknown,
             &["hold_after_exit", "confirm_multiline_paste"],
+        );
+        collect_unknown(
+            &mut warnings,
+            source,
+            "tabs",
+            &self.tabs.unknown,
+            &[
+                "max_count",
+                "bar_height",
+                "min_width",
+                "max_width",
+                "show_close_button",
+            ],
         );
 
         if let Some(family) = self.font.family {
@@ -796,6 +876,48 @@ impl RawConfig {
         if let Some(value) = self.behavior.confirm_multiline_paste {
             result.behavior.confirm_multiline_paste = value;
         }
+        set_bounded(
+            path,
+            "tabs.max_count",
+            self.tabs.max_count,
+            1,
+            i64::from(MAX_TABS),
+            &mut result.tabs.max_count,
+        )?;
+        set_bounded(
+            path,
+            "tabs.bar_height",
+            self.tabs.bar_height,
+            24,
+            64,
+            &mut result.tabs.bar_height,
+        )?;
+        set_bounded(
+            path,
+            "tabs.min_width",
+            self.tabs.min_width,
+            48,
+            240,
+            &mut result.tabs.min_width,
+        )?;
+        set_bounded(
+            path,
+            "tabs.max_width",
+            self.tabs.max_width,
+            48,
+            400,
+            &mut result.tabs.max_width,
+        )?;
+        if result.tabs.min_width > result.tabs.max_width {
+            return semantic(
+                path,
+                "tabs.min_width",
+                "must be less than or equal to tabs.max_width".into(),
+            );
+        }
+        if let Some(value) = self.tabs.show_close_button {
+            result.tabs.show_close_button = value;
+        }
 
         if let Some(bindings) = self.keybindings {
             let mut positions = result
@@ -837,6 +959,7 @@ const TOP_FIELDS: &[&str] = &[
     "scrollbar",
     "cursor",
     "behavior",
+    "tabs",
     "keybindings",
 ];
 
@@ -1007,6 +1130,19 @@ fn parse_binding(path: &Path, index: usize, raw: RawKeyBinding) -> Result<KeyBin
         "ResetFontSize" => Action::ResetFontSize,
         "ScrollPageUp" => Action::ScrollPageUp,
         "ScrollPageDown" => Action::ScrollPageDown,
+        "NewTab" => Action::NewTab,
+        "CloseTab" => Action::CloseTab,
+        "PreviousTab" => Action::PreviousTab,
+        "NextTab" => Action::NextTab,
+        "ActivateTab1" => Action::ActivateTab(1),
+        "ActivateTab2" => Action::ActivateTab(2),
+        "ActivateTab3" => Action::ActivateTab(3),
+        "ActivateTab4" => Action::ActivateTab(4),
+        "ActivateTab5" => Action::ActivateTab(5),
+        "ActivateTab6" => Action::ActivateTab(6),
+        "ActivateTab7" => Action::ActivateTab(7),
+        "ActivateTab8" => Action::ActivateTab(8),
+        "ActivateTab9" => Action::ActivateTab(9),
         _ => {
             return semantic(
                 path,
@@ -1209,5 +1345,33 @@ mod tests {
             .into_effective(Path::new("config.toml"), "")
             .expect_err("unknown key must fail");
         assert!(error.to_string().contains("keybindings[0].key"));
+    }
+
+    #[test]
+    fn tabs_are_bounded_and_tab_actions_are_configurable() {
+        let source = "[tabs]\nmax_count=12\nbar_height=36\nmin_width=72\nmax_width=200\nshow_close_button=false\n[[keybindings]]\nkey=\"F1\"\nmods=[]\naction=\"ActivateTab9\"\n";
+        let raw: RawConfig = toml::from_str(source).expect("raw config");
+        let (effective, _) = raw
+            .into_effective(Path::new("config.toml"), source)
+            .expect("effective config");
+        assert_eq!(effective.tabs.max_count, 12);
+        assert!(!effective.tabs.show_close_button);
+        assert!(
+            effective
+                .keybindings
+                .iter()
+                .any(|binding| binding.action == Action::ActivateTab(9))
+        );
+
+        for source in [
+            "[tabs]\nmax_count=33\n",
+            "[tabs]\nmin_width=200\nmax_width=100\n",
+        ] {
+            let raw: RawConfig = toml::from_str(source).expect("raw config");
+            assert!(
+                raw.into_effective(Path::new("config.toml"), source)
+                    .is_err()
+            );
+        }
     }
 }

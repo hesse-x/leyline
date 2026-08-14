@@ -14,10 +14,20 @@ use crate::{
     config::{ColorsConfig, CursorStyle},
     interaction::{PreeditOverlay, ScrollbarPresentation},
     layout::GridLayout,
-    terminal::{CellWidth, FrameSnapshot, TerminalColor},
+    terminal::{CellWidth, FrameSnapshot, SnapshotCell, TerminalColor},
 };
 
 pub const MAX_UNIQUE_GLYPHS: usize = MAX_GLYPH_BITMAPS;
+
+const TAB_BAR_BACKGROUND: u32 = 0x2b2b_2bff;
+const TAB_ACTIVE_BACKGROUND: u32 = 0x3333_33ff;
+const TAB_DIVIDER: u32 = 0x4141_41ff;
+const TAB_ACCENT: u32 = 0xff5a_36ff;
+const TAB_ACTIVE_TEXT: u32 = 0xeded_edff;
+const TAB_INACTIVE_TEXT: u32 = 0xa8a8_a8ff;
+const TAB_UNREAD_TEXT: u32 = 0xd8d8_d8ff;
+const TAB_CLOSE_MARK: &str = "\u{00d7}";
+const TAB_FONT_KEY_NAMESPACE: u64 = 1 << 63;
 
 type ShapedCache = HashMap<(String, FontStyle), ShapedRun>;
 type GlyphAssets = HashMap<GlyphKey, GlyphAsset>;
@@ -41,6 +51,7 @@ pub struct FrameOverlays<'a> {
     pub preedit: Option<&'a PreeditOverlay>,
     pub paste_confirmation: Option<&'a PasteConfirmationOverlay>,
     pub scrollbar: Option<&'a ScrollbarPresentation>,
+    pub tab_bar: Option<&'a crate::tab::TabBarPresentation>,
 }
 
 /// Converts one validated terminal snapshot into a bounded graphics scene.
@@ -55,6 +66,7 @@ pub struct FrameOverlays<'a> {
 )]
 pub fn compose(
     text: &mut TextSystem,
+    tab_text: &mut TextSystem,
     snapshot: &FrameSnapshot,
     overlays: FrameOverlays<'_>,
     layout: &GridLayout,
@@ -62,8 +74,18 @@ pub fn compose(
     cursor_style: CursorStyle,
 ) -> Result<SceneData, ComposeError> {
     text.begin_scene();
-    let result = compose_active_scene(text, snapshot, overlays, layout, colors, cursor_style);
+    tab_text.begin_scene();
+    let result = compose_active_scene(
+        text,
+        tab_text,
+        snapshot,
+        overlays,
+        layout,
+        colors,
+        cursor_style,
+    );
     text.end_scene();
+    tab_text.end_scene();
     result
 }
 
@@ -75,6 +97,7 @@ pub fn compose(
 )]
 fn compose_active_scene(
     text: &mut TextSystem,
+    tab_text: &mut TextSystem,
     snapshot: &FrameSnapshot,
     overlays: FrameOverlays<'_>,
     layout: &GridLayout,
@@ -101,6 +124,16 @@ fn compose_active_scene(
         overlays.paste_confirmation,
         overlays.preedit,
     )?;
+    let (tab_shaped_cache, tab_assets) =
+        match prepare_tab_glyph_working_set(tab_text, overlays.tab_bar) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(category = "tab_text", %error, "tab text omitted for this frame");
+                (ShapedCache::new(), GlyphAssets::new())
+            }
+        };
+    assets.extend(tab_assets);
+    let tab_metrics = tab_text.metrics();
     let mut rectangles = Vec::new();
     let mut glyphs = Vec::new();
     let metrics = layout.cell_metrics;
@@ -216,13 +249,17 @@ fn compose_active_scene(
                     pen_x = pen_x.saturating_add(glyph.advance_26_6[0]);
                 }
             }
-            if cell.flags.underline || cell.flags.strikeout {
+            let underlined = draws_underline(cell);
+            if underlined || cell.flags.strikeout {
                 let origin = cell_origin(layout, column, line);
                 let span = if cell.width == CellWidth::Wide { 2 } else { 1 };
-                if cell.flags.underline {
-                    let underline = cell
-                        .underline_color
-                        .map_or(foreground, |color| resolve_color(color, foreground, colors));
+                if underlined {
+                    let underline = if cell.flags.underline {
+                        cell.underline_color
+                            .map_or(foreground, |color| resolve_color(color, foreground, colors))
+                    } else {
+                        foreground
+                    };
                     rectangles.push(line_rectangle(
                         origin,
                         layout,
@@ -285,6 +322,147 @@ fn compose_active_scene(
             size_px: [cursor_size[0] as f32, cursor_size[1] as f32],
             color: LinearColor::from_srgba8(colors.cursor.0),
         });
+    }
+    if let Some(tab_bar) = overlays.tab_bar {
+        if let Some(bar) = tab_bar.bar {
+            rectangles.push(RectangleInstance {
+                origin_px: [bar.x as f32, bar.y as f32],
+                size_px: [bar.width as f32, bar.height as f32],
+                color: LinearColor::from_srgba8(TAB_BAR_BACKGROUND),
+            });
+        }
+        let close_marker = tab_shaped_cache.get(&(TAB_CLOSE_MARK.to_owned(), FontStyle::Regular));
+        for item in &tab_bar.items {
+            if item.active {
+                rectangles.push(RectangleInstance {
+                    origin_px: [item.rect.x as f32, item.rect.y as f32],
+                    size_px: [item.rect.width as f32, item.rect.height as f32],
+                    color: LinearColor::from_srgba8(TAB_ACTIVE_BACKGROUND),
+                });
+            }
+            if item.rect.width > 1 && item.rect.height > 14 {
+                rectangles.push(RectangleInstance {
+                    origin_px: [
+                        item.rect.x.saturating_add(item.rect.width - 1) as f32,
+                        item.rect.y.saturating_add(7) as f32,
+                    ],
+                    size_px: [1.0, item.rect.height.saturating_sub(14) as f32],
+                    color: LinearColor::from_srgba8(TAB_DIVIDER),
+                });
+            }
+            if item.active {
+                let accent_height = item.rect.height.clamp(1, 2);
+                rectangles.push(RectangleInstance {
+                    origin_px: [
+                        item.rect.x as f32,
+                        item.rect
+                            .y
+                            .saturating_add(item.rect.height.saturating_sub(accent_height))
+                            as f32,
+                    ],
+                    size_px: [item.rect.width as f32, accent_height as f32],
+                    color: LinearColor::from_srgba8(TAB_ACCENT),
+                });
+            } else if item.unread && item.rect.width >= 20 {
+                rectangles.push(RectangleInstance {
+                    origin_px: [
+                        item.rect.x.saturating_add(8) as f32,
+                        item.rect.y.saturating_add(item.rect.height / 2) as f32,
+                    ],
+                    size_px: [3.0, 3.0],
+                    color: LinearColor::from_srgba8(TAB_ACCENT),
+                });
+            }
+            if let Some(shaped) = tab_shaped_cache.get(&(item.title.clone(), FontStyle::Regular)) {
+                let title_left = item.rect.x.saturating_add(12);
+                let title_right = item.close_rect.map_or_else(
+                    || {
+                        item.rect
+                            .x
+                            .saturating_add(item.rect.width)
+                            .saturating_sub(12)
+                    },
+                    |close| close.x.saturating_sub(6),
+                );
+                let available_width = title_right.saturating_sub(title_left);
+                let run_width = shaped
+                    .glyphs
+                    .iter()
+                    .fold(0_i32, |width, glyph| {
+                        width.saturating_add(glyph.advance_26_6[0])
+                    })
+                    .max(0)
+                    / 64;
+                let text_origin = title_left as i32
+                    + (i32::try_from(available_width).unwrap_or(i32::MAX) - run_width).max(0) / 2;
+                let mut pen_x = 0_i32;
+                for glyph in &shaped.glyphs {
+                    let Some(bitmap) = assets.get(&glyph.key) else {
+                        continue;
+                    };
+                    let x = text_origin
+                        + i32::from(bitmap.bitmap.bearing_px[0])
+                        + (pen_x + glyph.offset_26_6[0]) / 64;
+                    let y = item.rect.y.saturating_add(item.rect.height / 2) as i32
+                        + i32::from(tab_metrics.baseline_px / 2)
+                        - i32::from(bitmap.bitmap.bearing_px[1])
+                        - glyph.offset_26_6[1] / 64;
+                    if bitmap.bitmap.size_px != [0, 0] {
+                        glyphs.push(GlyphPlacement {
+                            key: glyph.key,
+                            origin_px: [x, y],
+                            clip_px: [title_left, item.rect.y, available_width, item.rect.height],
+                            color: LinearColor::from_srgba8(if item.active {
+                                TAB_ACTIVE_TEXT
+                            } else if item.unread {
+                                TAB_UNREAD_TEXT
+                            } else {
+                                TAB_INACTIVE_TEXT
+                            }),
+                        });
+                    }
+                    pen_x = pen_x.saturating_add(glyph.advance_26_6[0]);
+                }
+            }
+            if let (Some(close), Some(shaped)) = (item.close_rect, close_marker) {
+                let run_width = shaped
+                    .glyphs
+                    .iter()
+                    .fold(0_i32, |width, glyph| {
+                        width.saturating_add(glyph.advance_26_6[0])
+                    })
+                    .max(0)
+                    / 64;
+                let text_origin = close.x as i32
+                    + (i32::try_from(close.width).unwrap_or(i32::MAX) - run_width).max(0) / 2;
+                let mut pen_x = 0_i32;
+                for glyph in &shaped.glyphs {
+                    let Some(bitmap) = assets.get(&glyph.key) else {
+                        continue;
+                    };
+                    let x = text_origin
+                        + i32::from(bitmap.bitmap.bearing_px[0])
+                        + (pen_x + glyph.offset_26_6[0]) / 64;
+                    let y = close.y.saturating_add(close.height / 2) as i32
+                        + i32::from(tab_metrics.baseline_px / 2)
+                        - i32::from(bitmap.bitmap.bearing_px[1])
+                        - glyph.offset_26_6[1] / 64;
+                    if bitmap.bitmap.size_px != [0, 0] {
+                        glyphs.push(GlyphPlacement {
+                            key: glyph.key,
+                            origin_px: [x, y],
+                            clip_px: [close.x, close.y, close.width, close.height],
+                            color: LinearColor::from_srgba8(if item.active {
+                                TAB_ACTIVE_TEXT
+                            } else {
+                                TAB_INACTIVE_TEXT
+                            }),
+                        });
+                    }
+                    pen_x = pen_x.saturating_add(glyph.advance_26_6[0]);
+                }
+            }
+        }
     }
     if let Some(preedit) = overlays
         .preedit
@@ -407,7 +585,6 @@ fn prepare_glyph_working_set(
             request(preedit.text.to_string(), FontStyle::Regular);
         }
     }
-
     let mut shaped = HashMap::with_capacity(requests.len());
     let mut key_set = HashSet::new();
     let mut keys = Vec::new();
@@ -432,6 +609,45 @@ fn prepare_glyph_working_set(
         .into_iter()
         .map(|asset| (asset.key, asset))
         .collect();
+    Ok((shaped, assets))
+}
+
+fn prepare_tab_glyph_working_set(
+    text: &mut TextSystem,
+    tab_bar: Option<&crate::tab::TabBarPresentation>,
+) -> Result<(ShapedCache, GlyphAssets), ComposeError> {
+    let Some(tab_bar) = tab_bar else {
+        return Ok((ShapedCache::new(), GlyphAssets::new()));
+    };
+    let mut requests = tab_bar
+        .items
+        .iter()
+        .map(|item| item.title.clone())
+        .collect::<HashSet<_>>();
+    if tab_bar.items.iter().any(|item| item.close_rect.is_some()) {
+        requests.insert(TAB_CLOSE_MARK.to_owned());
+    }
+
+    let mut shaped = ShapedCache::new();
+    let mut keys = HashSet::new();
+    for request in requests {
+        let mut run = text.shape_cluster_only(&request, FontStyle::Regular)?;
+        for glyph in &run.glyphs {
+            keys.insert(glyph.key);
+        }
+        for glyph in &mut run.glyphs {
+            glyph.key.font_generation |= TAB_FONT_KEY_NAMESPACE;
+        }
+        shaped.insert((request, FontStyle::Regular), run);
+    }
+    if keys.len() > MAX_UNIQUE_GLYPHS {
+        return Err(ComposeError::Capacity("tab glyphs"));
+    }
+    let mut assets = GlyphAssets::new();
+    for mut asset in text.rasterize_working_set(&keys.into_iter().collect::<Vec<_>>())? {
+        asset.key.font_generation |= TAB_FONT_KEY_NAMESPACE;
+        assets.insert(asset.key, asset);
+    }
     Ok((shaped, assets))
 }
 
@@ -681,6 +897,10 @@ fn point_in_range(point: [u16; 2], range: CellRange) -> bool {
     point >= start.min(end) && point <= start.max(end)
 }
 
+fn draws_underline(cell: &SnapshotCell) -> bool {
+    cell.width != CellWidth::Spacer && (cell.flags.underline || cell.hyperlink.is_some())
+}
+
 fn resolve_cell_colors(
     foreground: TerminalColor,
     background: TerminalColor,
@@ -756,6 +976,7 @@ fn dim(color: u32) -> u32 {
     };
     u32::from_be_bytes([dim(r), dim(g), dim(b), a])
 }
+
 #[allow(clippy::cast_possible_truncation)]
 fn cell_origin(layout: &GridLayout, column: usize, line: usize) -> [u32; 2] {
     [
@@ -815,8 +1036,9 @@ pub enum ComposeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{cursor_glyph_color, dim, resolve_color, validate_glyph_budget};
+    use super::{cursor_glyph_color, dim, draws_underline, resolve_color, validate_glyph_budget};
     use crate::config::CursorStyle;
+    use crate::terminal::{CellFlags, CellWidth, SnapshotCell, TerminalColor};
     use leyline_text::{MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS, MAX_PREPARED_GLYPHS};
 
     #[test]
@@ -879,5 +1101,26 @@ mod tests {
             value > 64,
             "linear-light dimming must remain brighter than byte halving"
         );
+    }
+
+    #[test]
+    fn osc_8_hyperlinks_are_underlined() {
+        let mut cell = SnapshotCell {
+            ch: 'x',
+            zerowidth: None,
+            foreground: TerminalColor::Named(256),
+            background: TerminalColor::Named(257),
+            underline_color: None,
+            flags: CellFlags::default(),
+            width: CellWidth::Narrow,
+            hyperlink: None,
+        };
+        assert!(!draws_underline(&cell));
+
+        cell.hyperlink = Some(0);
+        assert!(draws_underline(&cell));
+
+        cell.width = CellWidth::Spacer;
+        assert!(!draws_underline(&cell));
     }
 }
