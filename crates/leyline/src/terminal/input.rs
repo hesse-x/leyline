@@ -55,6 +55,20 @@ pub fn encode_key(
     modifiers: Modifiers,
     modes: TerminalModes,
 ) -> Result<Vec<u8>, InputError> {
+    let alt_is_parameter = matches!(
+        key,
+        TerminalKey::Up
+            | TerminalKey::Down
+            | TerminalKey::Left
+            | TerminalKey::Right
+            | TerminalKey::Home
+            | TerminalKey::End
+            | TerminalKey::Insert
+            | TerminalKey::Delete
+            | TerminalKey::PageUp
+            | TerminalKey::PageDown
+            | TerminalKey::Function(_)
+    );
     let mut encoded = match key {
         TerminalKey::Char(ch) => encode_char(ch, modifiers)?,
         TerminalKey::Backspace => vec![0x7f],
@@ -74,7 +88,7 @@ pub fn encode_key(
         TerminalKey::PageDown => tilde(6, modifiers),
         TerminalKey::Function(number) => function(number, modifiers)?,
     };
-    if modifiers.alt && !matches!(key, TerminalKey::Char(_)) {
+    if modifiers.alt && !matches!(key, TerminalKey::Char(_)) && !alt_is_parameter {
         encoded.insert(0, 0x1b);
     }
     Ok(encoded)
@@ -121,11 +135,23 @@ fn tilde(code: u8, modifiers: Modifiers) -> Vec<u8> {
 }
 
 fn function(number: u8, modifiers: Modifiers) -> Result<Vec<u8>, InputError> {
+    let parameter = modifier_parameter(modifiers);
+    let ss3_final = match number {
+        1 => Some(b'P'),
+        2 => Some(b'Q'),
+        3 => Some(b'R'),
+        4 => Some(b'S'),
+        5..=12 => None,
+        _ => return Err(InputError::UnsupportedFunction(number)),
+    };
+    if let Some(final_byte) = ss3_final {
+        return if parameter == 1 {
+            Ok(vec![0x1b, b'O', final_byte])
+        } else {
+            Ok(format!("\x1b[1;{parameter}{}", char::from(final_byte)).into_bytes())
+        };
+    }
     let code = match number {
-        1 => 11,
-        2 => 12,
-        3 => 13,
-        4 => 14,
         5 => 15,
         6 => 17,
         7 => 18,
@@ -134,7 +160,7 @@ fn function(number: u8, modifiers: Modifiers) -> Result<Vec<u8>, InputError> {
         10 => 21,
         11 => 23,
         12 => 24,
-        _ => return Err(InputError::UnsupportedFunction(number)),
+        _ => unreachable!("F1-F4 and unsupported function keys returned above"),
     };
     Ok(tilde(code, modifiers))
 }
@@ -327,6 +353,141 @@ mod tests {
             )
             .unwrap(),
             b"\x1b[1;5D"
+        );
+        assert_eq!(
+            encode_key(
+                TerminalKey::Left,
+                Modifiers {
+                    alt: true,
+                    ..Modifiers::default()
+                },
+                modes()
+            )
+            .unwrap(),
+            b"\x1b[1;3D"
+        );
+        assert_eq!(
+            encode_key(
+                TerminalKey::Enter,
+                Modifiers {
+                    alt: true,
+                    ..Modifiers::default()
+                },
+                modes()
+            )
+            .unwrap(),
+            b"\x1b\r"
+        );
+    }
+
+    #[test]
+    fn function_keys_match_xterm_256color() {
+        let expected: [&[u8]; 12] = [
+            b"\x1bOP",
+            b"\x1bOQ",
+            b"\x1bOR",
+            b"\x1bOS",
+            b"\x1b[15~",
+            b"\x1b[17~",
+            b"\x1b[18~",
+            b"\x1b[19~",
+            b"\x1b[20~",
+            b"\x1b[21~",
+            b"\x1b[23~",
+            b"\x1b[24~",
+        ];
+        for (index, expected) in expected.into_iter().enumerate() {
+            let number = u8::try_from(index + 1).unwrap();
+            assert_eq!(
+                encode_key(TerminalKey::Function(number), Modifiers::default(), modes()).unwrap(),
+                expected,
+                "F{number}"
+            );
+        }
+    }
+
+    #[test]
+    fn modified_function_keys_use_xterm_modifier_parameters() {
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        let alt = Modifiers {
+            alt: true,
+            ..Modifiers::default()
+        };
+        let control = Modifiers {
+            control: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            encode_key(TerminalKey::Function(1), shift, modes()).unwrap(),
+            b"\x1b[1;2P"
+        );
+        assert_eq!(
+            encode_key(TerminalKey::Function(4), alt, modes()).unwrap(),
+            b"\x1b[1;3S"
+        );
+        assert_eq!(
+            encode_key(TerminalKey::Function(5), control, modes()).unwrap(),
+            b"\x1b[15;5~"
+        );
+        assert_eq!(
+            encode_key(TerminalKey::Function(0), Modifiers::default(), modes()),
+            Err(InputError::UnsupportedFunction(0))
+        );
+        assert_eq!(
+            encode_key(TerminalKey::Function(13), Modifiers::default(), modes()),
+            Err(InputError::UnsupportedFunction(13))
+        );
+    }
+
+    #[test]
+    fn navigation_keys_match_normal_application_and_modified_xterm_forms() {
+        let normal: [(TerminalKey, &[u8]); 10] = [
+            (TerminalKey::Up, b"\x1b[A"),
+            (TerminalKey::Down, b"\x1b[B"),
+            (TerminalKey::Right, b"\x1b[C"),
+            (TerminalKey::Left, b"\x1b[D"),
+            (TerminalKey::Home, b"\x1b[H"),
+            (TerminalKey::End, b"\x1b[F"),
+            (TerminalKey::Insert, b"\x1b[2~"),
+            (TerminalKey::Delete, b"\x1b[3~"),
+            (TerminalKey::PageUp, b"\x1b[5~"),
+            (TerminalKey::PageDown, b"\x1b[6~"),
+        ];
+        for (key, expected) in normal {
+            assert_eq!(
+                encode_key(key, Modifiers::default(), modes()).unwrap(),
+                expected
+            );
+        }
+
+        let application = TerminalModes {
+            application_cursor: true,
+            ..modes()
+        };
+        assert_eq!(
+            encode_key(TerminalKey::Up, Modifiers::default(), application).unwrap(),
+            b"\x1bOA"
+        );
+        assert_eq!(
+            encode_key(TerminalKey::Home, Modifiers::default(), application).unwrap(),
+            b"\x1bOH"
+        );
+        let shift_alt_control = Modifiers {
+            shift: true,
+            alt: true,
+            control: true,
+            ..Modifiers::default()
+        };
+        assert_eq!(
+            encode_key(TerminalKey::Right, shift_alt_control, application).unwrap(),
+            b"\x1b[1;8C"
+        );
+        assert_eq!(
+            encode_key(TerminalKey::PageDown, shift_alt_control, application).unwrap(),
+            b"\x1b[6;8~"
         );
     }
     #[test]

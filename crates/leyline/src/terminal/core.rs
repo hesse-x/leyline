@@ -523,6 +523,34 @@ mod tests {
     }
 
     #[test]
+    fn standard_device_queries_emit_bounded_xterm_replies() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(20, 4).unwrap(), 100).unwrap();
+        let delta = core.advance(b"\x1b[c\x1b[5n\x1b[2;3H\x1b[6n").unwrap();
+        let mut actions = Vec::new();
+        core.drain_actions(&mut actions);
+        let replies: Vec<Vec<u8>> = actions
+            .into_iter()
+            .filter_map(|action| match action {
+                TerminalAction::WriteToPty(bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            replies,
+            [
+                b"\x1b[?6c".to_vec(),
+                b"\x1b[0n".to_vec(),
+                b"\x1b[2;3R".to_vec()
+            ]
+        );
+        assert_eq!(
+            delta.audit.reply_bytes,
+            replies.iter().map(Vec::len).sum::<usize>()
+        );
+        assert!(delta.audit.reply_bytes <= MAX_PTY_REPLY_BYTES);
+    }
+
+    #[test]
     fn overlong_title_is_rejected_instead_of_byte_unsafe_truncation() {
         let mut core = TerminalCoreAdapter::new(GridSize::new(4, 2).unwrap(), 0).unwrap();
         let input = format!("\x1b]0;{}\x07", "中".repeat(342));

@@ -1,5 +1,6 @@
 mod environment;
 mod report;
+mod scene;
 mod terminal;
 mod text;
 mod vulkan;
@@ -15,6 +16,7 @@ use report::{ProbeError, ProbeResult, Reporter};
 enum Command {
     Environment,
     Terminal,
+    Scene,
     Text,
     Wayland,
     Vulkan,
@@ -31,7 +33,7 @@ struct Options {
 }
 
 fn usage() -> &'static str {
-    "Usage: leyline-probe <environment|terminal|text|wayland|vulkan|all> \
+    "Usage: leyline-probe <environment|terminal|scene|text|wayland|vulkan|all> \
      [--verbose] [--json] [--font PATTERN] [--terminal-fixture PATH] \
      [--wayland-interactive-seconds SECONDS]"
 }
@@ -45,6 +47,7 @@ fn parse_args() -> Result<Options, ProbeError> {
     {
         Some("environment") => Command::Environment,
         Some("terminal") => Command::Terminal,
+        Some("scene") => Command::Scene,
         Some("text") => Command::Text,
         Some("wayland") => Command::Wayland,
         Some("vulkan") => Command::Vulkan,
@@ -100,12 +103,14 @@ fn run(options: &Options, reporter: &mut Reporter) -> ProbeResult<()> {
     match options.command {
         Command::Environment => environment::run(reporter),
         Command::Terminal => terminal::run(reporter, options.terminal_fixture.as_deref()),
+        Command::Scene => scene::run(reporter, options.terminal_fixture.as_deref()),
         Command::Text => text::run(reporter, options.font.as_deref()),
         Command::Wayland => wayland::run(reporter, options.wayland_interactive_seconds),
         Command::Vulkan => vulkan::run(reporter),
         Command::All => {
             environment::run(reporter)?;
             terminal::run(reporter, options.terminal_fixture.as_deref())?;
+            scene::run(reporter, options.terminal_fixture.as_deref())?;
             text::run(reporter, options.font.as_deref())?;
             wayland::run(reporter, options.wayland_interactive_seconds)?;
             vulkan::run(reporter)

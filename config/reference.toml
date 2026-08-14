@@ -28,3 +28,10 @@ min_thumb_size = 24.0
 thumb = "#9aa2a680"
 thumb_hover = "#c1c7caff"
 track = "#00000000"
+
+[tabs]
+max_count = 32
+bar_height = 32
+min_width = 80
+max_width = 240
+show_close_button = true

@@ -38,6 +38,7 @@ The stage 0 hardware and integration probes remain available:
 ```sh
 cargo run --locked --bin leyline-probe -- environment
 cargo run --locked --bin leyline-probe -- terminal
+cargo run --locked --bin leyline-probe -- scene
 cargo run --locked --bin leyline-probe -- text
 cargo run --locked --bin leyline-probe -- wayland
 cargo run --locked --bin leyline-probe -- vulkan

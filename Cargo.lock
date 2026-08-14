@@ -344,6 +344,7 @@ dependencies = [
  "ash",
  "freetype-sys",
  "harfbuzz-sys",
+ "leyline",
  "smithay-client-toolkit",
  "wayland-client",
  "yeslogic-fontconfig-sys",

@@ -564,9 +564,13 @@ impl WaylandWindow {
             self.dispatch_pending()?;
             return Ok(());
         };
+        let mut wayland_interest = PollFlags::IN | PollFlags::ERR | PollFlags::HUP;
+        if self.flush_blocked {
+            wayland_interest |= PollFlags::OUT;
+        }
         let mut descriptors = vec![PollFd::from_borrowed_fd(
             self.connection.as_fd(),
-            PollFlags::IN | PollFlags::ERR | PollFlags::HUP,
+            wayland_interest,
         )];
         if let Some(wake) = wake {
             descriptors.push(PollFd::from_borrowed_fd(
@@ -585,16 +589,20 @@ impl WaylandWindow {
                 Err(error) => return Err(format!("UI poll failed: {error}")),
             }
         }
-        if descriptors[0]
-            .revents()
-            .intersects(PollFlags::ERR | PollFlags::HUP)
-        {
+        let readiness = descriptors[0].revents();
+        if readiness.intersects(PollFlags::ERR | PollFlags::HUP) {
             return Err("Wayland compositor disconnected".into());
         }
-        if descriptors[0].revents().contains(PollFlags::IN) {
+        if readiness.contains(PollFlags::IN) {
             read_guard
                 .read()
                 .map_err(|error| format!("Wayland socket read failed: {error}"))?;
+        } else {
+            // libdecor shares this wl_display, so cancel our prepared read before dispatching.
+            drop(read_guard);
+        }
+        if readiness.contains(PollFlags::OUT) {
+            self.flush()?;
         }
         self.libdecor
             .as_mut()
