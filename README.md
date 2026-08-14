@@ -64,12 +64,16 @@ size = 11.0
 ligatures = false
 
 [colors]
-foreground = "#d8d8d8"
-background = "#181818"
+foreground = "#dce7f3"
+# The final byte controls opacity; the compositor shows the desktop behind the window.
+background = "#101522dc"
+cursor = "#8bd5ff"
+selection_foreground = "#f6f9ff"
+selection_background = "#526ab8cc"
 
 [window]
-padding_x = 8
-padding_y = 8
+padding_x = 12
+padding_y = 10
 
 [scrolling]
 history_lines = 10000
@@ -82,10 +86,19 @@ hold_after_exit = false
 confirm_multiline_paste = true
 
 [[keybindings]]
-key = "C"
-mods = ["Control", "Shift"]
-action = "Copy"
+key = "PageUp"
+mods = ["Shift"]
+action = "ScrollPageUp"
 ```
+
+Selecting text publishes the primary selection; paste it with the middle mouse button or
+`Shift+Insert`.
+
+When paste confirmation is enabled, multiline or control-character clipboard content opens a
+modal warning that shows only its source, size, line count, and risk category. Press `Enter` or
+`Y` to paste; press `Escape` or `N` to reject. Any other key cancels the modal and is consumed.
+Losing keyboard focus, replacing the primary-selection offer, requesting another paste, or closing
+the session also cancels the pending paste.
 
 Unknown configuration fields produce warnings. Colors must be `#RRGGBB` or `#RRGGBBAA`; font size,
 padding, and scrollback are bounded to prevent accidental resource exhaustion.
@@ -104,9 +117,10 @@ available. Ligatures are disabled by default and always remain constrained to te
 Strong RTL runs are shaped, but v0.1 does not perform full Unicode bidi visual reordering: cursor
 and selection coordinates remain in logical cell order.
 
-Keyboard, mouse, IME, interactive selection, clipboard, and hyperlink interaction arrive in later
-stages. The renderer already accepts a generation-bound selection overlay for integration testing.
-OSC 52 clipboard requests are deliberately rejected and OSC 8 links remain inert metadata.
+Keyboard, mouse, IME, interactive selection, primary selection, and explicitly triggered OSC 8
+links are implemented. System-clipboard shortcuts are not exposed and OSC 52 clipboard requests
+remain deliberately rejected. OSC 8 `Ctrl+click` opening has been manually verified on GNOME.
+Broader IBus/Fcitx, fractional-scale, and hardware Vulkan acceptance coverage is still pending.
 GNOME client-side decoration
 uses libdecor; compositors providing xdg-decoration use server-side decoration. Fractional scale is
 enabled only when fractional-scale-v1 and viewporter are both available, with integer buffer-scale

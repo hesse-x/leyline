@@ -6,8 +6,9 @@ mod snapshot;
 pub use core::{TerminalAction, TerminalCoreAdapter, TerminalDelta, TerminalError};
 pub use debug_grid::format_debug_grid;
 pub use input::{
-    ButtonState, InputError, Modifiers, MouseButton, TerminalKey, commit_text, encode_focus,
-    encode_key, encode_mouse, paste_transaction,
+    ButtonState, InputError, MAX_PASTE_BODY_BYTES, MAX_TRANSACTION_BYTES, Modifiers, MouseButton,
+    TerminalKey, commit_text, encode_alternate_scroll, encode_focus, encode_key, encode_mouse,
+    paste_transaction,
 };
 pub use snapshot::{
     CellFlags, CellWidth, CursorSnapshot, FrameSnapshot, GridSize, MouseEncoding, MouseProtocol,

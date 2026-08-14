@@ -2,7 +2,10 @@
 
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 
-use wayland_client::{Connection, Proxy, protocol::wl_surface};
+use wayland_client::{
+    Connection, Proxy,
+    protocol::{wl_seat, wl_surface},
+};
 
 use crate::LogicalSize;
 
@@ -10,6 +13,19 @@ enum Context {}
 enum Frame {}
 enum Configuration {}
 enum DecorState {}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) enum ResizeEdge {
+    Top = 1,
+    Bottom = 2,
+    Left = 3,
+    TopLeft = 4,
+    BottomLeft = 5,
+    Right = 6,
+    TopRight = 7,
+    BottomRight = 8,
+}
 
 #[repr(C)]
 struct ContextInterface {
@@ -50,6 +66,7 @@ unsafe extern "C" {
     fn libdecor_frame_set_title(frame: *mut Frame, title: *const c_char);
     fn libdecor_frame_set_app_id(frame: *mut Frame, app_id: *const c_char);
     fn libdecor_frame_set_min_content_size(frame: *mut Frame, width: c_int, height: c_int);
+    fn libdecor_frame_resize(frame: *mut Frame, seat: *mut c_void, serial: u32, edge: ResizeEdge);
     fn libdecor_frame_map(frame: *mut Frame);
     fn libdecor_configuration_get_content_size(
         configuration: *mut Configuration,
@@ -212,6 +229,11 @@ impl Libdecor {
         let title = CString::new(title).map_err(|_| "window title contains NUL")?;
         unsafe { libdecor_frame_set_title(self.frame, title.as_ptr()) };
         Ok(())
+    }
+
+    pub(crate) fn resize(&mut self, seat: &wl_seat::WlSeat, serial: u32, edge: ResizeEdge) {
+        // SAFETY: the seat belongs to the same display and the serial comes from its pointer press.
+        unsafe { libdecor_frame_resize(self.frame, seat.id().as_ptr().cast(), serial, edge) };
     }
 }
 

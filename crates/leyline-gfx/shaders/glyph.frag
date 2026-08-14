@@ -7,5 +7,5 @@ layout(location = 0) out vec4 output_color;
 
 void main() {
     float coverage = texture(atlas, glyph_uv).r;
-    output_color = vec4(glyph_color.rgb * coverage, glyph_color.a * coverage);
+    output_color = vec4(glyph_color.rgb * glyph_color.a * coverage, glyph_color.a * coverage);
 }

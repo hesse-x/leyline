@@ -120,6 +120,7 @@ pub(crate) struct VulkanRenderer {
     queue_family: u32,
     swapchain_loader: ash::khr::swapchain::Device,
     swapchain: vk::SwapchainKHR,
+    composite_alpha: vk::CompositeAlphaFlagsKHR,
     format: vk::Format,
     extent: vk::Extent2D,
     images: Vec<vk::Image>,
@@ -225,6 +226,7 @@ impl VulkanRenderer {
             queue_family,
             swapchain_loader,
             swapchain: vk::SwapchainKHR::null(),
+            composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
             format: vk::Format::UNDEFINED,
             extent: vk::Extent2D::default(),
             images: Vec::new(),
@@ -952,6 +954,7 @@ impl VulkanRenderer {
             });
         }
         self.swapchain = new_swapchain;
+        self.composite_alpha = alpha;
         self.images = images;
         self.views = views;
         self.image_fences = vec![vk::Fence::null(); self.images.len()];
@@ -977,17 +980,21 @@ impl VulkanRenderer {
             acquired
         } else {
             let slot_index = self.current_frame;
-            let slot = &self.frames[slot_index];
-            match unsafe { self.device.get_fence_status(slot.fence) } {
+            let slot_fence = self.frames[slot_index].fence;
+            let slot_available = self.frames[slot_index].available;
+            match unsafe { self.device.get_fence_status(slot_fence) } {
                 Ok(true) => {}
                 Ok(false) => return Ok(RenderStatus::Deferred),
                 Err(error) => return Err(format!("query frame fence failed: {error:?}")),
             }
+            // Retired generations referencing this signaled fence must be destroyed before the
+            // frame slot resets it for unrelated work.
+            self.collect_retired()?;
             let result = unsafe {
                 self.swapchain_loader.acquire_next_image(
                     self.swapchain,
                     0,
-                    slot.available,
+                    slot_available,
                     vk::Fence::null(),
                 )
             };
@@ -1100,7 +1107,13 @@ impl VulkanRenderer {
             vk::AccessFlags2::empty(),
             vk::AccessFlags2::COLOR_ATTACHMENT_WRITE,
         );
-        let clear = color(scene.clear);
+        let clear = if self.composite_alpha == vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED {
+            premultiplied_color(scene.clear)
+        } else {
+            let mut opaque = scene.clear;
+            opaque.alpha = 1.0;
+            color(opaque)
+        };
         let attachment = vk::RenderingAttachmentInfo::default()
             .image_view(self.views[image_index])
             .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
@@ -1333,14 +1346,15 @@ impl VulkanRenderer {
             .mapped_slice_mut()
             .ok_or("rectangle instance memory is not mapped")?;
         for (index, rectangle) in rectangles.iter().enumerate() {
+            let alpha = rectangle.color.alpha;
             let gpu = GpuRectangle {
                 origin_px: rectangle.origin_px,
                 size_px: rectangle.size_px,
                 color: [
-                    rectangle.color.red,
-                    rectangle.color.green,
-                    rectangle.color.blue,
-                    rectangle.color.alpha,
+                    rectangle.color.red * alpha,
+                    rectangle.color.green * alpha,
+                    rectangle.color.blue * alpha,
+                    alpha,
                 ],
             };
             let start = offset + index * size_of::<GpuRectangle>();
@@ -1616,6 +1630,17 @@ fn transition(
 fn color(value: LinearColor) -> vk::ClearColorValue {
     vk::ClearColorValue {
         float32: [value.red, value.green, value.blue, value.alpha],
+    }
+}
+
+fn premultiplied_color(value: LinearColor) -> vk::ClearColorValue {
+    vk::ClearColorValue {
+        float32: [
+            value.red * value.alpha,
+            value.green * value.alpha,
+            value.blue * value.alpha,
+            value.alpha,
+        ],
     }
 }
 fn vk_error(context: &'static str) -> impl FnOnce(vk::Result) -> String {

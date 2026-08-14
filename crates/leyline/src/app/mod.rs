@@ -84,7 +84,14 @@ impl App {
                     AppAction::Continue
                 })
             }
-            AppEvent::Pty(_) if self.lifecycle == Lifecycle::Running => Ok(AppAction::Continue),
+            AppEvent::Pty(_)
+                if matches!(
+                    self.lifecycle,
+                    Lifecycle::Running | Lifecycle::ShuttingDown(_)
+                ) =>
+            {
+                Ok(AppAction::Continue)
+            }
             AppEvent::Pty(_) => Err(self.invalid_transition("handle PTY event")),
         }
     }

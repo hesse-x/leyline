@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     ffi::{CStr, CString, c_int},
     ptr,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 
 use fontconfig_sys as fc;
@@ -17,14 +17,8 @@ use crate::{
     TextError,
 };
 
+#[derive(Clone, Copy)]
 struct FontconfigOwner(&'static fc::Fc);
-
-impl Drop for FontconfigOwner {
-    fn drop(&mut self) {
-        // SAFETY: TextSystem owns the single Fontconfig session and all patterns are temporary.
-        unsafe { (self.0.FcFini)() }
-    }
-}
 
 struct Library(ft::FT_Library);
 
@@ -43,6 +37,7 @@ struct Face {
     shaping_blob: *mut hb::hb_blob_t,
     raw: ft::FT_Face,
     id: FaceId,
+    style: FontStyle,
 }
 
 impl Drop for Face {
@@ -104,30 +99,46 @@ pub struct TextSystem {
     metrics: CellMetrics,
 }
 
+/// Fully initialized font resources which can be committed without further native work.
+pub struct PreparedFontState {
+    base_generation: u64,
+    system: TextSystem,
+    metrics: CellMetrics,
+    generation: u64,
+}
+
+impl PreparedFontState {
+    #[must_use]
+    pub const fn metrics(&self) -> CellMetrics {
+        self.metrics
+    }
+
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn text_system_mut(&mut self) -> &mut TextSystem {
+        &mut self.system
+    }
+}
+
 impl TextSystem {
     /// Opens the configured primary monospace face and freezes cell metrics for generation one.
     ///
     /// # Errors
     /// Returns a typed environment or font data error when the configured face cannot be opened.
     pub fn new(request: FontRequest) -> Result<Self, TextError> {
-        let fc = fc::statics::LIB_RESULT
-            .as_ref()
-            .map_err(|error| TextError::Environment(format!("load libfontconfig.so.1: {error}")))?;
-        // SAFETY: initialization is paired with FontconfigOwner and no native object escapes.
-        if unsafe { (fc.FcInit)() } == 0 {
-            return Err(TextError::Environment(
-                "Fontconfig initialization failed".into(),
-            ));
-        }
-        let fontconfig = FontconfigOwner(fc);
-        let mut raw_library = ptr::null_mut();
-        // SAFETY: output pointer is valid and checked immediately.
-        if unsafe { ft::FT_Init_FreeType(&raw mut raw_library) } != 0 || raw_library.is_null() {
-            return Err(TextError::Environment(
-                "FreeType initialization failed".into(),
-            ));
-        }
-        let library = Library(raw_library);
+        let fontconfig = FontconfigOwner(initialize_fontconfig()?);
+        Self::with_generation(request, fontconfig, 1)
+    }
+
+    fn with_generation(
+        request: FontRequest,
+        fontconfig: FontconfigOwner,
+        generation: u64,
+    ) -> Result<Self, TextError> {
+        let library = initialize_freetype()?;
         let mut system = Self {
             faces: Vec::new(),
             face_lookup: HashMap::new(),
@@ -136,7 +147,7 @@ impl TextSystem {
             library,
             fontconfig,
             request,
-            generation: 1,
+            generation,
             metrics: placeholder_metrics(),
         };
         let primary = system.resolve_face(None, FontStyle::Regular)?;
@@ -154,26 +165,49 @@ impl TextSystem {
         self.metrics
     }
 
+    /// Resolves a complete replacement without changing the active font resources.
+    ///
+    /// # Errors
+    /// Returns a typed font error while leaving `self` untouched.
+    pub fn prepare_configure(&self, request: FontRequest) -> Result<PreparedFontState, TextError> {
+        let generation = if self.request == request {
+            self.generation
+        } else {
+            self.generation
+                .checked_add(1)
+                .ok_or(TextError::CapacityExceeded("font generation"))?
+        };
+        let system = Self::with_generation(request, self.fontconfig, generation)?;
+        Ok(PreparedFontState {
+            base_generation: self.generation,
+            metrics: system.metrics,
+            generation,
+            system,
+        })
+    }
+
+    /// Atomically swaps a prepared replacement into the active text system.
+    ///
+    /// # Errors
+    /// Rejects a state prepared against an older active generation.
+    pub fn commit_configure(
+        &mut self,
+        prepared: PreparedFontState,
+    ) -> Result<CellMetrics, TextError> {
+        if prepared.base_generation != self.generation {
+            return Err(TextError::StalePreparedState);
+        }
+        *self = prepared.system;
+        Ok(self.metrics)
+    }
+
     /// Reopens faces and invalidates generation-bound caches after font or scale changes.
     ///
     /// # Errors
     /// Returns a typed font error without changing the resident graphics scene.
     pub fn configure(&mut self, request: FontRequest) -> Result<CellMetrics, TextError> {
-        if self.request == request {
-            return Ok(self.metrics);
-        }
-        self.faces.clear();
-        self.face_lookup.clear();
-        self.glyph_cache.clear();
-        self.glyph_cache_bytes = 0;
-        self.request = request;
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .ok_or(TextError::CapacityExceeded("font generation"))?;
-        let primary = self.resolve_face(None, FontStyle::Regular)?;
-        self.metrics = metrics(self.face(primary)?.raw)?;
-        Ok(self.metrics)
+        let prepared = self.prepare_configure(request)?;
+        self.commit_configure(prepared)
     }
 
     /// Shapes and rasterizes one indivisible snapshot cluster with bounded output.
@@ -386,6 +420,14 @@ impl TextSystem {
         cluster: Option<&str>,
         style: FontStyle,
     ) -> Result<FaceId, TextError> {
+        if let Some(text) = cluster
+            && let Some(face) = self
+                .faces
+                .iter()
+                .find(|face| face.style == style && face_supports(face.raw, text))
+        {
+            return Ok(face.id);
+        }
         let (path, index) = font_match(self.fontconfig.0, &self.request, cluster, style)?;
         if let Some(id) = self.face_lookup.get(&(path.clone(), index)) {
             return Ok(*id);
@@ -453,6 +495,7 @@ impl TextSystem {
             shaping_blob: hb_blob,
             raw: raw_face,
             id,
+            style,
         });
         self.face_lookup.insert((path, index), id);
         Ok(id)
@@ -464,6 +507,42 @@ impl TextSystem {
             .filter(|face| face.id == id)
             .ok_or_else(|| TextError::FontData("unknown face id".into()))
     }
+}
+
+fn face_supports(face: ft::FT_Face, text: &str) -> bool {
+    text.chars()
+        .all(|ch| unsafe { ft::FT_Get_Char_Index(face, u64::from(u32::from(ch))) } != 0)
+}
+
+fn initialize_freetype() -> Result<Library, TextError> {
+    let mut raw_library = ptr::null_mut();
+    // SAFETY: output pointer is valid and checked immediately.
+    if unsafe { ft::FT_Init_FreeType(&raw mut raw_library) } != 0 || raw_library.is_null() {
+        return Err(TextError::Environment(
+            "FreeType initialization failed".into(),
+        ));
+    }
+    Ok(Library(raw_library))
+}
+
+fn initialize_fontconfig() -> Result<&'static fc::Fc, TextError> {
+    static INITIALIZED: OnceLock<Result<(), String>> = OnceLock::new();
+    let fc = fc::statics::LIB_RESULT
+        .as_ref()
+        .map_err(|error| TextError::Environment(format!("load libfontconfig.so.1: {error}")))?;
+    let initialized = INITIALIZED.get_or_init(|| {
+        // SAFETY: OnceLock makes FcInit process-wide and one-shot. FcFini is intentionally not
+        // called, since it tears down global state that other TextSystem instances may still use.
+        if unsafe { (fc.FcInit)() } == 0 {
+            Err("Fontconfig initialization failed".into())
+        } else {
+            Ok(())
+        }
+    });
+    initialized
+        .as_ref()
+        .map(|()| fc)
+        .map_err(|error| TextError::Environment(error.clone()))
 }
 
 fn font_match(
@@ -624,5 +703,21 @@ fn placeholder_metrics() -> CellMetrics {
         underline_thickness_px: std::num::NonZeroU16::new(1).expect("one is nonzero"),
         strike_y_px: 1,
         strike_thickness_px: std::num::NonZeroU16::new(1).expect("one is nonzero"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repeated_supported_clusters_reuse_the_loaded_face() {
+        let request = FontRequest::from_points("monospace", 11.0, 120, false).unwrap();
+        let mut system = TextSystem::new(request).unwrap();
+        let initial_faces = system.faces.len();
+        for cluster in ["a", "terminal", "123", "e\u{301}", "terminal"] {
+            system.shape_cluster(cluster, FontStyle::Regular).unwrap();
+        }
+        assert_eq!(system.faces.len(), initial_faces);
     }
 }

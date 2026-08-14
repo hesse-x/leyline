@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, sync::Arc};
+use std::{
+    collections::VecDeque,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use leyline_pty::{PtyProcess, PtySinks, SpawnSpec};
 
@@ -32,6 +36,15 @@ pub enum SessionAction {
     Failed,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ShutdownPoll {
+    Pending,
+    Complete,
+    TimedOut,
+}
+
+const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
+
 pub struct TerminalSession {
     core: TerminalCoreAdapter,
     process: Option<PtyProcess>,
@@ -44,6 +57,7 @@ pub struct TerminalSession {
     pending_title: Option<Arc<str>>,
     pending_input: VecDeque<Vec<u8>>,
     pending_input_bytes: usize,
+    shutdown_deadline: Option<Instant>,
 }
 
 #[allow(clippy::missing_errors_doc)]
@@ -111,6 +125,7 @@ impl TerminalSession {
             pending_title: None,
             pending_input: VecDeque::new(),
             pending_input_bytes: 0,
+            shutdown_deadline: None,
         })
     }
 
@@ -188,10 +203,19 @@ impl TerminalSession {
     ) -> Result<(), SessionError> {
         let bytes = crate::terminal::encode_key(key, modifiers, self.core.input_modes())
             .map_err(SessionError::Input)?;
+        self.restore_viewport_after_input()?;
         self.queue_input(bytes)
     }
     pub fn commit_text(&mut self, text: &str) -> Result<(), SessionError> {
         let bytes = crate::terminal::commit_text(text).map_err(SessionError::Input)?;
+        self.restore_viewport_after_input()?;
+        self.queue_input(bytes)
+    }
+    pub fn paste(&mut self, text: &str) -> Result<(), SessionError> {
+        let bytes =
+            crate::terminal::paste_transaction(text, self.core.input_modes().bracketed_paste)
+                .map_err(SessionError::Input)?;
+        self.restore_viewport_after_input()?;
         self.queue_input(bytes)
     }
     pub fn focus_changed(&mut self, focused: bool) -> Result<(), SessionError> {
@@ -204,11 +228,15 @@ impl TerminalSession {
         &mut self,
         point: crate::terminal::SelectionPoint,
     ) -> Result<(), SessionError> {
-        self.core.start_selection(
-            crate::terminal::SelectionKind::Simple,
-            point,
-            crate::terminal::SelectionSide::Left,
-        )?;
+        self.start_selection_kind(crate::terminal::SelectionKind::Simple, point)
+    }
+    pub fn start_selection_kind(
+        &mut self,
+        kind: crate::terminal::SelectionKind,
+        point: crate::terminal::SelectionPoint,
+    ) -> Result<(), SessionError> {
+        self.core
+            .start_selection(kind, point, crate::terminal::SelectionSide::Left)?;
         self.dirty = true;
         Ok(())
     }
@@ -237,6 +265,21 @@ impl TerminalSession {
             ranges,
         }
     }
+    pub fn selected_text(&self) -> Option<String> {
+        self.core.selected_text()
+    }
+    pub fn hyperlink_at(
+        &self,
+        point: crate::terminal::SelectionPoint,
+    ) -> Option<(u64, u16, Arc<str>)> {
+        let snapshot = self.latest_snapshot.as_ref()?;
+        let index = usize::from(point.line)
+            .checked_mul(snapshot.grid.columns())?
+            .checked_add(usize::from(point.column))?;
+        let hyperlink = snapshot.cells.get(index)?.hyperlink?;
+        let uri = Arc::clone(&snapshot.hyperlinks.get(usize::from(hyperlink))?.uri);
+        Some((snapshot.generation, hyperlink, uri))
+    }
     pub fn pointer_report(
         &mut self,
         button: crate::terminal::MouseButton,
@@ -264,6 +307,20 @@ impl TerminalSession {
         self.dirty = true;
         Ok(())
     }
+    pub fn alternate_scroll(&mut self, lines: i32) -> Result<bool, SessionError> {
+        let Some(bytes) = crate::terminal::encode_alternate_scroll(lines, self.core.input_modes())
+        else {
+            return Ok(false);
+        };
+        self.queue_input(bytes)?;
+        Ok(true)
+    }
+
+    fn restore_viewport_after_input(&mut self) -> Result<(), SessionError> {
+        self.core.scroll_to_bottom()?;
+        self.dirty = true;
+        Ok(())
+    }
     pub const fn state(&self) -> SessionState {
         self.state
     }
@@ -271,10 +328,48 @@ impl TerminalSession {
         self.pending_title.take()
     }
     pub fn begin_shutdown(&mut self) {
+        if self.shutdown_deadline.is_some() || self.state == SessionState::Closed {
+            return;
+        }
         self.state = SessionState::Closing;
+        self.pending_input.clear();
+        self.pending_input_bytes = 0;
+        self.shutdown_deadline = Some(Instant::now() + SHUTDOWN_DEADLINE);
         if let Some(process) = &self.process {
             let _ = process.request_shutdown();
         }
+    }
+
+    #[must_use]
+    pub const fn shutdown_deadline(&self) -> Option<Instant> {
+        self.shutdown_deadline
+    }
+
+    pub fn poll_shutdown(&mut self, now: Instant) -> Result<ShutdownPoll, SessionError> {
+        let Some(deadline) = self.shutdown_deadline else {
+            return Ok(ShutdownPoll::Pending);
+        };
+        if let Some(process) = self.process.as_mut()
+            && process.try_join().map_err(SessionError::Join)?
+        {
+            self.process.take();
+            self.state = SessionState::Closed;
+            self.shutdown_deadline = None;
+            return Ok(ShutdownPoll::Complete);
+        }
+        if self.process.is_none() {
+            self.state = SessionState::Closed;
+            self.shutdown_deadline = None;
+            return Ok(ShutdownPoll::Complete);
+        }
+        if now >= deadline {
+            // PtyProcess::drop detaches handles whose workers own all remaining state.
+            self.process.take();
+            self.state = SessionState::Closed;
+            self.shutdown_deadline = None;
+            return Ok(ShutdownPoll::TimedOut);
+        }
+        Ok(ShutdownPoll::Pending)
     }
 
     fn flush_actions(&mut self) -> Result<(), SessionError> {
@@ -314,7 +409,9 @@ impl TerminalSession {
         }
         self.pending_input_bytes = next;
         self.pending_input.push_back(bytes);
-        Ok(())
+        // Start every newly queued transaction immediately. Writable notifications only report
+        // recovery from backpressure; an idle PTY has no transition that would trigger one.
+        self.flush_input(64 * 1024)
     }
 
     pub fn flush_input(&mut self, mut budget: usize) -> Result<(), SessionError> {
@@ -347,6 +444,9 @@ impl TerminalSession {
     }
 
     fn update_state(&mut self) -> Result<SessionAction, SessionError> {
+        if self.shutdown_deadline.is_some() {
+            return Ok(SessionAction::Continue);
+        }
         self.state = match (self.exited.is_some(), self.read_closed) {
             (false, false) => SessionState::Running,
             (true, false) => SessionState::ExitObserved,
@@ -403,6 +503,99 @@ mod tests {
         session.begin_shutdown();
         drop(session);
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn shutdown_completion_is_polled_without_blocking_ui() {
+        let mut runtime = AppRuntimeBuilder::new(Arc::new(CountingWake::default()))
+            .build()
+            .unwrap();
+        let config = EffectiveConfig::default();
+        let launch = LaunchRequest::Command(crate::cli::CommandSpec {
+            program: OsString::from("/bin/sh"),
+            args: vec![OsString::from("-c"), OsString::from("exec sleep 30")],
+        });
+        let mut session =
+            TerminalSession::start(&launch, &config, GridSize::new(10, 2).unwrap(), &runtime)
+                .unwrap();
+
+        session.begin_shutdown();
+        let first_poll = Instant::now();
+        assert_eq!(
+            session.poll_shutdown(Instant::now()).unwrap(),
+            ShutdownPoll::Pending
+        );
+        assert!(first_poll.elapsed() < Duration::from_millis(100));
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let mut events = Vec::new();
+            runtime.inbox().drain_round(|event| events.push(event));
+            for event in events {
+                if let crate::app::event::AppEvent::Pty(event) = event {
+                    session.handle_pty_event(event).unwrap();
+                }
+            }
+            if session.poll_shutdown(Instant::now()).unwrap() == ShutdownPoll::Complete {
+                break;
+            }
+            assert!(Instant::now() < deadline, "shutdown did not complete");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(session.state(), SessionState::Closed);
+    }
+
+    #[test]
+    fn user_input_is_submitted_without_waiting_for_a_writable_notification() {
+        let runtime = AppRuntimeBuilder::new(Arc::new(CountingWake::default()))
+            .build()
+            .unwrap();
+        let config = EffectiveConfig::default();
+        let launch = LaunchRequest::Command(crate::cli::CommandSpec {
+            program: OsString::from("/bin/sh"),
+            args: vec![OsString::from("-c"), OsString::from("exec sleep 30")],
+        });
+        let mut session =
+            TerminalSession::start(&launch, &config, GridSize::new(10, 2).unwrap(), &runtime)
+                .unwrap();
+
+        session.commit_text("x").unwrap();
+
+        assert!(session.pending_input.is_empty());
+        assert_eq!(session.pending_input_bytes, 0);
+        session.begin_shutdown();
+    }
+
+    #[test]
+    fn user_input_reaches_the_pty_without_prior_output() {
+        let mut runtime = AppRuntimeBuilder::new(Arc::new(CountingWake::default()))
+            .build()
+            .unwrap();
+        let config = EffectiveConfig::default();
+        let launch = LaunchRequest::Command(crate::cli::CommandSpec {
+            program: OsString::from("/bin/cat"),
+            args: Vec::new(),
+        });
+        let mut session =
+            TerminalSession::start(&launch, &config, GridSize::new(10, 2).unwrap(), &runtime)
+                .unwrap();
+
+        session.commit_text("x").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut echoed = false;
+        while Instant::now() < deadline && !echoed {
+            let mut events = Vec::new();
+            runtime.inbox().drain_round(|event| events.push(event));
+            for event in events {
+                if let crate::app::event::AppEvent::Pty(PtyEvent::Output(batch)) = event {
+                    echoed |= batch.as_slice().contains(&b'x');
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(echoed, "queued keyboard text never reached the PTY");
+        session.begin_shutdown();
     }
 
     #[test]

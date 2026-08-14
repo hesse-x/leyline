@@ -1,3 +1,5 @@
+use std::os::fd::OwnedFd;
+
 use leyline_text::{GlyphAsset, GlyphKey};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -56,7 +58,7 @@ pub struct WindowState {
     pub activated: bool,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug)]
 pub enum PlatformEvent {
     CloseRequested,
     Configured {
@@ -71,12 +73,64 @@ pub enum PlatformEvent {
     SurfaceSuspended,
     SurfaceResumed,
     KeyboardFocus {
-        serial: u32,
+        seat: crate::SeatToken,
+        serial: crate::InputSerial,
         focused: bool,
     },
     Key(KeyInput),
     ModifiersChanged(ModifiersState),
     Pointer(PointerInput),
+    TextInput(TextInputEvent),
+    Clipboard(ClipboardEvent),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectionTarget {
+    Clipboard,
+    Primary,
+}
+
+#[derive(Debug)]
+pub enum ClipboardEvent {
+    Offer {
+        target: SelectionTarget,
+        mime_types: Vec<String>,
+    },
+    Cleared(SelectionTarget),
+    Send {
+        source: u64,
+        mime_type: String,
+        fd: OwnedFd,
+    },
+    SourceCancelled {
+        source: u64,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TextInputEvent {
+    Enter,
+    Leave,
+    Preedit {
+        text: String,
+        cursor: Option<(i32, i32)>,
+    },
+    Commit(String),
+    DeleteSurrounding {
+        before_bytes: u32,
+        after_bytes: u32,
+    },
+    Done {
+        serial: u32,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextInputRectangle {
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -86,6 +140,7 @@ pub struct ModifiersState {
     pub control: bool,
     pub alt: bool,
     pub super_key: bool,
+    pub alt_graph: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,13 +151,13 @@ pub enum KeyState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyInput {
-    pub serial: u32,
+    pub serial: crate::InputSerial,
     pub time_ms: u32,
     pub physical_keycode: u32,
-    pub keysym: u32,
-    pub keysym_name: Option<String>,
     pub utf8: Option<String>,
     pub modifiers: ModifiersState,
+    pub shortcut_modifiers: crate::ModifierMask,
+    pub logical_key: crate::LogicalKey,
     pub state: KeyState,
     pub repeat: bool,
 }
@@ -116,21 +171,21 @@ pub struct PointerInput {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum PointerKind {
     Enter {
-        serial: u32,
+        serial: crate::InputSerial,
     },
     Leave {
-        serial: u32,
+        serial: crate::InputSerial,
     },
     Motion {
         time_ms: u32,
     },
     Press {
-        serial: u32,
+        serial: crate::InputSerial,
         time_ms: u32,
         button: u32,
     },
     Release {
-        serial: u32,
+        serial: crate::InputSerial,
         time_ms: u32,
         button: u32,
     },

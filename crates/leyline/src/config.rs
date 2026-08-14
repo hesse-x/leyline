@@ -73,9 +73,9 @@ pub struct BehaviorConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyBinding {
-    pub key: String,
-    pub mods: Vec<Modifier>,
+    pub chord: crate::input::shortcut::KeyChord,
     pub action: Action,
+    pub origin: crate::input::shortcut::BindingOrigin,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -88,8 +88,7 @@ pub enum Modifier {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
-    Copy,
-    Paste,
+    PastePrimary,
     IncreaseFontSize,
     DecreaseFontSize,
     ResetFontSize,
@@ -106,15 +105,15 @@ impl Default for EffectiveConfig {
                 ligatures: false,
             },
             colors: ColorsConfig {
-                foreground: Color(0xd8d8_d8ff),
-                background: Color(0x1818_18ff),
-                cursor: Color(0xf2f2_f2ff),
-                selection_foreground: Color(0xffff_ffff),
-                selection_background: Color(0x365b_7dff),
+                foreground: Color(0xdce7_f3ff),
+                background: Color(0x1015_22dc),
+                cursor: Color(0x8bd5_ffff),
+                selection_foreground: Color(0xf6f9_ffff),
+                selection_background: Color(0x526a_b8cc),
             },
             window: WindowConfig {
-                padding_x: 8,
-                padding_y: 8,
+                padding_x: 12,
+                padding_y: 10,
             },
             scrolling: ScrollingConfig {
                 history_lines: 10_000,
@@ -132,25 +131,46 @@ impl Default for EffectiveConfig {
 }
 
 fn default_keybindings() -> Vec<KeyBinding> {
+    use crate::input::shortcut::{BindingOrigin, KeyChord, LogicalKeyPattern};
     use Action::{
-        Copy, DecreaseFontSize, IncreaseFontSize, Paste, ResetFontSize, ScrollPageDown,
+        DecreaseFontSize, IncreaseFontSize, PastePrimary, ResetFontSize, ScrollPageDown,
         ScrollPageUp,
     };
-    use Modifier::{Control, Shift};
+    use leyline_gfx::ModifierMask;
     [
-        ("C", vec![Control, Shift], Copy),
-        ("V", vec![Control, Shift], Paste),
-        ("Plus", vec![Control, Shift], IncreaseFontSize),
-        ("Minus", vec![Control, Shift], DecreaseFontSize),
-        ("0", vec![Control, Shift], ResetFontSize),
-        ("PageUp", vec![Shift], ScrollPageUp),
-        ("PageDown", vec![Shift], ScrollPageDown),
+        (LogicalKeyPattern::Insert, ModifierMask::SHIFT, PastePrimary),
+        (
+            LogicalKeyPattern::Character('+'),
+            modifier_mask(&[Modifier::Control, Modifier::Shift]),
+            IncreaseFontSize,
+        ),
+        (
+            LogicalKeyPattern::Character('='),
+            ModifierMask::CONTROL,
+            IncreaseFontSize,
+        ),
+        (
+            LogicalKeyPattern::Character('-'),
+            ModifierMask::CONTROL,
+            DecreaseFontSize,
+        ),
+        (
+            LogicalKeyPattern::Character('0'),
+            ModifierMask::CONTROL,
+            ResetFontSize,
+        ),
+        (LogicalKeyPattern::PageUp, ModifierMask::SHIFT, ScrollPageUp),
+        (
+            LogicalKeyPattern::PageDown,
+            ModifierMask::SHIFT,
+            ScrollPageDown,
+        ),
     ]
     .into_iter()
-    .map(|(key, mods, action)| KeyBinding {
-        key: key.into(),
-        mods,
+    .map(|(key, modifiers, action)| KeyBinding {
+        chord: KeyChord { key, modifiers },
         action,
+        origin: BindingOrigin::Default,
     })
     .collect()
 }
@@ -566,7 +586,7 @@ impl RawConfig {
                 if let Some(index) = positions.get(&chord).copied() {
                     result.keybindings[index] = binding;
                     warnings.push(ConfigWarning {
-                        message: format!("duplicate keybinding {chord}; the later binding wins"),
+                        message: format!("duplicate keybinding {chord:?}; the later binding wins"),
                     });
                 } else {
                     positions.insert(chord, result.keybindings.len());
@@ -694,13 +714,11 @@ where
 }
 
 fn parse_binding(path: &Path, index: usize, raw: RawKeyBinding) -> Result<KeyBinding, ConfigError> {
-    if raw.key.is_empty() || raw.key.chars().any(char::is_control) {
-        return semantic(
-            path,
-            &format!("keybindings[{index}].key"),
-            "key must be a non-empty printable name".into(),
-        );
-    }
+    let key = crate::input::shortcut::parse_key(&raw.key).map_err(|_| ConfigError::Semantic {
+        path: path.into(),
+        field: format!("keybindings[{index}].key"),
+        reason: format!("unknown logical key {}", escape_diagnostic(&raw.key)),
+    })?;
     let mut mods = raw
         .mods
         .into_iter()
@@ -719,8 +737,7 @@ fn parse_binding(path: &Path, index: usize, raw: RawKeyBinding) -> Result<KeyBin
     mods.sort_unstable();
     mods.dedup();
     let action = match raw.action.as_str() {
-        "Copy" => Action::Copy,
-        "Paste" => Action::Paste,
+        "PastePrimary" => Action::PastePrimary,
         "IncreaseFontSize" => Action::IncreaseFontSize,
         "DecreaseFontSize" => Action::DecreaseFontSize,
         "ResetFontSize" => Action::ResetFontSize,
@@ -735,24 +752,30 @@ fn parse_binding(path: &Path, index: usize, raw: RawKeyBinding) -> Result<KeyBin
         }
     };
     Ok(KeyBinding {
-        key: raw.key,
-        mods,
+        chord: crate::input::shortcut::KeyChord {
+            key,
+            modifiers: modifier_mask(&mods),
+        },
         action,
+        origin: crate::input::shortcut::BindingOrigin::User { index },
     })
 }
 
-fn chord(binding: &KeyBinding) -> String {
-    let mut value = binding
-        .mods
-        .iter()
-        .map(|modifier| format!("{modifier:?}"))
-        .collect::<Vec<_>>()
-        .join("+");
-    if !value.is_empty() {
-        value.push('+');
+fn modifier_mask(modifiers: &[Modifier]) -> leyline_gfx::ModifierMask {
+    let mut mask = leyline_gfx::ModifierMask::empty();
+    for modifier in modifiers {
+        mask.insert(match modifier {
+            Modifier::Control => leyline_gfx::ModifierMask::CONTROL,
+            Modifier::Shift => leyline_gfx::ModifierMask::SHIFT,
+            Modifier::Alt => leyline_gfx::ModifierMask::ALT,
+            Modifier::Super => leyline_gfx::ModifierMask::SUPER,
+        });
     }
-    value.push_str(&binding.key);
-    value
+    mask
+}
+
+fn chord(binding: &KeyBinding) -> crate::input::shortcut::KeyChord {
+    binding.chord
 }
 
 fn semantic<T>(path: &Path, field: &str, reason: String) -> Result<T, ConfigError> {
@@ -782,6 +805,38 @@ mod tests {
     }
 
     #[test]
+    fn defaults_include_configurable_primary_paste() {
+        use crate::input::shortcut::LogicalKeyPattern;
+        let bindings = default_keybindings();
+        assert!(bindings.iter().any(|binding| {
+            binding.chord.key == LogicalKeyPattern::Insert
+                && binding.chord.modifiers == leyline_gfx::ModifierMask::SHIFT
+                && binding.action == Action::PastePrimary
+        }));
+    }
+
+    #[test]
+    fn default_font_shortcuts_match_the_logical_characters_users_type() {
+        use crate::input::shortcut::LogicalKeyPattern;
+        let bindings = default_keybindings();
+        assert!(bindings.iter().any(|binding| {
+            binding.chord.key == LogicalKeyPattern::Character('=')
+                && binding.chord.modifiers == leyline_gfx::ModifierMask::CONTROL
+                && binding.action == Action::IncreaseFontSize
+        }));
+        assert!(bindings.iter().any(|binding| {
+            binding.chord.key == LogicalKeyPattern::Character('-')
+                && binding.chord.modifiers == leyline_gfx::ModifierMask::CONTROL
+                && binding.action == Action::DecreaseFontSize
+        }));
+        assert!(bindings.iter().any(|binding| {
+            binding.chord.key == LogicalKeyPattern::Character('0')
+                && binding.chord.modifiers == leyline_gfx::ModifierMask::CONTROL
+                && binding.action == Action::ResetFontSize
+        }));
+    }
+
+    #[test]
     fn xdg_path_precedes_home_and_relative_values_fall_back() {
         let source = FileConfigSource::new(Env {
             xdg: Some("/xdg".into()),
@@ -803,14 +858,16 @@ mod tests {
 
     #[test]
     fn validates_and_merges_configuration() {
-        let raw: RawConfig = toml::from_str("[font]\nsize=72\n[colors]\nforeground=\"#01020304\"\n[window]\npadding_x=0\n[[keybindings]]\nkey=\"C\"\nmods=[\"Shift\",\"Control\"]\naction=\"Paste\"\n").expect("raw config");
+        let raw: RawConfig = toml::from_str("[font]\nsize=72\n[colors]\nforeground=\"#01020304\"\n[window]\npadding_x=0\n[[keybindings]]\nkey=\"PageUp\"\nmods=[\"Shift\"]\naction=\"ScrollPageUp\"\n").expect("raw config");
         let (effective, warnings) = raw
             .into_effective(Path::new("config.toml"), "")
             .expect("effective config");
         assert!((effective.font.size - 72.0).abs() < f64::EPSILON);
         assert_eq!(effective.colors.foreground, Color(0x0102_0304));
         assert_eq!(effective.window.padding_x, 0);
-        assert_eq!(effective.keybindings[0].action, Action::Paste);
+        assert!(effective.keybindings.iter().any(|binding| binding.chord.key
+            == crate::input::shortcut::LogicalKeyPattern::PageUp
+            && binding.action == Action::ScrollPageUp));
         assert_eq!(warnings.len(), 1);
     }
 
@@ -835,5 +892,17 @@ mod tests {
             .into_effective(Path::new("config.toml"), "")
             .expect_err("must reject");
         assert!(error.to_string().contains("scrolling.history_lines"));
+    }
+
+    #[test]
+    fn rejects_unknown_key_names_during_configuration_loading() {
+        let raw: RawConfig = toml::from_str(
+            "[[keybindings]]\nkey=\"DefinitelyNotAKey\"\nmods=[]\naction=\"PastePrimary\"\n",
+        )
+        .expect("raw config");
+        let error = raw
+            .into_effective(Path::new("config.toml"), "")
+            .expect_err("unknown key must fail");
+        assert!(error.to_string().contains("keybindings[0].key"));
     }
 }

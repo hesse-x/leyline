@@ -1,7 +1,8 @@
 use super::{MouseEncoding, MouseProtocol, TerminalModes};
 
 const MAX_COMMIT_BYTES: usize = 64 * 1024;
-const MAX_TRANSACTION_BYTES: usize = 1024 * 1024;
+pub const MAX_TRANSACTION_BYTES: usize = 1024 * 1024;
+pub const MAX_PASTE_BODY_BYTES: usize = MAX_TRANSACTION_BYTES - 12;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
@@ -149,6 +150,26 @@ pub fn encode_focus(focused: bool, modes: TerminalModes) -> Option<Vec<u8>> {
     })
 }
 
+#[must_use]
+pub fn encode_alternate_scroll(lines: i32, modes: TerminalModes) -> Option<Vec<u8>> {
+    if lines == 0
+        || modes.mouse_protocol != MouseProtocol::None
+        || !modes.alternate_screen
+        || !modes.alternate_scroll
+    {
+        return None;
+    }
+
+    let key = if lines > 0 {
+        TerminalKey::Up
+    } else {
+        TerminalKey::Down
+    };
+    let sequence = encode_key(key, Modifiers::default(), modes).ok()?;
+    let count = usize::try_from(lines.unsigned_abs().min(12)).ok()?;
+    Some(sequence.repeat(count))
+}
+
 #[allow(clippy::missing_errors_doc)]
 pub fn encode_mouse(
     button: MouseButton,
@@ -222,7 +243,11 @@ pub fn paste_transaction(text: &str, bracketed: bool) -> Result<Vec<u8>, InputEr
         return Err(InputError::Nul);
     }
     let normalized = text.replace("\r\n", "\n").replace('\n', "\r");
-    let wrapper = if bracketed { 12 } else { 0 };
+    let wrapper = if bracketed {
+        MAX_TRANSACTION_BYTES - MAX_PASTE_BODY_BYTES
+    } else {
+        0
+    };
     if normalized.len() > MAX_TRANSACTION_BYTES - wrapper {
         return Err(InputError::Capacity);
     }
@@ -347,5 +372,34 @@ mod tests {
             b"\x1b[200~a\rb\r\x1b[201~"
         );
         assert_eq!(paste_transaction("bad\0", false), Err(InputError::Nul));
+    }
+
+    #[test]
+    fn alternate_scroll_uses_bounded_cursor_sequences() {
+        let alternate = TerminalModes {
+            alternate_screen: true,
+            alternate_scroll: true,
+            application_cursor: true,
+            ..modes()
+        };
+        assert_eq!(
+            encode_alternate_scroll(3, alternate).unwrap(),
+            b"\x1bOA\x1bOA\x1bOA"
+        );
+        assert_eq!(
+            encode_alternate_scroll(-20, alternate).unwrap(),
+            b"\x1bOB".repeat(12)
+        );
+        assert!(encode_alternate_scroll(3, modes()).is_none());
+        assert!(
+            encode_alternate_scroll(
+                3,
+                TerminalModes {
+                    mouse_protocol: MouseProtocol::Normal,
+                    ..alternate
+                }
+            )
+            .is_none()
+        );
     }
 }

@@ -1,8 +1,11 @@
-use std::{os::fd::BorrowedFd, time::Duration};
+use std::{
+    os::fd::{BorrowedFd, OwnedFd},
+    time::Duration,
+};
 
 use crate::{
     GfxCommand, LinearColor, LogicalSize, PlatformEvent, RectangleInstance, RenderOutcome,
-    RenderScene, Scale120,
+    RenderScene, Scale120, SelectionTarget, TextInputRectangle,
     atlas::AtlasManager,
     model::SceneData,
     vulkan::{RenderStatus, VulkanRenderer},
@@ -159,7 +162,6 @@ impl GfxRuntime {
                     self.scale = *scale;
                     if extent_changed {
                         self.dirty = true;
-                        self.frame_ready = true;
                         self.swapchain_state = SwapchainState::RecreatePending;
                     }
                 }
@@ -181,7 +183,9 @@ impl GfxRuntime {
                 PlatformEvent::KeyboardFocus { .. }
                 | PlatformEvent::Key(_)
                 | PlatformEvent::ModifiersChanged(_)
-                | PlatformEvent::Pointer(_) => {}
+                | PlatformEvent::Pointer(_)
+                | PlatformEvent::TextInput(_)
+                | PlatformEvent::Clipboard(_) => {}
             }
         }
         Ok(())
@@ -222,6 +226,18 @@ impl GfxRuntime {
     /// # Errors
     /// Returns [`GfxError`] for renderer failures; transient GPU readiness is deferred.
     pub fn try_render(&mut self) -> Result<RenderOutcome, GfxError> {
+        self.try_render_mode(true)
+    }
+
+    /// Presents the existing swapchain while Wayland scales it to pending surface geometry.
+    ///
+    /// # Errors
+    /// Returns [`GfxError`] for renderer or platform failures.
+    pub fn try_render_resize_preview(&mut self) -> Result<RenderOutcome, GfxError> {
+        self.try_render_mode(false)
+    }
+
+    fn try_render_mode(&mut self, allow_recreate: bool) -> Result<RenderOutcome, GfxError> {
         if !self.dirty {
             return Ok(RenderOutcome::Idle);
         }
@@ -231,18 +247,24 @@ impl GfxRuntime {
         if !self.frame_ready {
             return Ok(RenderOutcome::WaitingForFrame);
         }
-        let target = self
+        let requested = self
             .scale
             .pixels(self.logical_size)
             .map_err(|error| GfxError::Internal(error.to_string()))?;
-        if self.swapchain_state == SwapchainState::RecreatePending
-            || self.renderer.extent() != target
+        if allow_recreate
+            && (self.swapchain_state == SwapchainState::RecreatePending
+                || self.renderer.extent() != requested)
         {
-            if !self.renderer.recreate(target).map_err(GfxError::Renderer)? {
+            if !self
+                .renderer
+                .recreate(requested)
+                .map_err(GfxError::Renderer)?
+            {
                 return Ok(RenderOutcome::Deferred);
             }
             self.swapchain_state = SwapchainState::Ready;
         }
+        let target = self.renderer.extent();
         let scene = RenderScene {
             clear: self.scene.clear,
             viewport: target,
@@ -262,7 +284,7 @@ impl GfxRuntime {
         self.wayland.request_frame();
         self.wayland.commit();
         self.wayland.flush().map_err(GfxError::Platform)?;
-        self.swapchain_state = if recreate_after_present {
+        self.swapchain_state = if recreate_after_present || target != requested {
             SwapchainState::RecreatePending
         } else {
             SwapchainState::Ready
@@ -307,6 +329,84 @@ impl GfxRuntime {
     #[must_use]
     pub const fn scale(&self) -> Scale120 {
         self.scale
+    }
+
+    #[must_use]
+    pub const fn text_input_available(&self) -> bool {
+        self.wayland.text_input_available()
+    }
+
+    /// Enables text-input and immediately flushes the focus transaction.
+    ///
+    /// # Errors
+    /// Returns a platform error when the compositor connection cannot be flushed.
+    pub fn enable_text_input(
+        &mut self,
+        rectangle: TextInputRectangle,
+    ) -> Result<Option<u32>, GfxError> {
+        self.wayland
+            .enable_text_input(rectangle)
+            .map_err(GfxError::Platform)
+    }
+
+    /// Updates text-input state and immediately flushes the transaction.
+    ///
+    /// # Errors
+    /// Returns a platform error when the compositor connection cannot be flushed.
+    pub fn update_text_input(
+        &mut self,
+        rectangle: TextInputRectangle,
+    ) -> Result<Option<u32>, GfxError> {
+        self.wayland
+            .update_text_input(rectangle)
+            .map_err(GfxError::Platform)
+    }
+
+    /// Disables text-input and commits the associated main surface immediately.
+    ///
+    /// # Errors
+    /// Returns a platform error when the compositor connection cannot be flushed.
+    pub fn disable_text_input(&mut self) -> Result<Option<u32>, GfxError> {
+        self.wayland
+            .disable_text_input()
+            .map_err(GfxError::Platform)
+    }
+
+    /// Commits the latest surface geometry without allocating a new swapchain.
+    ///
+    /// # Errors
+    /// Returns a platform error when the compositor connection cannot be flushed.
+    pub fn acknowledge_resize(&mut self) -> Result<(), GfxError> {
+        self.wayland.commit();
+        self.wayland.flush().map_err(GfxError::Platform)
+    }
+
+    /// Publishes a selection and flushes the request to the compositor.
+    ///
+    /// # Errors
+    /// Returns a platform error when the compositor connection cannot be flushed.
+    pub fn publish_selection(
+        &mut self,
+        target: SelectionTarget,
+        source: u64,
+        serial: crate::InputSerial,
+    ) -> Result<bool, GfxError> {
+        self.wayland
+            .publish_selection(target, source, serial)
+            .map_err(GfxError::Platform)
+    }
+
+    /// Requests selection contents and flushes before returning the read pipe.
+    ///
+    /// # Errors
+    /// Returns a platform error when the compositor connection cannot be flushed.
+    pub fn receive_selection(
+        &mut self,
+        target: SelectionTarget,
+    ) -> Result<Option<OwnedFd>, GfxError> {
+        self.wayland
+            .receive_selection(target)
+            .map_err(GfxError::Platform)
     }
 
     #[must_use]

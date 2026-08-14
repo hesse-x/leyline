@@ -353,6 +353,27 @@ impl PtyProcess {
     pub fn join(mut self) -> Result<(), JoinError> {
         self.join_inner(false)
     }
+    /// Joins the workers only after both have finished.
+    ///
+    /// This is safe to call from an event loop because it never waits for a live worker.
+    ///
+    /// # Errors
+    /// Returns a typed error when either completed worker panicked.
+    pub fn try_join(&mut self) -> Result<bool, JoinError> {
+        let io_finished = self
+            .io_thread
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished);
+        let wait_finished = self
+            .wait_thread
+            .as_ref()
+            .is_none_or(std::thread::JoinHandle::is_finished);
+        if !io_finished || !wait_finished {
+            return Ok(false);
+        }
+        self.join_inner(false)?;
+        Ok(true)
+    }
     fn join_inner(&mut self, shutdown: bool) -> Result<(), JoinError> {
         if shutdown {
             self.shutdown.store(true, Ordering::Release);
@@ -597,7 +618,7 @@ impl Drop for ChildOwner {
 }
 
 fn wait_worker(mut owner: ChildOwner, shutdown: &AtomicBool, sinks: &PtySinks) {
-    const TERM_GRACE: Duration = Duration::from_millis(500);
+    const TERM_GRACE: Duration = Duration::from_secs(1);
     let mut term_sent: Option<Instant> = None;
     loop {
         match owner.child.try_wait() {

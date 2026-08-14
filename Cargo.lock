@@ -311,6 +311,7 @@ dependencies = [
  "leyline-gfx",
  "leyline-pty",
  "leyline-text",
+ "rustix",
  "serde",
  "tempfile",
  "thiserror",

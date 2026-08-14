@@ -1,8 +1,8 @@
 use std::{
     env,
     ffi::c_void,
-    os::fd::{AsFd, BorrowedFd},
-    time::Duration,
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
+    time::{Duration, Instant},
 };
 
 use rustix::{
@@ -13,13 +13,30 @@ use rustix::{
 use smithay_client_toolkit::reexports::csd_frame::WindowState as XdgWindowState;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_seat,
-    delegate_xdg_shell, delegate_xdg_window,
+    data_device_manager::{
+        DataDeviceManagerState,
+        data_device::{DataDevice, DataDeviceHandler},
+        data_offer::{DataOfferHandler, DragOffer, SelectionOffer},
+        data_source::{CopyPasteSource, DataSourceHandler},
+    },
+    delegate_compositor, delegate_data_device, delegate_keyboard, delegate_output,
+    delegate_pointer, delegate_primary_selection, delegate_seat, delegate_shm, delegate_xdg_shell,
+    delegate_xdg_window,
     output::{OutputHandler, OutputState},
+    primary_selection::{
+        PrimarySelectionManagerState,
+        device::{PrimarySelectionDevice, PrimarySelectionDeviceHandler},
+        offer::PrimarySelectionOffer,
+        selection::{PrimarySelectionSource, PrimarySelectionSourceHandler},
+    },
     seat::{
         Capability, SeatHandler, SeatState,
-        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
-        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        keyboard::{
+            KeyEvent, KeyboardHandler, Keymap, Keysym, Modifiers, RawModifiers, RepeatInfo,
+        },
+        pointer::{
+            CursorIcon, PointerEvent, PointerEventKind, PointerHandler, ThemeSpec, ThemedPointer,
+        },
     },
     shell::{
         WaylandSurface,
@@ -28,17 +45,25 @@ use smithay_client_toolkit::{
             window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
         },
     },
+    shm::{Shm, ShmHandler},
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
     backend::WaylandError,
     globals::{GlobalListContents, registry_queue_init},
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_registry, wl_seat, wl_surface},
+    protocol::{
+        wl_data_device, wl_data_device_manager::DndAction, wl_data_source, wl_keyboard, wl_output,
+        wl_pointer, wl_registry, wl_seat, wl_surface,
+    },
 };
 use wayland_protocols::wp::{
     fractional_scale::v1::client::{
         wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
         wp_fractional_scale_v1::{self, WpFractionalScaleV1},
+    },
+    text_input::zv3::client::{
+        zwp_text_input_manager_v3::ZwpTextInputManagerV3,
+        zwp_text_input_v3::{self, ContentHint, ContentPurpose, ZwpTextInputV3},
     },
     viewporter::client::{
         wp_viewport::{self, WpViewport},
@@ -46,16 +71,87 @@ use wayland_protocols::wp::{
     },
 };
 
-use crate::decor::Libdecor;
+use crate::decor::{Libdecor, ResizeEdge};
 use crate::{
-    GfxInitError, KeyInput, KeyState, LogicalSize, ModifiersState, PlatformEvent, PointerInput,
-    PointerKind, Scale120, WindowState,
+    ClipboardEvent, GfxInitError, InputSerial, KeyInput, KeyState, LogicalSize, ModifierMask,
+    ModifiersState, PlatformEvent, PointerInput, PointerKind, Scale120, SeatToken, SelectionTarget,
+    SerialKind, TextInputEvent, TextInputRectangle, WindowState, logical_key_from_keysym,
 };
 
 const DEFAULT_SIZE: LogicalSize = LogicalSize {
     width: 800,
     height: 500,
 };
+const CONTENT_RESIZE_MARGIN: f64 = 6.0;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct PressedModifiers(u16);
+
+impl PressedModifiers {
+    const SHIFT_LEFT: u16 = 1 << 0;
+    const SHIFT_RIGHT: u16 = 1 << 1;
+    const CONTROL_LEFT: u16 = 1 << 2;
+    const CONTROL_RIGHT: u16 = 1 << 3;
+    const ALT_LEFT: u16 = 1 << 4;
+    const ALT_RIGHT: u16 = 1 << 5;
+    const SUPER_LEFT: u16 = 1 << 6;
+    const SUPER_RIGHT: u16 = 1 << 7;
+    const ALT_GRAPH: u16 = 1 << 8;
+
+    fn update(&mut self, keysym: u32, state: KeyState) {
+        let bit = match keysym {
+            0xffe1 => Self::SHIFT_LEFT,
+            0xffe2 => Self::SHIFT_RIGHT,
+            0xffe3 => Self::CONTROL_LEFT,
+            0xffe4 => Self::CONTROL_RIGHT,
+            0xffe9 => Self::ALT_LEFT,
+            0xffea => Self::ALT_RIGHT,
+            0xffeb => Self::SUPER_LEFT,
+            0xffec => Self::SUPER_RIGHT,
+            0xfe03 => Self::ALT_GRAPH,
+            _ => return,
+        };
+        match state {
+            KeyState::Pressed => self.0 |= bit,
+            KeyState::Released => self.0 &= !bit,
+        }
+    }
+
+    const fn merge(self, reported: ModifiersState) -> ModifiersState {
+        ModifiersState {
+            shift: reported.shift || self.0 & (Self::SHIFT_LEFT | Self::SHIFT_RIGHT) != 0,
+            control: reported.control || self.0 & (Self::CONTROL_LEFT | Self::CONTROL_RIGHT) != 0,
+            alt: reported.alt || self.0 & (Self::ALT_LEFT | Self::ALT_RIGHT) != 0,
+            super_key: reported.super_key || self.0 & (Self::SUPER_LEFT | Self::SUPER_RIGHT) != 0,
+            alt_graph: reported.alt_graph || self.0 & Self::ALT_GRAPH != 0,
+        }
+    }
+
+    const fn physical_control(self) -> bool {
+        self.0 & (Self::CONTROL_LEFT | Self::CONTROL_RIGHT) != 0
+    }
+
+    const fn physical_alt(self) -> bool {
+        self.0 & (Self::ALT_LEFT | Self::ALT_RIGHT) != 0
+    }
+}
+
+fn shortcut_modifiers(effective: ModifiersState, pressed: PressedModifiers) -> ModifierMask {
+    let mut mask = ModifierMask::empty();
+    if effective.shift {
+        mask.insert(ModifierMask::SHIFT);
+    }
+    if effective.control && (!effective.alt_graph || pressed.physical_control()) {
+        mask.insert(ModifierMask::CONTROL);
+    }
+    if effective.alt && (!effective.alt_graph || pressed.physical_alt()) {
+        mask.insert(ModifierMask::ALT);
+    }
+    if effective.super_key {
+        mask.insert(ModifierMask::SUPER);
+    }
+    mask
+}
 
 #[derive(Default)]
 struct PendingEvents {
@@ -65,6 +161,88 @@ struct PendingEvents {
     frame_ready: bool,
     suspended: Option<bool>,
     input: Vec<PlatformEvent>,
+    resize: Option<(wl_seat::WlSeat, u32, ResizeEdge)>,
+}
+
+#[derive(Default)]
+struct KeyRepeatState {
+    settings: Option<(Duration, Duration)>,
+    active: Option<ActiveKeyRepeat>,
+}
+
+struct ActiveKeyRepeat {
+    serial: u32,
+    event: KeyEvent,
+    next: Instant,
+    interval: Duration,
+}
+
+impl KeyRepeatState {
+    fn update_info(&mut self, info: RepeatInfo) {
+        self.settings = match info {
+            RepeatInfo::Repeat { rate, delay } => Some((
+                Duration::from_millis(u64::from(delay)),
+                Duration::from_micros((1_000_000 / u64::from(rate.get())).max(1)),
+            )),
+            RepeatInfo::Disable => None,
+        };
+        if self.settings.is_none() {
+            self.active = None;
+        }
+    }
+
+    fn press(&mut self, serial: u32, event: KeyEvent, now: Instant) {
+        self.active = None;
+        let Some((delay, interval)) = self.settings else {
+            return;
+        };
+        if matches!(
+            logical_key_from_keysym(event.keysym.raw()),
+            crate::LogicalKey::Unidentified(_)
+        ) {
+            return;
+        }
+        self.active = Some(ActiveKeyRepeat {
+            serial,
+            event,
+            next: now + delay,
+            interval,
+        });
+    }
+
+    fn release(&mut self, raw_code: u32) {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.event.raw_code == raw_code)
+        {
+            self.active = None;
+        }
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.active.as_ref().map(|active| active.next)
+    }
+
+    fn take_due(&mut self, now: Instant) -> Option<(u32, KeyEvent)> {
+        let active = self.active.as_mut().filter(|active| active.next <= now)?;
+        active.next = now + active.interval;
+        Some((active.serial, active.event.clone()))
+    }
+
+    fn cancel(&mut self) {
+        self.active = None;
+    }
+}
+
+fn min_timeout(timeout: Option<Duration>, deadline: Option<Instant>) -> Option<Duration> {
+    let repeat = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    match (timeout, repeat) {
+        (Some(timeout), Some(repeat)) => Some(timeout.min(repeat)),
+        (Some(timeout), None) => Some(timeout),
+        (None, Some(repeat)) => Some(repeat),
+        (None, None) => None,
+    }
 }
 
 pub(crate) struct WaylandWindow {
@@ -79,7 +257,16 @@ pub(crate) struct WaylandWindow {
     flush_blocked: bool,
 }
 
+impl Drop for WaylandWindow {
+    fn drop(&mut self) {
+        // libdecor keeps raw references to the display and surface, so release it before Rust
+        // drops the Wayland objects declared earlier in this struct.
+        drop(self.libdecor.take());
+    }
+}
+
 impl WaylandWindow {
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn connect(title: &str) -> Result<Self, GfxInitError> {
         if env::var_os("WAYLAND_DISPLAY").is_none() {
             return Err(GfxInitError::Environment(
@@ -106,9 +293,12 @@ impl WaylandWindow {
         let compositor = CompositorState::bind(&globals, &qh).map_err(|error| {
             GfxInitError::Platform(format!("cannot bind wl_compositor: {error}"))
         })?;
+        let shm = Shm::bind(&globals, &qh)
+            .map_err(|error| GfxInitError::Platform(format!("cannot bind wl_shm: {error}")))?;
         let shell = XdgShell::bind(&globals, &qh)
             .map_err(|error| GfxInitError::Platform(format!("cannot bind xdg-shell: {error}")))?;
         let surface = compositor.create_surface(&qh);
+        let cursor_surface = compositor.create_surface(&qh);
         let has_server_decor = advertised
             .iter()
             .any(|global| global.interface == "zxdg_decoration_manager_v1");
@@ -123,6 +313,15 @@ impl WaylandWindow {
                     Some(viewporter.get_viewport(&surface, &qh, ())),
                 )
             });
+        let text_input_manager = globals
+            .bind::<ZwpTextInputManagerV3, _, _>(&qh, 1..=2, ())
+            .ok();
+        let data_device_manager = DataDeviceManagerState::bind(&globals, &qh).map_err(|error| {
+            GfxInitError::Platform(format!(
+                "cannot bind required wl_data_device_manager: {error}"
+            ))
+        })?;
+        let primary_selection_manager = PrimarySelectionManagerState::bind(&globals, &qh).ok();
         let (window, libdecor) = if has_server_decor {
             let window =
                 shell.create_window(surface.clone(), WindowDecorations::RequestServer, &qh);
@@ -147,15 +346,36 @@ impl WaylandWindow {
             state: WaylandState {
                 outputs: OutputState::new(&globals, &qh),
                 seats: SeatState::new(&globals, &qh),
+                shm,
                 keyboard: None,
                 pointer: None,
+                pointer_seat: None,
+                cursor_surface,
+                libdecor_resize_fallback: !has_server_decor,
+                pointer_icon: None,
+                resize_press_active: false,
+                data_device_manager,
+                data_device: None,
+                clipboard_offer: None,
+                clipboard_sources: Vec::new(),
+                primary_selection_manager,
+                primary_device: None,
+                primary_offer: None,
+                primary_sources: Vec::new(),
+                text_input_manager,
+                text_input: None,
+                text_input_focused: false,
+                text_input_commits: 0,
                 target_surface: surface.clone(),
                 modifiers: ModifiersState::default(),
+                pressed_modifiers: PressedModifiers::default(),
+                key_repeat: KeyRepeatState::default(),
                 logical_size: DEFAULT_SIZE,
                 scale: Scale120::ONE,
                 pending: PendingEvents::default(),
                 configured: false,
                 suspended: false,
+                seat_token: SeatToken::new(0, 1),
             },
             connection,
             event_queue,
@@ -184,8 +404,14 @@ impl WaylandWindow {
         }
         self.event_queue
             .dispatch_pending(&mut self.state)
-            .map(|_| ())
-            .map_err(|error| format!("Wayland dispatch failed: {error}"))
+            .map_err(|error| format!("Wayland dispatch failed: {error}"))?;
+        self.state.emit_due_key_repeat(Instant::now());
+        if let Some((seat, serial, edge)) = self.state.pending.resize.take()
+            && let Some(decor) = self.libdecor.as_mut()
+        {
+            decor.resize(&seat, serial, edge);
+        }
+        Ok(())
     }
 
     pub(crate) fn roundtrip(&mut self) -> Result<(), String> {
@@ -225,6 +451,7 @@ impl WaylandWindow {
         timeout: Option<Duration>,
     ) -> Result<(), String> {
         self.flush()?;
+        let timeout = min_timeout(timeout, self.state.key_repeat.deadline());
         if self.libdecor.is_some() {
             return self.poll_libdecor(wake, timeout);
         }
@@ -375,6 +602,145 @@ impl WaylandWindow {
         }
         self.surface.commit();
     }
+
+    pub(crate) const fn text_input_available(&self) -> bool {
+        self.state.text_input_manager.is_some()
+    }
+
+    pub(crate) fn enable_text_input(
+        &mut self,
+        rectangle: TextInputRectangle,
+    ) -> Result<Option<u32>, String> {
+        if !self.state.text_input_focused {
+            return Ok(None);
+        }
+        let Some(input) = self.state.text_input.clone() else {
+            return Ok(None);
+        };
+        input.enable();
+        input.set_content_type(ContentHint::None, ContentPurpose::Terminal);
+        input.set_cursor_rectangle(
+            rectangle.x,
+            rectangle.y,
+            rectangle.width.max(1),
+            rectangle.height.max(1),
+        );
+        input.commit();
+        self.surface.commit();
+        let serial = self.state.bump_text_input_commit();
+        self.flush()?;
+        Ok(serial)
+    }
+
+    pub(crate) fn update_text_input(
+        &mut self,
+        rectangle: TextInputRectangle,
+    ) -> Result<Option<u32>, String> {
+        if !self.state.text_input_focused {
+            return Ok(None);
+        }
+        let Some(input) = self.state.text_input.as_ref() else {
+            return Ok(None);
+        };
+        input.set_content_type(ContentHint::None, ContentPurpose::Terminal);
+        input.set_cursor_rectangle(
+            rectangle.x,
+            rectangle.y,
+            rectangle.width.max(1),
+            rectangle.height.max(1),
+        );
+        input.commit();
+        self.surface.commit();
+        let serial = self.state.bump_text_input_commit();
+        self.flush()?;
+        Ok(serial)
+    }
+
+    pub(crate) fn disable_text_input(&mut self) -> Result<Option<u32>, String> {
+        let Some(input) = self.state.text_input.as_ref() else {
+            return Ok(None);
+        };
+        input.disable();
+        input.commit();
+        self.surface.commit();
+        let serial = self.state.bump_text_input_commit();
+        self.flush()?;
+        Ok(serial)
+    }
+
+    pub(crate) fn publish_selection(
+        &mut self,
+        target: SelectionTarget,
+        source_id: u64,
+        serial: InputSerial,
+    ) -> Result<bool, String> {
+        const MIMES: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
+        if serial.seat != self.state.seat_token {
+            return Err("selection publish rejected a stale seat serial".into());
+        }
+        let qh = self.event_queue.handle();
+        match target {
+            SelectionTarget::Clipboard => {
+                let Some(device) = self.state.data_device.as_ref() else {
+                    return Ok(false);
+                };
+                let source = self
+                    .state
+                    .data_device_manager
+                    .create_copy_paste_source(&qh, MIMES);
+                source.set_selection(device, serial.value);
+                self.state.clipboard_sources.push((source_id, source));
+            }
+            SelectionTarget::Primary => {
+                let (Some(manager), Some(device)) = (
+                    self.state.primary_selection_manager.as_ref(),
+                    self.state.primary_device.as_ref(),
+                ) else {
+                    return Ok(false);
+                };
+                let source = manager.create_selection_source(&qh, MIMES);
+                source.set_selection(device, serial.value);
+                self.state.primary_sources.push((source_id, source));
+            }
+        }
+        self.flush()?;
+        Ok(true)
+    }
+
+    pub(crate) fn receive_selection(
+        &mut self,
+        target: SelectionTarget,
+    ) -> Result<Option<OwnedFd>, String> {
+        let choose_mime = |mimes: &[String]| {
+            ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"]
+                .iter()
+                .find_map(|wanted| mimes.iter().find(|mime| mime.as_str() == *wanted).cloned())
+        };
+        let fd = match target {
+            SelectionTarget::Clipboard => {
+                let Some(offer) = self.state.clipboard_offer.as_ref() else {
+                    return Ok(None);
+                };
+                let Some(mime) = offer.with_mime_types(choose_mime) else {
+                    return Ok(None);
+                };
+                offer.receive(mime).ok().map(OwnedFd::from)
+            }
+            SelectionTarget::Primary => {
+                let Some(offer) = self.state.primary_offer.as_ref() else {
+                    return Ok(None);
+                };
+                let Some(mime) = offer.with_mime_types(choose_mime) else {
+                    return Ok(None);
+                };
+                offer.receive(mime).ok().map(OwnedFd::from)
+            }
+        };
+        if fd.is_some() {
+            self.flush()?;
+        }
+        Ok(fd)
+    }
     pub(crate) fn set_title(&mut self, title: &str) {
         if let Some(window) = self.window.as_ref() {
             window.set_title(title);
@@ -392,18 +758,40 @@ impl WaylandWindow {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct WaylandState {
     outputs: OutputState,
     seats: SeatState,
+    shm: Shm,
     keyboard: Option<wl_keyboard::WlKeyboard>,
-    pointer: Option<wl_pointer::WlPointer>,
+    pointer: Option<ThemedPointer>,
+    pointer_seat: Option<wl_seat::WlSeat>,
+    cursor_surface: wl_surface::WlSurface,
+    libdecor_resize_fallback: bool,
+    pointer_icon: Option<CursorIcon>,
+    resize_press_active: bool,
+    data_device_manager: DataDeviceManagerState,
+    data_device: Option<DataDevice>,
+    clipboard_offer: Option<SelectionOffer>,
+    clipboard_sources: Vec<(u64, CopyPasteSource)>,
+    primary_selection_manager: Option<PrimarySelectionManagerState>,
+    primary_device: Option<PrimarySelectionDevice>,
+    primary_offer: Option<PrimarySelectionOffer>,
+    primary_sources: Vec<(u64, PrimarySelectionSource)>,
+    text_input_manager: Option<ZwpTextInputManagerV3>,
+    text_input: Option<ZwpTextInputV3>,
+    text_input_focused: bool,
+    text_input_commits: u32,
     target_surface: wl_surface::WlSurface,
     modifiers: ModifiersState,
+    pressed_modifiers: PressedModifiers,
+    key_repeat: KeyRepeatState,
     logical_size: LogicalSize,
     scale: Scale120,
     pending: PendingEvents,
     pub(crate) configured: bool,
     suspended: bool,
+    seat_token: SeatToken,
 }
 
 impl OutputHandler for WaylandState {
@@ -415,11 +803,19 @@ impl OutputHandler for WaylandState {
     fn output_destroyed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_output::WlOutput) {}
 }
 
+impl ShmHandler for WaylandState {
+    fn shm_state(&mut self) -> &mut Shm {
+        &mut self.shm
+    }
+}
+
 impl SeatHandler for WaylandState {
     fn seat_state(&mut self) -> &mut SeatState {
         &mut self.seats
     }
-    fn new_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn new_seat(&mut self, _: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        self.ensure_selection_devices(qh, &seat);
+    }
     fn new_capability(
         &mut self,
         _: &Connection,
@@ -427,10 +823,39 @@ impl SeatHandler for WaylandState {
         seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
+        // SeatState::new binds seats already present in the initial registry without
+        // invoking new_seat, so the first capability event is the reliable setup point.
+        self.ensure_selection_devices(qh, &seat);
         if capability == Capability::Keyboard && self.keyboard.is_none() {
-            self.keyboard = self.seats.get_keyboard(qh, &seat, None).ok();
+            match self.seats.get_keyboard(qh, &seat, None) {
+                Ok(keyboard) => {
+                    tracing::debug!("Wayland keyboard capability initialized");
+                    self.keyboard = Some(keyboard);
+                }
+                Err(error) => {
+                    tracing::error!(%error, "failed to initialize required Wayland keyboard");
+                }
+            }
+            if self.text_input.is_none()
+                && let Some(manager) = self.text_input_manager.as_ref()
+            {
+                self.text_input = Some(manager.get_text_input(&seat, qh, ()));
+            }
         } else if capability == Capability::Pointer && self.pointer.is_none() {
-            self.pointer = self.seats.get_pointer(qh, &seat).ok();
+            let cursor_surface = self
+                .seats
+                .get_pointer_with_theme(
+                    qh,
+                    &seat,
+                    self.shm.wl_shm(),
+                    self.cursor_surface.clone(),
+                    ThemeSpec::System,
+                )
+                .ok();
+            if cursor_surface.is_some() {
+                self.pointer_seat = Some(seat);
+                self.pointer = cursor_surface;
+            }
         }
     }
     fn remove_capability(
@@ -444,14 +869,34 @@ impl SeatHandler for WaylandState {
             && let Some(keyboard) = self.keyboard.take()
         {
             keyboard.release();
+            if let Some(text_input) = self.text_input.take() {
+                text_input.destroy();
+            }
+            self.text_input_focused = false;
+            self.text_input_commits = 0;
+            self.pressed_modifiers = PressedModifiers::default();
+            self.key_repeat.cancel();
         }
         if capability == Capability::Pointer
             && let Some(pointer) = self.pointer.take()
         {
-            pointer.release();
+            drop(pointer);
+            self.pointer_seat = None;
         }
     }
-    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
+    fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        if self
+            .data_device
+            .as_ref()
+            .is_some_and(|device| device.data().seat() == &seat)
+        {
+            self.data_device = None;
+            self.clipboard_offer = None;
+            self.primary_device = None;
+            self.primary_offer = None;
+            self.seat_token = self.seat_token.next_generation();
+        }
+    }
 }
 
 impl KeyboardHandler for WaylandState {
@@ -466,8 +911,14 @@ impl KeyboardHandler for WaylandState {
         _: &[Keysym],
     ) {
         if surface == &self.target_surface {
+            tracing::debug!("Wayland keyboard focus entered terminal surface");
             self.pending.input.push(PlatformEvent::KeyboardFocus {
-                serial,
+                seat: self.seat_token,
+                serial: InputSerial {
+                    seat: self.seat_token,
+                    value: serial,
+                    kind: SerialKind::Keyboard,
+                },
                 focused: true,
             });
         }
@@ -481,8 +932,15 @@ impl KeyboardHandler for WaylandState {
         serial: u32,
     ) {
         if surface == &self.target_surface {
+            self.pressed_modifiers = PressedModifiers::default();
+            self.key_repeat.cancel();
             self.pending.input.push(PlatformEvent::KeyboardFocus {
-                serial,
+                seat: self.seat_token,
+                serial: InputSerial {
+                    seat: self.seat_token,
+                    value: serial,
+                    kind: SerialKind::Keyboard,
+                },
                 focused: false,
             });
         }
@@ -495,7 +953,8 @@ impl KeyboardHandler for WaylandState {
         serial: u32,
         event: KeyEvent,
     ) {
-        self.push_key(serial, event, KeyState::Pressed, false);
+        self.push_key(serial, event.clone(), KeyState::Pressed, false);
+        self.key_repeat.press(serial, event, Instant::now());
     }
     fn repeat_key(
         &mut self,
@@ -505,6 +964,7 @@ impl KeyboardHandler for WaylandState {
         serial: u32,
         event: KeyEvent,
     ) {
+        self.key_repeat.cancel();
         self.push_key(serial, event, KeyState::Pressed, true);
     }
     fn release_key(
@@ -515,6 +975,7 @@ impl KeyboardHandler for WaylandState {
         serial: u32,
         event: KeyEvent,
     ) {
+        self.key_repeat.release(event.raw_code);
         self.push_key(serial, event, KeyState::Released, false);
     }
     fn update_modifiers(
@@ -532,33 +993,96 @@ impl KeyboardHandler for WaylandState {
             control: modifiers.ctrl,
             alt: modifiers.alt,
             super_key: modifiers.logo,
+            alt_graph: false,
         };
         self.pending
             .input
             .push(PlatformEvent::ModifiersChanged(self.modifiers));
     }
+
+    fn update_keymap(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        _: Keymap<'_>,
+    ) {
+        tracing::debug!("Wayland keyboard keymap initialized");
+    }
+
+    fn update_repeat_info(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_keyboard::WlKeyboard,
+        info: RepeatInfo,
+    ) {
+        self.key_repeat.update_info(info);
+    }
 }
 
 impl WaylandState {
+    fn emit_due_key_repeat(&mut self, now: Instant) {
+        if let Some((serial, event)) = self.key_repeat.take_due(now) {
+            self.push_key(serial, event, KeyState::Pressed, true);
+        }
+    }
+
+    fn ensure_selection_devices(&mut self, qh: &QueueHandle<Self>, seat: &wl_seat::WlSeat) {
+        if self.data_device.is_none() {
+            self.data_device = Some(self.data_device_manager.get_data_device(qh, seat));
+            tracing::debug!("Wayland clipboard data device initialized");
+        }
+        if self.primary_device.is_none()
+            && let Some(manager) = self.primary_selection_manager.as_ref()
+        {
+            self.primary_device = Some(manager.get_selection_device(qh, seat));
+            tracing::debug!("Wayland primary-selection device initialized");
+        }
+    }
+
     fn push_key(&mut self, serial: u32, event: KeyEvent, state: KeyState, repeat: bool) {
+        self.pressed_modifiers.update(event.keysym.raw(), state);
+        let modifiers = self.pressed_modifiers.merge(self.modifiers);
+        tracing::trace!(
+            physical_keycode = event.raw_code,
+            keysym = event.keysym.raw(),
+            has_utf8 = event.utf8.as_ref().is_some_and(|text| !text.is_empty()),
+            ?state,
+            repeat,
+            shift = modifiers.shift,
+            control = modifiers.control,
+            alt = modifiers.alt,
+            super_key = modifiers.super_key,
+            "Wayland keyboard event"
+        );
         self.pending.input.push(PlatformEvent::Key(KeyInput {
-            serial,
+            serial: InputSerial {
+                seat: self.seat_token,
+                value: serial,
+                kind: SerialKind::Keyboard,
+            },
             time_ms: event.time,
             physical_keycode: event.raw_code,
-            keysym: event.keysym.raw(),
-            keysym_name: event.keysym.name().map(str::to_owned),
             utf8: event.utf8,
-            modifiers: self.modifiers,
+            modifiers,
+            shortcut_modifiers: shortcut_modifiers(modifiers, self.pressed_modifiers),
+            logical_key: logical_key_from_keysym(event.keysym.raw()),
             state,
             repeat,
         }));
+    }
+
+    fn bump_text_input_commit(&mut self) -> Option<u32> {
+        self.text_input_commits = self.text_input_commits.checked_add(1)?;
+        Some(self.text_input_commits)
     }
 }
 
 impl PointerHandler for WaylandState {
     fn pointer_frame(
         &mut self,
-        _: &Connection,
+        connection: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_pointer::WlPointer,
         events: &[PointerEvent],
@@ -567,28 +1091,59 @@ impl PointerHandler for WaylandState {
             if event.surface != self.target_surface {
                 continue;
             }
+            let edge = self
+                .libdecor_resize_fallback
+                .then(|| content_resize_edge(event.position, self.logical_size))
+                .flatten();
             let kind = match &event.kind {
-                PointerEventKind::Enter { serial } => PointerKind::Enter { serial: *serial },
-                PointerEventKind::Leave { serial } => PointerKind::Leave { serial: *serial },
-                PointerEventKind::Motion { time } => PointerKind::Motion { time_ms: *time },
+                PointerEventKind::Enter { serial } => {
+                    // Cursor requests are serial-bound and must be repeated for every enter.
+                    self.pointer_icon = None;
+                    self.set_pointer_cursor(connection, edge);
+                    PointerKind::Enter {
+                        serial: self.pointer_serial(*serial),
+                    }
+                }
+                PointerEventKind::Leave { serial } => PointerKind::Leave {
+                    serial: self.pointer_serial(*serial),
+                },
+                PointerEventKind::Motion { time } => {
+                    self.set_pointer_cursor(connection, edge);
+                    PointerKind::Motion { time_ms: *time }
+                }
                 PointerEventKind::Press {
                     time,
                     button,
                     serial,
-                } => PointerKind::Press {
-                    serial: *serial,
-                    time_ms: *time,
-                    button: *button,
-                },
+                } => {
+                    self.resize_press_active = false;
+                    if *button == 0x110
+                        && let (Some(edge), Some(seat)) = (edge, self.pointer_seat.clone())
+                    {
+                        self.pending.resize = Some((seat, *serial, edge));
+                        self.resize_press_active = true;
+                        continue;
+                    }
+                    PointerKind::Press {
+                        serial: self.pointer_serial(*serial),
+                        time_ms: *time,
+                        button: *button,
+                    }
+                }
                 PointerEventKind::Release {
                     time,
                     button,
                     serial,
-                } => PointerKind::Release {
-                    serial: *serial,
-                    time_ms: *time,
-                    button: *button,
-                },
+                } => {
+                    if *button == 0x110 && std::mem::take(&mut self.resize_press_active) {
+                        continue;
+                    }
+                    PointerKind::Release {
+                        serial: self.pointer_serial(*serial),
+                        time_ms: *time,
+                        button: *button,
+                    }
+                }
                 PointerEventKind::Axis {
                     time,
                     horizontal,
@@ -607,6 +1162,211 @@ impl PointerHandler for WaylandState {
                     kind,
                 }));
         }
+    }
+}
+
+impl WaylandState {
+    const fn pointer_serial(&self, value: u32) -> InputSerial {
+        InputSerial {
+            seat: self.seat_token,
+            value,
+            kind: SerialKind::Pointer,
+        }
+    }
+
+    fn set_pointer_cursor(&mut self, connection: &Connection, edge: Option<ResizeEdge>) {
+        let Some(pointer) = self.pointer.as_ref() else {
+            return;
+        };
+        let icon = match edge {
+            Some(ResizeEdge::Top) => CursorIcon::NResize,
+            Some(ResizeEdge::Bottom) => CursorIcon::SResize,
+            Some(ResizeEdge::Left) => CursorIcon::WResize,
+            Some(ResizeEdge::TopLeft) => CursorIcon::NwResize,
+            Some(ResizeEdge::BottomLeft) => CursorIcon::SwResize,
+            Some(ResizeEdge::Right) => CursorIcon::EResize,
+            Some(ResizeEdge::TopRight) => CursorIcon::NeResize,
+            Some(ResizeEdge::BottomRight) => CursorIcon::SeResize,
+            None => CursorIcon::Text,
+        };
+        if self.pointer_icon == Some(icon) {
+            return;
+        }
+        if let Err(error) = pointer.set_cursor(connection, icon) {
+            tracing::trace!(%error, "could not update terminal pointer cursor");
+        } else {
+            self.pointer_icon = Some(icon);
+        }
+    }
+}
+
+fn content_resize_edge(position: (f64, f64), size: LogicalSize) -> Option<ResizeEdge> {
+    let (x, y) = position;
+    if !x.is_finite() || !y.is_finite() || x < 0.0 || y < 0.0 {
+        return None;
+    }
+    let right = x >= (f64::from(size.width) - CONTENT_RESIZE_MARGIN).max(0.0);
+    let bottom = y >= (f64::from(size.height) - CONTENT_RESIZE_MARGIN).max(0.0);
+    let left = x < CONTENT_RESIZE_MARGIN;
+    let top = y < CONTENT_RESIZE_MARGIN;
+    match (left, right, top, bottom) {
+        (true, _, true, _) => Some(ResizeEdge::TopLeft),
+        (true, _, _, true) => Some(ResizeEdge::BottomLeft),
+        (_, true, true, _) => Some(ResizeEdge::TopRight),
+        (_, true, _, true) => Some(ResizeEdge::BottomRight),
+        (true, _, _, _) => Some(ResizeEdge::Left),
+        (_, true, _, _) => Some(ResizeEdge::Right),
+        (_, _, true, _) => Some(ResizeEdge::Top),
+        (_, _, _, true) => Some(ResizeEdge::Bottom),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod resize_tests {
+    use super::content_resize_edge;
+    use crate::{LogicalSize, decor::ResizeEdge};
+
+    const SIZE: LogicalSize = LogicalSize {
+        width: 800,
+        height: 500,
+    };
+
+    #[test]
+    fn content_resize_margin_covers_edges_and_corners() {
+        assert!(matches!(
+            content_resize_edge((0.0, 0.0), SIZE),
+            Some(ResizeEdge::TopLeft)
+        ));
+        assert!(matches!(
+            content_resize_edge((799.0, 499.0), SIZE),
+            Some(ResizeEdge::BottomRight)
+        ));
+        assert!(matches!(
+            content_resize_edge((400.0, 1.0), SIZE),
+            Some(ResizeEdge::Top)
+        ));
+        assert!(content_resize_edge((400.0, 250.0), SIZE).is_none());
+    }
+
+    #[test]
+    fn content_resize_margin_rejects_invalid_coordinates() {
+        assert!(content_resize_edge((-1.0, 10.0), SIZE).is_none());
+        assert!(content_resize_edge((f64::NAN, 10.0), SIZE).is_none());
+    }
+}
+
+#[cfg(test)]
+mod modifier_tests {
+    use super::{PressedModifiers, shortcut_modifiers};
+    use crate::{KeyState, ModifierMask, ModifiersState};
+
+    #[test]
+    fn physical_shift_bridges_late_compositor_modifier_updates() {
+        let mut pressed = PressedModifiers::default();
+        pressed.update(0xffe1, KeyState::Pressed);
+        assert!(pressed.merge(ModifiersState::default()).shift);
+
+        pressed.update(0xffe2, KeyState::Pressed);
+        pressed.update(0xffe1, KeyState::Released);
+        assert!(pressed.merge(ModifiersState::default()).shift);
+
+        pressed.update(0xffe2, KeyState::Released);
+        assert!(!pressed.merge(ModifiersState::default()).shift);
+    }
+
+    #[test]
+    fn compositor_modifier_state_remains_authoritative() {
+        let pressed = PressedModifiers::default();
+        let reported = ModifiersState {
+            control: true,
+            ..ModifiersState::default()
+        };
+        assert!(pressed.merge(reported).control);
+    }
+
+    #[test]
+    fn alt_graph_does_not_impersonate_control_alt_shortcut() {
+        let mut pressed = PressedModifiers::default();
+        pressed.update(0xfe03, KeyState::Pressed);
+        let effective = pressed.merge(ModifiersState {
+            control: true,
+            alt: true,
+            ..ModifiersState::default()
+        });
+        assert!(effective.alt_graph);
+        assert_eq!(
+            shortcut_modifiers(effective, pressed),
+            ModifierMask::empty()
+        );
+
+        pressed.update(0xffe3, KeyState::Pressed);
+        pressed.update(0xffe9, KeyState::Pressed);
+        let shortcut = shortcut_modifiers(effective, pressed);
+        assert!(shortcut.contains(ModifierMask::CONTROL));
+        assert!(shortcut.contains(ModifierMask::ALT));
+    }
+}
+
+#[cfg(test)]
+mod key_repeat_tests {
+    use std::{num::NonZeroU32, time::Duration};
+
+    use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, RepeatInfo};
+
+    use super::KeyRepeatState;
+
+    fn key(raw_code: u32, keysym: u32) -> KeyEvent {
+        KeyEvent {
+            time: 10,
+            raw_code,
+            keysym: Keysym::new(keysym),
+            utf8: Some("a".into()),
+        }
+    }
+
+    #[test]
+    fn repeat_obeys_compositor_delay_rate_and_release() {
+        let mut repeat = KeyRepeatState::default();
+        repeat.update_info(RepeatInfo::Repeat {
+            rate: NonZeroU32::new(20).unwrap(),
+            delay: 300,
+        });
+        let start = std::time::Instant::now();
+        repeat.press(7, key(30, 0x61), start);
+
+        assert!(
+            repeat
+                .take_due(start + Duration::from_millis(299))
+                .is_none()
+        );
+        let (serial, event) = repeat.take_due(start + Duration::from_millis(300)).unwrap();
+        assert_eq!(serial, 7);
+        assert_eq!(event.raw_code, 30);
+        assert!(
+            repeat
+                .take_due(start + Duration::from_millis(349))
+                .is_none()
+        );
+        assert!(
+            repeat
+                .take_due(start + Duration::from_millis(350))
+                .is_some()
+        );
+
+        repeat.release(30);
+        assert!(repeat.deadline().is_none());
+    }
+
+    #[test]
+    fn unidentified_modifier_does_not_repeat() {
+        let mut repeat = KeyRepeatState::default();
+        repeat.update_info(RepeatInfo::Repeat {
+            rate: NonZeroU32::new(20).unwrap(),
+            delay: 300,
+        });
+        repeat.press(7, key(42, 0xffe1), std::time::Instant::now());
+        assert!(repeat.deadline().is_none());
     }
 }
 
@@ -755,10 +1515,289 @@ impl Dispatch<WpViewport, ()> for WaylandState {
     }
 }
 
+impl Dispatch<ZwpTextInputManagerV3, ()> for WaylandState {
+    fn event(
+        _: &mut Self,
+        _: &ZwpTextInputManagerV3,
+        _: <ZwpTextInputManagerV3 as Proxy>::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
+    fn event(
+        state: &mut Self,
+        _: &ZwpTextInputV3,
+        event: zwp_text_input_v3::Event,
+        (): &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let event = match event {
+            zwp_text_input_v3::Event::Enter { surface } if surface == state.target_surface => {
+                state.text_input_focused = true;
+                Some(TextInputEvent::Enter)
+            }
+            zwp_text_input_v3::Event::Leave { surface } if surface == state.target_surface => {
+                state.text_input_focused = false;
+                Some(TextInputEvent::Leave)
+            }
+            zwp_text_input_v3::Event::PreeditString {
+                text,
+                cursor_begin,
+                cursor_end,
+            } if state.text_input_focused => Some(TextInputEvent::Preedit {
+                text: text.unwrap_or_default(),
+                cursor: (cursor_begin != -1 || cursor_end != -1)
+                    .then_some((cursor_begin, cursor_end)),
+            }),
+            zwp_text_input_v3::Event::CommitString { text } if state.text_input_focused => {
+                Some(TextInputEvent::Commit(text.unwrap_or_default()))
+            }
+            zwp_text_input_v3::Event::DeleteSurroundingText {
+                before_length,
+                after_length,
+            } if state.text_input_focused => Some(TextInputEvent::DeleteSurrounding {
+                before_bytes: before_length,
+                after_bytes: after_length,
+            }),
+            zwp_text_input_v3::Event::Done { serial } if state.text_input_focused => {
+                Some(TextInputEvent::Done { serial })
+            }
+            _ => None,
+        };
+        if let Some(event) = event {
+            state.pending.input.push(PlatformEvent::TextInput(event));
+        }
+    }
+}
+
+impl DataDeviceHandler for WaylandState {
+    fn enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_data_device::WlDataDevice,
+        _: f64,
+        _: f64,
+        _: &wl_surface::WlSurface,
+    ) {
+    }
+    fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_data_device::WlDataDevice) {}
+    fn motion(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_data_device::WlDataDevice,
+        _: f64,
+        _: f64,
+    ) {
+    }
+    fn selection(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        device: &wl_data_device::WlDataDevice,
+    ) {
+        let Some(data_device) = self
+            .data_device
+            .as_ref()
+            .filter(|value| value.inner() == device)
+        else {
+            return;
+        };
+        self.clipboard_offer = data_device.data().selection_offer();
+        let event = self.clipboard_offer.as_ref().map_or(
+            ClipboardEvent::Cleared(SelectionTarget::Clipboard),
+            |offer| ClipboardEvent::Offer {
+                target: SelectionTarget::Clipboard,
+                mime_types: offer.with_mime_types(<[String]>::to_vec),
+            },
+        );
+        self.pending.input.push(PlatformEvent::Clipboard(event));
+    }
+    fn drop_performed(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_data_device::WlDataDevice,
+    ) {
+    }
+}
+
+impl DataOfferHandler for WaylandState {
+    fn source_actions(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &mut DragOffer,
+        _: DndAction,
+    ) {
+    }
+    fn selected_action(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &mut DragOffer,
+        _: DndAction,
+    ) {
+    }
+}
+
+impl DataSourceHandler for WaylandState {
+    fn accept_mime(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_data_source::WlDataSource,
+        _: Option<String>,
+    ) {
+    }
+    fn send_request(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &wl_data_source::WlDataSource,
+        mime_type: String,
+        fd: smithay_client_toolkit::data_device_manager::WritePipe,
+    ) {
+        if let Some((source, _)) = self
+            .clipboard_sources
+            .iter()
+            .find(|(_, value)| value.inner() == source)
+        {
+            self.pending
+                .input
+                .push(PlatformEvent::Clipboard(ClipboardEvent::Send {
+                    source: *source,
+                    mime_type,
+                    fd: OwnedFd::from(fd),
+                }));
+        }
+    }
+    fn cancelled(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &wl_data_source::WlDataSource,
+    ) {
+        if let Some(index) = self
+            .clipboard_sources
+            .iter()
+            .position(|(_, value)| value.inner() == source)
+        {
+            let (source, _) = self.clipboard_sources.remove(index);
+            self.pending
+                .input
+                .push(PlatformEvent::Clipboard(ClipboardEvent::SourceCancelled {
+                    source,
+                }));
+        }
+    }
+    fn dnd_dropped(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_data_source::WlDataSource,
+    ) {
+    }
+    fn dnd_finished(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_data_source::WlDataSource,
+    ) {
+    }
+    fn action(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_data_source::WlDataSource,
+        _: DndAction,
+    ) {
+    }
+}
+
+impl PrimarySelectionDeviceHandler for WaylandState {
+    fn selection(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        device: &wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_device_v1::ZwpPrimarySelectionDeviceV1,
+    ) {
+        let Some(primary_device) = self
+            .primary_device
+            .as_ref()
+            .filter(|value| value.inner() == device)
+        else {
+            return;
+        };
+        self.primary_offer = primary_device.data().selection_offer();
+        let event = self.primary_offer.as_ref().map_or(
+            ClipboardEvent::Cleared(SelectionTarget::Primary),
+            |offer| ClipboardEvent::Offer {
+                target: SelectionTarget::Primary,
+                mime_types: offer.with_mime_types(<[String]>::to_vec),
+            },
+        );
+        self.pending.input.push(PlatformEvent::Clipboard(event));
+    }
+}
+
+impl PrimarySelectionSourceHandler for WaylandState {
+    fn send_request(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+        mime_type: String,
+        fd: smithay_client_toolkit::data_device_manager::WritePipe,
+    ) {
+        if let Some((source, _)) = self
+            .primary_sources
+            .iter()
+            .find(|(_, value)| value.inner() == source)
+        {
+            self.pending
+                .input
+                .push(PlatformEvent::Clipboard(ClipboardEvent::Send {
+                    source: *source,
+                    mime_type,
+                    fd: OwnedFd::from(fd),
+                }));
+        }
+    }
+    fn cancelled(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        source: &wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
+    ) {
+        if let Some(index) = self
+            .primary_sources
+            .iter()
+            .position(|(_, value)| value.inner() == source)
+        {
+            let (source, _) = self.primary_sources.remove(index);
+            self.pending
+                .input
+                .push(PlatformEvent::Clipboard(ClipboardEvent::SourceCancelled {
+                    source,
+                }));
+        }
+    }
+}
+
 delegate_compositor!(WaylandState);
 delegate_output!(WaylandState);
 delegate_seat!(WaylandState);
 delegate_keyboard!(WaylandState);
 delegate_pointer!(WaylandState);
+delegate_shm!(WaylandState);
+delegate_data_device!(WaylandState);
+delegate_primary_selection!(WaylandState);
 delegate_xdg_shell!(WaylandState);
 delegate_xdg_window!(WaylandState);

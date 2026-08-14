@@ -1,8 +1,79 @@
 use std::{ops::Range, sync::Arc};
 
+use crate::terminal::{SelectionKind, SelectionPoint};
+
 const MAX_PREEDIT_BYTES: usize = 4096;
 const MAX_PREEDIT_SCALARS: usize = 1024;
 const MAX_IME_COMMIT_BYTES: usize = 64 * 1024;
+const MULTI_CLICK_MS: u32 = 400;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ClickTracker {
+    last: Option<ClickRecord>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ClickRecord {
+    button: u32,
+    point: SelectionPoint,
+    time_ms: u32,
+    count: u8,
+}
+
+impl ClickTracker {
+    #[must_use]
+    pub fn register(&mut self, button: u32, point: SelectionPoint, time_ms: u32) -> SelectionKind {
+        let count = self.last.map_or(1, |last| {
+            if last.button == button
+                && last.point == point
+                && time_ms.wrapping_sub(last.time_ms) <= MULTI_CLICK_MS
+            {
+                (last.count % 3) + 1
+            } else {
+                1
+            }
+        });
+        self.last = Some(ClickRecord {
+            button,
+            point,
+            time_ms,
+            count,
+        });
+        match count {
+            2 => SelectionKind::Semantic,
+            3 => SelectionKind::Lines,
+            _ => SelectionKind::Simple,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LinkCandidate {
+    pub snapshot_generation: u64,
+    pub hyperlink: u16,
+    pub point: SelectionPoint,
+    pub modifiers: leyline_gfx::ModifiersState,
+}
+
+impl LinkCandidate {
+    #[must_use]
+    pub fn matches(
+        &self,
+        snapshot_generation: u64,
+        hyperlink: u16,
+        point: SelectionPoint,
+        modifiers: leyline_gfx::ModifiersState,
+    ) -> bool {
+        self.snapshot_generation == snapshot_generation
+            && self.hyperlink == hyperlink
+            && self.point == point
+            && self.modifiers == modifiers
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PreeditOverlay {
@@ -60,6 +131,16 @@ impl ImeState {
         self.pending = ImeTransaction::default();
         self.preedit = None;
     }
+    #[must_use]
+    pub const fn is_active(&self) -> bool {
+        self.active
+    }
+    pub fn reanchor_preedit(&mut self, generation: u64, anchor: [u16; 2]) {
+        if let Some(preedit) = self.preedit.as_mut() {
+            preedit.snapshot_generation = generation;
+            preedit.anchor = anchor;
+        }
+    }
     pub fn sent_commit(&mut self) -> Result<u32, ImeError> {
         self.outbound.commit_serial = self
             .outbound
@@ -68,6 +149,10 @@ impl ImeState {
             .ok_or(ImeError::SerialOverflow)?;
         self.outbound.dirty = false;
         Ok(self.outbound.commit_serial)
+    }
+    pub fn record_commit_serial(&mut self, serial: u32) {
+        self.outbound.commit_serial = serial;
+        self.outbound.dirty = false;
     }
     pub fn preedit_string(
         &mut self,
@@ -204,5 +289,39 @@ mod tests {
             ime.preedit_string("中".into(), Some((1, 2))),
             Err(ImeError::InvalidCursor)
         );
+    }
+
+    #[test]
+    fn click_tracker_requires_same_cell_button_and_deadline() {
+        let point = SelectionPoint { column: 2, line: 1 };
+        let mut clicks = ClickTracker::default();
+        assert_eq!(clicks.register(1, point, 10), SelectionKind::Simple);
+        assert_eq!(clicks.register(1, point, 410), SelectionKind::Semantic);
+        assert_eq!(clicks.register(1, point, 411), SelectionKind::Lines);
+        assert_eq!(clicks.register(1, point, 412), SelectionKind::Simple);
+        assert_eq!(clicks.register(2, point, 413), SelectionKind::Simple);
+        assert_eq!(
+            clicks.register(2, SelectionPoint { column: 3, line: 1 }, 414),
+            SelectionKind::Simple
+        );
+        assert_eq!(clicks.register(2, point, 900), SelectionKind::Simple);
+    }
+
+    #[test]
+    fn link_candidate_rejects_any_stale_release_property() {
+        let point = SelectionPoint { column: 2, line: 1 };
+        let modifiers = leyline_gfx::ModifiersState {
+            control: true,
+            ..leyline_gfx::ModifiersState::default()
+        };
+        let candidate = LinkCandidate {
+            snapshot_generation: 7,
+            hyperlink: 3,
+            point,
+            modifiers,
+        };
+        assert!(candidate.matches(7, 3, point, modifiers));
+        assert!(!candidate.matches(8, 3, point, modifiers));
+        assert!(!candidate.matches(7, 4, point, modifiers));
     }
 }

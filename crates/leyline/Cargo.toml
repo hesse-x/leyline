@@ -12,6 +12,7 @@ leyline-text.workspace = true
 alacritty_terminal.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true
+rustix.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 toml.workspace = true

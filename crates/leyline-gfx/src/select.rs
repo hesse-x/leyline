@@ -31,9 +31,8 @@ pub(crate) fn composite_alpha(
     supported: vk::CompositeAlphaFlagsKHR,
 ) -> Option<vk::CompositeAlphaFlagsKHR> {
     [
-        vk::CompositeAlphaFlagsKHR::OPAQUE,
         vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED,
-        vk::CompositeAlphaFlagsKHR::POST_MULTIPLIED,
+        vk::CompositeAlphaFlagsKHR::OPAQUE,
         vk::CompositeAlphaFlagsKHR::INHERIT,
     ]
     .into_iter()
@@ -91,6 +90,11 @@ mod tests {
         assert!(
             composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
                 == Some(vk::CompositeAlphaFlagsKHR::OPAQUE)
+        );
+        assert!(
+            composite_alpha(
+                vk::CompositeAlphaFlagsKHR::OPAQUE | vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED
+            ) == Some(vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED)
         );
         assert_eq!(image_count(4, 0), 5);
         assert_eq!(image_count(4, 4), 4);

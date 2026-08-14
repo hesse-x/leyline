@@ -6,7 +6,7 @@ mod ffi;
 
 use std::{num::NonZeroU16, sync::Arc};
 
-pub use ffi::TextSystem;
+pub use ffi::{PreparedFontState, TextSystem};
 
 pub const MAX_FACES: usize = 256;
 pub const MAX_GLYPH_BITMAP_BYTES: usize = 32 * 1024 * 1024;
@@ -141,11 +141,14 @@ pub enum TextError {
     Shape(String),
     #[error("text resource exceeds its hard limit: {0}")]
     CapacityExceeded(&'static str),
+    #[error("prepared font state no longer matches the active generation")]
+    StalePreparedState,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc as SyncArc, Barrier};
 
     #[test]
     fn rational_size_uses_wayland_scale_once() {
@@ -172,5 +175,83 @@ mod tests {
         assert!(!shaped.glyphs.is_empty());
         assert!(shaped.assets.iter().all(|asset| asset.bitmap.coverage.len()
             == usize::from(asset.bitmap.size_px[0]) * usize::from(asset.bitmap.size_px[1])));
+    }
+
+    #[test]
+    fn prepared_font_state_is_invisible_until_commit() {
+        let initial = FontRequest::from_points("monospace", 11.0, 120, false).unwrap();
+        let replacement = FontRequest::from_points("monospace", 13.0, 120, false).unwrap();
+        let mut system = TextSystem::new(initial).unwrap();
+        let old_generation = system.generation();
+        let prepared = system.prepare_configure(replacement).unwrap();
+        assert_eq!(system.generation(), old_generation);
+        assert_eq!(prepared.generation(), old_generation + 1);
+        system.commit_configure(prepared).unwrap();
+        assert_eq!(system.generation(), old_generation + 1);
+    }
+
+    #[test]
+    fn stale_prepared_font_state_is_rejected_without_mutation() {
+        let initial = FontRequest::from_points("monospace", 11.0, 120, false).unwrap();
+        let first = FontRequest::from_points("monospace", 12.0, 120, false).unwrap();
+        let stale = FontRequest::from_points("monospace", 13.0, 120, false).unwrap();
+        let mut system = TextSystem::new(initial).unwrap();
+        let stale = system.prepare_configure(stale).unwrap();
+        let first = system.prepare_configure(first).unwrap();
+        system.commit_configure(first).unwrap();
+        let generation = system.generation();
+        assert!(matches!(
+            system.commit_configure(stale),
+            Err(TextError::StalePreparedState)
+        ));
+        assert_eq!(system.generation(), generation);
+    }
+
+    #[test]
+    fn failed_prepare_keeps_active_font_usable() {
+        let initial = FontRequest::from_points("monospace", 11.0, 120, false).unwrap();
+        let mut invalid = initial.clone();
+        invalid.family = Arc::from("invalid\0family");
+        let mut system = TextSystem::new(initial).unwrap();
+        let generation = system.generation();
+        assert!(system.prepare_configure(invalid).is_err());
+        assert_eq!(system.generation(), generation);
+        assert!(
+            !system
+                .shape_cluster("still active", FontStyle::Regular)
+                .unwrap()
+                .glyphs
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn independent_text_systems_are_safe_under_parallel_create_and_drop() {
+        const THREADS: usize = 8;
+        const ITERATIONS: usize = 8;
+        let barrier = SyncArc::new(Barrier::new(THREADS));
+        let threads: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let barrier = SyncArc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    for _ in 0..ITERATIONS {
+                        let request =
+                            FontRequest::from_points("monospace", 11.0, 120, false).unwrap();
+                        let mut system = TextSystem::new(request).unwrap();
+                        assert!(
+                            !system
+                                .shape_cluster("parallel", FontStyle::Regular)
+                                .unwrap()
+                                .glyphs
+                                .is_empty()
+                        );
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().expect("parallel text worker");
+        }
     }
 }

@@ -203,7 +203,7 @@ impl TerminalCoreAdapter {
             cursor: CursorSnapshot {
                 column: u16::try_from(cursor.point.column.0).unwrap_or(u16::MAX),
                 line: u16::try_from(cursor.point.line.0.max(0)).unwrap_or(u16::MAX),
-                visible: mode.contains(TermMode::SHOW_CURSOR),
+                visible: mode.contains(TermMode::SHOW_CURSOR) && content.display_offset == 0,
             },
             modes: map_modes(mode),
             display_offset: content.display_offset,
@@ -282,6 +282,20 @@ impl TerminalCoreAdapter {
     pub fn scroll_display(&mut self, lines: i32) -> Result<(), TerminalError> {
         self.term
             .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(TerminalError::GenerationOverflow)?;
+        self.cached.get_mut().take();
+        Ok(())
+    }
+
+    pub fn scroll_to_bottom(&mut self) -> Result<(), TerminalError> {
+        if self.term.grid().display_offset() == 0 {
+            return Ok(());
+        }
+        self.term
+            .scroll_display(alacritty_terminal::grid::Scroll::Bottom);
         self.generation = self
             .generation
             .checked_add(1)
@@ -494,6 +508,31 @@ mod tests {
     }
 
     #[test]
+    fn semantic_and_line_selection_use_terminal_boundaries() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(12, 2).unwrap(), 10).unwrap();
+        core.advance(b"one two\r\nsecond").unwrap();
+        core.start_selection(
+            SelectionKind::Semantic,
+            SelectionPoint { column: 1, line: 0 },
+            SelectionSide::Left,
+        )
+        .unwrap();
+        core.update_selection(SelectionPoint { column: 1, line: 0 }, SelectionSide::Right)
+            .unwrap();
+        assert_eq!(core.selected_text().as_deref(), Some("one"));
+
+        core.start_selection(
+            SelectionKind::Lines,
+            SelectionPoint { column: 2, line: 1 },
+            SelectionSide::Left,
+        )
+        .unwrap();
+        core.update_selection(SelectionPoint { column: 2, line: 1 }, SelectionSide::Right)
+            .unwrap();
+        assert_eq!(core.selected_text().as_deref(), Some("second\n"));
+    }
+
+    #[test]
     fn snapshot_preserves_indexed_color_wide_combining_cursor_and_modes() {
         let mut core = TerminalCoreAdapter::new(GridSize::new(12, 3).unwrap(), 10).unwrap();
         core.advance(b"e\xcc\x81\xe4\xb8\xad\x1b[38;5;196mX\x1b[2;4H\x1b[?1h\x1b[?1000h")
@@ -537,6 +576,31 @@ mod tests {
                 .collect::<String>()
                 .contains("MAIN")
         );
+    }
+
+    #[test]
+    fn user_input_can_restore_scrollback_to_bottom() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 2).unwrap(), 10).unwrap();
+        core.advance(b"one\r\ntwo\r\nthree").unwrap();
+        core.scroll_display(1).unwrap();
+        assert_eq!(core.snapshot().unwrap().display_offset, 1);
+        core.scroll_to_bottom().unwrap();
+        assert_eq!(core.snapshot().unwrap().display_offset, 0);
+    }
+
+    #[test]
+    fn cursor_is_hidden_while_viewing_scrollback() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 2).unwrap(), 10).unwrap();
+        core.advance(b"one\r\ntwo\r\nthree").unwrap();
+        assert!(core.snapshot().unwrap().cursor.visible);
+
+        core.scroll_display(1).unwrap();
+        let snapshot = core.snapshot().unwrap();
+        assert_eq!(snapshot.display_offset, 1);
+        assert!(!snapshot.cursor.visible);
+
+        core.scroll_to_bottom().unwrap();
+        assert!(core.snapshot().unwrap().cursor.visible);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use std::time::{Duration, Instant};
+
 use leyline_gfx::{
     EventWake, GfxError, GfxInitError, GfxOptions, GfxRuntime, LinearColor, PlatformEvent,
     RenderOutcome, WakeError,
@@ -11,9 +13,10 @@ use crate::{
         runtime::{AppRuntime, WakeBackend},
     },
     diagnostics::{ClassifiedError, ErrorCategory},
-    frame_composer::compose,
+    frame_composer::{FrameOverlays, compose},
+    interaction::{ClickTracker, ImeState, LinkCandidate},
     layout::GridLayout,
-    session::{SessionAction, TerminalSession},
+    session::{SessionAction, ShutdownPoll, TerminalSession},
 };
 
 pub struct UiRuntime {
@@ -24,11 +27,35 @@ pub struct UiRuntime {
     session: TerminalSession,
     text: TextSystem,
     layout: GridLayout,
+    text_scale: leyline_gfx::Scale120,
+    resize_settle_deadline: Option<Instant>,
     font_size: f64,
     reset_font_size: f64,
     modifiers: leyline_gfx::ModifiersState,
     selecting: bool,
+    selection_point: Option<crate::terminal::SelectionPoint>,
+    click_tracker: ClickTracker,
+    drag_scroll: Option<DragScroll>,
+    link_candidate: Option<LinkCandidate>,
+    desktop_launcher: crate::desktop::DesktopLauncher,
+    ime: ImeState,
+    ime_rectangle: Option<leyline_gfx::TextInputRectangle>,
+    clipboard_workers: crate::clipboard::TransferWorkers,
+    selection: crate::selection::SelectionController,
+    last_input_serial: Option<leyline_gfx::InputSerial>,
+    wheel_remainder_120: i32,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct DragScroll {
+    direction: i32,
+    point: crate::terminal::SelectionPoint,
+    deadline: Instant,
+}
+
+const DRAG_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
 
 impl UiRuntime {
     /// Builds the single UI-thread composition root.
@@ -56,9 +83,11 @@ impl UiRuntime {
             text.generation(),
         )?;
         let initial_size = layout.grid;
+        let text_scale = gfx.scale();
         let session =
             TerminalSession::start(app.launch(), app.config(), initial_size, &app_runtime)?;
         let reset_font_size = app.config().font.size;
+        let clipboard_workers = crate::clipboard::TransferWorkers::new(&wake);
         Ok(Self {
             app,
             app_runtime,
@@ -67,10 +96,23 @@ impl UiRuntime {
             session,
             text,
             layout,
+            text_scale,
+            resize_settle_deadline: None,
             font_size: reset_font_size,
             reset_font_size,
             modifiers: leyline_gfx::ModifiersState::default(),
             selecting: false,
+            selection_point: None,
+            click_tracker: ClickTracker::default(),
+            drag_scroll: None,
+            link_candidate: None,
+            desktop_launcher: crate::desktop::DesktopLauncher::new(),
+            ime: ImeState::default(),
+            ime_rectangle: None,
+            clipboard_workers,
+            selection: crate::selection::SelectionController::default(),
+            last_input_serial: None,
+            wheel_remainder_120: 0,
         })
     }
 
@@ -89,27 +131,33 @@ impl UiRuntime {
                             ShutdownReason::UserRequested,
                         ))?;
                     }
-                    PlatformEvent::Configured {
-                        logical_size,
-                        scale,
-                        ..
-                    } => {
-                        self.reconfigure_layout(logical_size, scale)?;
-                    }
-                    PlatformEvent::ScaleChanged { scale } => {
-                        self.reconfigure_layout(self.gfx.logical_size(), scale)?;
+                    PlatformEvent::Configured { .. } | PlatformEvent::ScaleChanged { .. } => {
+                        self.resize_settle_deadline = Some(Instant::now() + RESIZE_SETTLE_INTERVAL);
+                        self.gfx.acknowledge_resize()?;
                     }
                     PlatformEvent::KeyboardFocus { focused, .. } => {
                         self.session.focus_changed(focused)?;
+                        if !focused {
+                            self.cancel_paste_confirmation()?;
+                            self.cancel_pointer_gesture();
+                            if let Some(serial) = self.gfx.disable_text_input()? {
+                                self.ime.record_commit_serial(serial);
+                            }
+                            self.ime.deactivate();
+                            self.ime_rectangle = None;
+                        }
                     }
-                    PlatformEvent::Key(key) => self.handle_key(key)?,
+                    PlatformEvent::Key(key) => self.handle_key(&key)?,
                     PlatformEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
                     PlatformEvent::Pointer(pointer) => self.handle_pointer(pointer)?,
+                    PlatformEvent::TextInput(event) => self.handle_text_input(event)?,
+                    PlatformEvent::Clipboard(event) => self.handle_clipboard_event(event)?,
                     PlatformEvent::FrameReady
                     | PlatformEvent::SurfaceSuspended
                     | PlatformEvent::SurfaceResumed => {}
                 }
             }
+            self.apply_settled_resize()?;
             let mut app_events = Vec::new();
             self.app_runtime
                 .inbox()
@@ -117,30 +165,44 @@ impl UiRuntime {
             for event in app_events {
                 self.handle_app_event(event)?;
             }
+            self.drain_clipboard_results()?;
+            self.process_drag_scroll()?;
             if let Some(snapshot) = self.session.end_drain_round()? {
-                let scene = compose(
-                    &mut self.text,
-                    &snapshot,
-                    &self.session.selection_overlay(snapshot.generation),
-                    &self.layout,
-                    &self.app.config().colors,
-                    self.app.config().cursor.style,
-                )?;
-                self.gfx.apply(leyline_gfx::GfxCommand::SetScene(scene))?;
+                self.compose_snapshot(&snapshot)?;
             }
             if let Some(title) = self.session.take_title() {
                 self.gfx
                     .apply(leyline_gfx::GfxCommand::SetTitle(title.to_string()))?;
             }
-            if self.gfx.close_requested() {
+            if self.poll_shutdown()? {
                 break;
             }
-            let timeout = match self.gfx.try_render()? {
-                RenderOutcome::Deferred => Some(GfxRuntime::retry_delay()),
-                RenderOutcome::Rendered | RenderOutcome::WaitingForFrame | RenderOutcome::Idle => {
-                    None
+            let render_timeout = if self.resize_settle_deadline.is_some() {
+                match self.gfx.try_render_resize_preview()? {
+                    RenderOutcome::Deferred => Some(GfxRuntime::retry_delay()),
+                    RenderOutcome::Rendered
+                    | RenderOutcome::WaitingForFrame
+                    | RenderOutcome::Idle => None,
+                }
+            } else {
+                match self.gfx.try_render()? {
+                    RenderOutcome::Deferred => Some(GfxRuntime::retry_delay()),
+                    RenderOutcome::Rendered
+                    | RenderOutcome::WaitingForFrame
+                    | RenderOutcome::Idle => None,
                 }
             };
+            let shutdown_poll = self
+                .session
+                .shutdown_deadline()
+                .map(|deadline| deadline.min(Instant::now() + SHUTDOWN_POLL_INTERVAL));
+            let timeout = earliest_timeout(
+                earliest_timeout(
+                    earliest_timeout(render_timeout, self.drag_scroll.map(|drag| drag.deadline)),
+                    self.resize_settle_deadline,
+                ),
+                shutdown_poll,
+            );
             if self.app_runtime.inbox().prepare_to_wait() {
                 self.gfx.poll_wait(Some(self.wake.as_fd()), timeout)?;
                 self.wake.drain()?;
@@ -150,18 +212,93 @@ impl UiRuntime {
         Ok(())
     }
 
+    fn poll_shutdown(&mut self) -> Result<bool, UiRuntimeError> {
+        if self.session.shutdown_deadline().is_none() {
+            return Ok(false);
+        }
+        match self.session.poll_shutdown(Instant::now())? {
+            ShutdownPoll::Pending => Ok(false),
+            ShutdownPoll::Complete => {
+                self.app_runtime.fast_cancel();
+                Ok(true)
+            }
+            ShutdownPoll::TimedOut => {
+                tracing::warn!(
+                    category = "pty",
+                    module = "ui_runtime",
+                    "PTY shutdown exceeded the 2 second completion deadline; detached owned workers"
+                );
+                self.app_runtime.fast_cancel();
+                Ok(true)
+            }
+        }
+    }
+
     fn reconfigure_layout(
         &mut self,
         logical: leyline_gfx::LogicalSize,
         scale: leyline_gfx::Scale120,
+        font_size: f64,
     ) -> Result<(), UiRuntimeError> {
+        if scale == self.text_scale && font_size.to_bits() == self.font_size.to_bits() {
+            return self.resize_layout_without_font_rebuild(logical, scale);
+        }
         let request = FontRequest::from_points(
             self.app.config().font.family.clone(),
-            self.font_size,
+            font_size,
             scale.0,
             self.app.config().font.ligatures,
         )?;
-        self.text.configure(request)?;
+        let mut prepared = self.text.prepare_configure(request)?;
+        let layout = GridLayout::calculate(
+            logical,
+            scale,
+            [
+                self.app.config().window.padding_x,
+                self.app.config().window.padding_y,
+            ],
+            prepared.metrics(),
+            prepared.generation(),
+        )?;
+        let grid_changed = self.layout.grid != layout.grid;
+        let scene = if grid_changed {
+            None
+        } else if let Some(snapshot) = self.session.latest_snapshot().cloned() {
+            let selection = self.session.selection_overlay(snapshot.generation);
+            Some(compose(
+                prepared.text_system_mut(),
+                &snapshot,
+                FrameOverlays {
+                    selection: &selection,
+                    preedit: self.ime.preedit.as_ref(),
+                    paste_confirmation: self.paste_confirmation_overlay(),
+                },
+                &layout,
+                &self.app.config().colors,
+                self.app.config().cursor.style,
+            )?)
+        } else {
+            None
+        };
+        if grid_changed {
+            self.session.resize(layout.grid)?;
+        }
+        self.text.commit_configure(prepared)?;
+        self.text_scale = scale;
+        self.font_size = font_size;
+        self.layout = layout;
+        self.refresh_text_input_rectangle()?;
+        if let Some(scene) = scene {
+            self.gfx.apply(leyline_gfx::GfxCommand::SetScene(scene))?;
+        }
+        Ok(())
+    }
+
+    fn resize_layout_without_font_rebuild(
+        &mut self,
+        logical: leyline_gfx::LogicalSize,
+        scale: leyline_gfx::Scale120,
+    ) -> Result<(), UiRuntimeError> {
         let layout = GridLayout::calculate(
             logical,
             scale,
@@ -177,18 +314,23 @@ impl UiRuntime {
             self.session.resize(layout.grid)?;
         }
         self.layout = layout;
-        if !grid_changed && let Some(snapshot) = self.session.latest_snapshot().cloned() {
-            let scene = compose(
-                &mut self.text,
-                &snapshot,
-                &self.session.selection_overlay(snapshot.generation),
-                &self.layout,
-                &self.app.config().colors,
-                self.app.config().cursor.style,
-            )?;
-            self.gfx.apply(leyline_gfx::GfxCommand::SetScene(scene))?;
+        self.refresh_text_input_rectangle()?;
+        if grid_changed {
+            Ok(())
+        } else {
+            self.compose_latest()
         }
-        Ok(())
+    }
+
+    fn apply_settled_resize(&mut self) -> Result<(), UiRuntimeError> {
+        let Some(deadline) = self.resize_settle_deadline else {
+            return Ok(());
+        };
+        if Instant::now() < deadline {
+            return Ok(());
+        }
+        self.resize_settle_deadline = None;
+        self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), self.font_size)
     }
 
     fn handle_app_event(
@@ -212,103 +354,329 @@ impl UiRuntime {
         }
         match self.app.handle_event(event)? {
             AppAction::BeginShutdown => {
-                self.app_runtime.fast_cancel();
+                if let Some(request) = self.selection.shutdown() {
+                    self.clipboard_workers.cancel(request.get());
+                }
                 self.session.begin_shutdown();
-                self.gfx.apply(leyline_gfx::GfxCommand::RequestClose)?;
+                self.cancel_pointer_gesture();
             }
             AppAction::Continue | AppAction::Stop => {}
         }
         Ok(())
     }
 
-    fn handle_key(&mut self, key: leyline_gfx::KeyInput) -> Result<(), UiRuntimeError> {
+    fn handle_key(&mut self, key: &leyline_gfx::KeyInput) -> Result<(), UiRuntimeError> {
+        if self.handle_paste_confirmation_key(key)? {
+            return Ok(());
+        }
         if key.state == leyline_gfx::KeyState::Released {
             return Ok(());
         }
-        let modifiers = crate::terminal::Modifiers {
-            shift: key.modifiers.shift,
-            control: key.modifiers.control,
-            alt: key.modifiers.alt,
-            super_key: key.modifiers.super_key,
-        };
-        if let Some(action) = self.resolve_shortcut(&key) {
+        self.last_input_serial = Some(key.serial);
+        let modifiers = terminal_modifiers(key);
+        if let Some(action) = self.resolve_shortcut(key) {
+            tracing::debug!(
+                ?action,
+                logical_key = ?key.logical_key,
+                "configurable shortcut matched"
+            );
             self.execute_action(action)?;
             return Ok(());
         }
-        let terminal_key = match key.keysym_name.as_deref() {
-            Some("BackSpace") => Some(crate::terminal::TerminalKey::Backspace),
-            Some("Tab" | "ISO_Left_Tab") => Some(crate::terminal::TerminalKey::Tab),
-            Some("Return" | "KP_Enter") => Some(crate::terminal::TerminalKey::Enter),
-            Some("Escape") => Some(crate::terminal::TerminalKey::Escape),
-            Some("Up") => Some(crate::terminal::TerminalKey::Up),
-            Some("Down") => Some(crate::terminal::TerminalKey::Down),
-            Some("Left") => Some(crate::terminal::TerminalKey::Left),
-            Some("Right") => Some(crate::terminal::TerminalKey::Right),
-            Some("Home") => Some(crate::terminal::TerminalKey::Home),
-            Some("End") => Some(crate::terminal::TerminalKey::End),
-            Some("Insert") => Some(crate::terminal::TerminalKey::Insert),
-            Some("Delete") => Some(crate::terminal::TerminalKey::Delete),
-            Some("Page_Up") => Some(crate::terminal::TerminalKey::PageUp),
-            Some("Page_Down") => Some(crate::terminal::TerminalKey::PageDown),
-            Some(name) if name.len() <= 3 && name.starts_with('F') => name[1..]
-                .parse()
-                .ok()
-                .map(crate::terminal::TerminalKey::Function),
+        let terminal_key = match key.logical_key {
+            leyline_gfx::LogicalKey::Backspace => Some(crate::terminal::TerminalKey::Backspace),
+            leyline_gfx::LogicalKey::Tab => Some(crate::terminal::TerminalKey::Tab),
+            leyline_gfx::LogicalKey::Enter => Some(crate::terminal::TerminalKey::Enter),
+            leyline_gfx::LogicalKey::Escape => Some(crate::terminal::TerminalKey::Escape),
+            leyline_gfx::LogicalKey::ArrowUp => Some(crate::terminal::TerminalKey::Up),
+            leyline_gfx::LogicalKey::ArrowDown => Some(crate::terminal::TerminalKey::Down),
+            leyline_gfx::LogicalKey::ArrowLeft => Some(crate::terminal::TerminalKey::Left),
+            leyline_gfx::LogicalKey::ArrowRight => Some(crate::terminal::TerminalKey::Right),
+            leyline_gfx::LogicalKey::Home => Some(crate::terminal::TerminalKey::Home),
+            leyline_gfx::LogicalKey::End => Some(crate::terminal::TerminalKey::End),
+            leyline_gfx::LogicalKey::Insert => Some(crate::terminal::TerminalKey::Insert),
+            leyline_gfx::LogicalKey::Delete => Some(crate::terminal::TerminalKey::Delete),
+            leyline_gfx::LogicalKey::PageUp => Some(crate::terminal::TerminalKey::PageUp),
+            leyline_gfx::LogicalKey::PageDown => Some(crate::terminal::TerminalKey::PageDown),
+            leyline_gfx::LogicalKey::Function(number) => {
+                Some(crate::terminal::TerminalKey::Function(number))
+            }
             _ => None,
         };
         if let Some(key) = terminal_key {
             self.session.input_key(key, modifiers)?;
-        } else if let Some(text) = key.utf8 {
+        } else if let Some(text) = key_text(key) {
             if modifiers.control || modifiers.alt {
-                if let Some(ch) = text.chars().next() {
-                    self.session
-                        .input_key(crate::terminal::TerminalKey::Char(ch), modifiers)?;
+                if let Some(ch) = match key.logical_key {
+                    leyline_gfx::LogicalKey::Character(ch) => Some(ch),
+                    _ => text.chars().next(),
+                } {
+                    match self
+                        .session
+                        .input_key(crate::terminal::TerminalKey::Char(ch), modifiers)
+                    {
+                        Ok(()) => {}
+                        Err(crate::session::SessionError::Input(
+                            crate::terminal::InputError::UnsupportedControl(_),
+                        )) => {
+                            tracing::debug!(
+                                character = ?ch,
+                                "ignored character without a terminal control mapping"
+                            );
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
             } else {
+                // Wayland still delivers unconsumed printable keys while text-input is enabled.
                 self.session.commit_text(&text)?;
             }
         }
         Ok(())
     }
 
-    fn resolve_shortcut(&self, key: &leyline_gfx::KeyInput) -> Option<crate::config::Action> {
-        use crate::config::Modifier;
-        let normalized_key = match key.keysym_name.as_deref()? {
-            "equal" if key.modifiers.shift => "Plus",
-            "minus" => "Minus",
-            "Page_Up" => "PageUp",
-            "Page_Down" => "PageDown",
-            name => name,
+    fn handle_text_input(
+        &mut self,
+        event: leyline_gfx::TextInputEvent,
+    ) -> Result<(), UiRuntimeError> {
+        use leyline_gfx::TextInputEvent;
+        if matches!(
+            self.selection.interaction_mode(),
+            crate::selection::InteractionMode::ConfirmPaste { .. }
+        ) {
+            return Ok(());
+        }
+        match event {
+            TextInputEvent::Enter => {
+                self.ime.activate();
+                self.ime_rectangle = None;
+                self.enable_text_input()?;
+            }
+            TextInputEvent::Leave => {
+                self.ime.deactivate();
+                self.ime_rectangle = None;
+            }
+            TextInputEvent::Preedit { text, cursor } => {
+                self.ime.preedit_string(text, cursor)?;
+            }
+            TextInputEvent::Commit(text) => self.ime.commit_string(text)?,
+            TextInputEvent::DeleteSurrounding {
+                before_bytes,
+                after_bytes,
+            } => self
+                .ime
+                .delete_surrounding_text(before_bytes, after_bytes)?,
+            TextInputEvent::Done { serial } => {
+                let Some(snapshot) = self.session.latest_snapshot().cloned() else {
+                    return Ok(());
+                };
+                let anchor = [snapshot.cursor.column, snapshot.cursor.line];
+                let done = self.ime.done(serial, snapshot.generation, anchor)?;
+                if let Some(commit) = done.commit {
+                    let text = std::str::from_utf8(&commit)
+                        .map_err(|_| crate::interaction::ImeError::CommitTooLarge)?;
+                    self.session.commit_text(text)?;
+                }
+                if done.delete_ignored {
+                    tracing::warn!("IME delete-surrounding request ignored for terminal input");
+                }
+                if done.outbound_resend_required {
+                    self.refresh_text_input_rectangle()?;
+                }
+                self.compose_latest()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn refresh_text_input_rectangle(&mut self) -> Result<(), UiRuntimeError> {
+        if !self.ime.is_active() || !self.gfx.text_input_available() {
+            return Ok(());
+        }
+        let Some(rectangle) = self.text_input_rectangle() else {
+            return Ok(());
         };
-        self.app
-            .config()
-            .keybindings
-            .iter()
-            .rev()
-            .find(|binding| {
-                binding.key.eq_ignore_ascii_case(normalized_key)
-                    && binding.mods.contains(&Modifier::Control) == key.modifiers.control
-                    && binding.mods.contains(&Modifier::Shift) == key.modifiers.shift
-                    && binding.mods.contains(&Modifier::Alt) == key.modifiers.alt
-                    && binding.mods.contains(&Modifier::Super) == key.modifiers.super_key
-            })
-            .map(|binding| binding.action)
+        if self.ime_rectangle == Some(rectangle) && !self.ime.outbound.dirty {
+            return Ok(());
+        }
+        let serial = self.gfx.update_text_input(rectangle)?;
+        if let Some(serial) = serial {
+            self.ime.record_commit_serial(serial);
+            self.ime_rectangle = Some(rectangle);
+        }
+        Ok(())
+    }
+
+    fn enable_text_input(&mut self) -> Result<(), UiRuntimeError> {
+        if !self.ime.is_active() || !self.gfx.text_input_available() {
+            return Ok(());
+        }
+        let Some(rectangle) = self.text_input_rectangle() else {
+            return Ok(());
+        };
+        if let Some(serial) = self.gfx.enable_text_input(rectangle)? {
+            self.ime.record_commit_serial(serial);
+            self.ime_rectangle = Some(rectangle);
+        }
+        Ok(())
+    }
+
+    fn text_input_rectangle(&self) -> Option<leyline_gfx::TextInputRectangle> {
+        let snapshot = self.session.latest_snapshot()?;
+        let scale = self.gfx.scale().0.max(1);
+        let physical_x = self.layout.content_origin_px[0].saturating_add(
+            u32::from(snapshot.cursor.column) * u32::from(self.layout.cell_px[0].get()),
+        );
+        let physical_y = self.layout.content_origin_px[1].saturating_add(
+            u32::from(snapshot.cursor.line) * u32::from(self.layout.cell_px[1].get()),
+        );
+        let logical = |value: u32| {
+            i32::try_from(u64::from(value) * 120 / u64::from(scale)).unwrap_or(i32::MAX)
+        };
+        Some(leyline_gfx::TextInputRectangle {
+            x: logical(physical_x),
+            y: logical(physical_y),
+            width: logical(u32::from(self.layout.cell_px[0].get())).max(1),
+            height: logical(u32::from(self.layout.cell_px[1].get())).max(1),
+        })
+    }
+
+    fn compose_latest(&mut self) -> Result<(), UiRuntimeError> {
+        let Some(snapshot) = self.session.latest_snapshot().cloned() else {
+            return Ok(());
+        };
+        self.compose_snapshot(&snapshot)
+    }
+
+    fn compose_snapshot(
+        &mut self,
+        snapshot: &crate::terminal::FrameSnapshot,
+    ) -> Result<(), UiRuntimeError> {
+        self.ime.reanchor_preedit(
+            snapshot.generation,
+            [snapshot.cursor.column, snapshot.cursor.line],
+        );
+        self.refresh_text_input_rectangle()?;
+        let paste_confirmation = self.paste_confirmation_overlay().copied();
+        let selection = self.session.selection_overlay(snapshot.generation);
+        let scene = compose(
+            &mut self.text,
+            snapshot,
+            FrameOverlays {
+                selection: &selection,
+                preedit: self.ime.preedit.as_ref(),
+                paste_confirmation: paste_confirmation.as_ref(),
+            },
+            &self.layout,
+            &self.app.config().colors,
+            self.app.config().cursor.style,
+        )?;
+        self.gfx.apply(leyline_gfx::GfxCommand::SetScene(scene))?;
+        Ok(())
+    }
+
+    fn paste_confirmation_overlay(&self) -> Option<&crate::clipboard::PasteConfirmationOverlay> {
+        self.selection.overlay()
+    }
+
+    fn enter_paste_confirmation(&mut self) -> Result<(), UiRuntimeError> {
+        let suspended = self.ime.is_active();
+        self.selection.set_modal_ime_suspended(suspended);
+        if suspended {
+            let serial = match self.gfx.disable_text_input() {
+                Ok(serial) => serial,
+                Err(error) => {
+                    let _ = self.selection.cancel_paste();
+                    return Err(error.into());
+                }
+            };
+            if let Some(serial) = serial {
+                self.ime.record_commit_serial(serial);
+            }
+            self.ime.deactivate();
+            self.ime_rectangle = None;
+        }
+        if let Some(overlay) = self.selection.overlay() {
+            tracing::warn!(
+                bytes = overlay.bytes,
+                lines = overlay.lines,
+                risk = ?overlay.risk,
+                "paste requires keyboard confirmation"
+            );
+        }
+        self.compose_latest()
+    }
+
+    fn cancel_paste_confirmation(&mut self) -> Result<(), UiRuntimeError> {
+        let resume_ime = self.selection.modal_ime_suspended();
+        if let Some(request) = self.selection.cancel_paste() {
+            self.clipboard_workers.cancel(request.get());
+        }
+        self.restore_ime_after_paste_confirmation(resume_ime)?;
+        self.compose_latest()
+    }
+
+    fn restore_ime_after_paste_confirmation(
+        &mut self,
+        suspended: bool,
+    ) -> Result<(), UiRuntimeError> {
+        if suspended {
+            self.ime.activate();
+            self.enable_text_input()?;
+        }
+        Ok(())
+    }
+
+    fn handle_paste_confirmation_key(
+        &mut self,
+        key: &leyline_gfx::KeyInput,
+    ) -> Result<bool, UiRuntimeError> {
+        let resume_ime = self.selection.modal_ime_suspended();
+        let outcome = self.selection.confirmation_input(key);
+        if outcome == crate::selection::ConfirmationOutcome::NotActive {
+            return Ok(false);
+        }
+        tracing::debug!(?outcome, logical_key = ?key.logical_key, "paste confirmation key handled");
+        match outcome {
+            crate::selection::ConfirmationOutcome::Paste(text) => {
+                self.restore_ime_after_paste_confirmation(resume_ime)?;
+                self.compose_latest()?;
+                self.session.paste(&text)?;
+            }
+            crate::selection::ConfirmationOutcome::Closed => {
+                self.restore_ime_after_paste_confirmation(resume_ime)?;
+                self.compose_latest()?;
+            }
+            crate::selection::ConfirmationOutcome::Consumed => {}
+            crate::selection::ConfirmationOutcome::NotActive => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn resolve_shortcut(&self, key: &leyline_gfx::KeyInput) -> Option<crate::config::Action> {
+        match crate::input::shortcut::resolve(&self.app.config().keybindings, key) {
+            crate::input::shortcut::ShortcutResult::Matched(action) => Some(action),
+            crate::input::shortcut::ShortcutResult::NotMatched => None,
+        }
     }
 
     fn execute_action(&mut self, action: crate::config::Action) -> Result<(), UiRuntimeError> {
         use crate::config::Action;
         match action {
             Action::IncreaseFontSize => {
-                self.font_size = (self.font_size + 1.0).min(72.0);
-                self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale())?;
+                let font_size = (self.font_size + 1.0).min(72.0);
+                self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), font_size)?;
             }
             Action::DecreaseFontSize => {
-                self.font_size = (self.font_size - 1.0).max(6.0);
-                self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale())?;
+                let font_size = (self.font_size - 1.0).max(6.0);
+                self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), font_size)?;
             }
             Action::ResetFontSize => {
-                self.font_size = self.reset_font_size;
-                self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale())?;
+                self.reconfigure_layout(
+                    self.gfx.logical_size(),
+                    self.gfx.scale(),
+                    self.reset_font_size,
+                )?;
             }
             Action::ScrollPageUp => self.session.scroll(
                 i32::try_from(self.layout.grid.lines().saturating_sub(1)).unwrap_or(i32::MAX),
@@ -316,34 +684,39 @@ impl UiRuntime {
             Action::ScrollPageDown => self.session.scroll(
                 -i32::try_from(self.layout.grid.lines().saturating_sub(1)).unwrap_or(i32::MAX),
             )?,
-            Action::Copy | Action::Paste => {
-                tracing::warn!(
-                    ?action,
-                    "desktop action requires an active selection/data offer"
-                );
+            Action::PastePrimary => {
+                self.request_paste(leyline_gfx::SelectionTarget::Primary)?;
             }
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_pointer(&mut self, event: leyline_gfx::PointerInput) -> Result<(), UiRuntimeError> {
+        if matches!(
+            self.selection.interaction_mode(),
+            crate::selection::InteractionMode::ConfirmPaste { .. }
+        ) {
+            return Ok(());
+        }
+        if let leyline_gfx::PointerKind::Release { serial, .. } = event.kind {
+            self.last_input_serial = Some(serial);
+        }
         let scale = f64::from(self.gfx.scale().0) / 120.0;
-        if !event.position.0.is_finite()
-            || !event.position.1.is_finite()
-            || event.position.0 < 0.0
-            || event.position.1 < 0.0
+        if !event.position.0.is_finite() || !event.position.1.is_finite() || event.position.0 < 0.0
         {
             return Ok(());
         }
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let pixel = [
             (event.position.0 * scale).floor() as u32,
-            (event.position.1 * scale).floor() as u32,
+            (event.position.1 * scale).max(0.0).floor() as u32,
         ];
-        let Some([column, line]) = self.layout.cell_at_pixel(pixel) else {
-            return Ok(());
-        };
-        let point = crate::terminal::SelectionPoint { column, line };
+        let above_grid = event.position.1 * scale < f64::from(self.layout.content_origin_px[1]);
+        let point = self
+            .layout
+            .cell_at_pixel(pixel)
+            .map(|[column, line]| crate::terminal::SelectionPoint { column, line });
         let modifiers = crate::terminal::Modifiers {
             shift: self.modifiers.shift,
             control: self.modifiers.control,
@@ -351,18 +724,53 @@ impl UiRuntime {
             super_key: self.modifiers.super_key,
         };
         match event.kind {
-            leyline_gfx::PointerKind::Press { button: 0x110, .. } => {
+            leyline_gfx::PointerKind::Press {
+                button: 0x110,
+                time_ms,
+                ..
+            } if point.is_some() => {
+                let point = point.expect("guarded pointer cell");
+                if modifiers.control && !modifiers.shift && !modifiers.alt && !modifiers.super_key {
+                    self.link_candidate = self.session.hyperlink_at(point).map(
+                        |(snapshot_generation, hyperlink, _)| LinkCandidate {
+                            snapshot_generation,
+                            hyperlink,
+                            point,
+                            modifiers: self.modifiers,
+                        },
+                    );
+                    if self.link_candidate.is_some() {
+                        return Ok(());
+                    }
+                }
                 if !self.session.pointer_report(
                     crate::terminal::MouseButton::Left,
                     crate::terminal::ButtonState::Pressed,
                     point,
                     modifiers,
                 )? {
-                    self.session.start_selection(point)?;
+                    let kind = self.click_tracker.register(0x110, point, time_ms);
+                    self.session.start_selection_kind(kind, point)?;
                     self.selecting = true;
+                    self.selection_point = Some(point);
                 }
             }
             leyline_gfx::PointerKind::Release { button: 0x110, .. } => {
+                if let Some(candidate) = self.link_candidate.take() {
+                    if let Some(point) = point
+                        && let Some((generation, hyperlink, uri)) = self.session.hyperlink_at(point)
+                        && candidate.matches(generation, hyperlink, point, self.modifiers)
+                        && let Err(error) = self.desktop_launcher.open(&uri)
+                    {
+                        tracing::warn!(%error, "link open request rejected");
+                    }
+                    return Ok(());
+                }
+                let point = point.or(self.selection_point);
+                let Some(point) = point else {
+                    self.cancel_pointer_gesture();
+                    return Ok(());
+                };
                 if !self.session.pointer_report(
                     crate::terminal::MouseButton::Left,
                     crate::terminal::ButtonState::Released,
@@ -372,30 +780,432 @@ impl UiRuntime {
                 {
                     self.session.update_selection(point)?;
                 }
+                if self.selecting {
+                    self.copy_selection(leyline_gfx::SelectionTarget::Primary)?;
+                }
                 self.selecting = false;
+                self.selection_point = None;
+                self.drag_scroll = None;
+            }
+            leyline_gfx::PointerKind::Press { button: 0x112, .. } if point.is_some() => {
+                self.request_paste(leyline_gfx::SelectionTarget::Primary)?;
             }
             leyline_gfx::PointerKind::Motion { .. } if self.selecting => {
-                self.session.update_selection(point)?;
+                if let Some(point) = point {
+                    self.session.update_selection(point)?;
+                    self.selection_point = Some(point);
+                    self.drag_scroll = None;
+                } else if let Some((direction, point)) = self.drag_scroll_target(pixel, above_grid)
+                {
+                    self.selection_point = Some(point);
+                    self.drag_scroll = Some(DragScroll {
+                        direction,
+                        point,
+                        deadline: Instant::now() + DRAG_SCROLL_INTERVAL,
+                    });
+                } else {
+                    self.drag_scroll = None;
+                }
             }
-            leyline_gfx::PointerKind::Axis { vertical_120, .. } if vertical_120 != 0 => {
-                let button = if vertical_120 < 0 {
+            leyline_gfx::PointerKind::Axis { vertical_120, .. }
+                if vertical_120 != 0 && point.is_some() =>
+            {
+                let point = point.expect("guarded pointer cell");
+                let steps = accumulate_wheel_steps(&mut self.wheel_remainder_120, vertical_120);
+                if steps == 0 {
+                    return Ok(());
+                }
+                let button = if steps < 0 {
                     crate::terminal::MouseButton::WheelUp
                 } else {
                     crate::terminal::MouseButton::WheelDown
                 };
-                if !self.session.pointer_report(
-                    button,
-                    crate::terminal::ButtonState::Pressed,
-                    point,
-                    modifiers,
-                )? {
-                    self.session.scroll((-vertical_120 / 120).clamp(-12, 12))?;
+                let mut reported = false;
+                for _ in 0..steps.unsigned_abs() {
+                    reported |= self.session.pointer_report(
+                        button,
+                        crate::terminal::ButtonState::Pressed,
+                        point,
+                        modifiers,
+                    )?;
+                }
+                if !reported {
+                    let lines = -steps * 3;
+                    if modifiers.shift || !self.session.alternate_scroll(lines)? {
+                        self.session.scroll(lines)?;
+                    }
                 }
             }
-            leyline_gfx::PointerKind::Leave { .. } => self.selecting = false,
+            leyline_gfx::PointerKind::Leave { .. } => self.cancel_pointer_gesture(),
             _ => {}
         }
         Ok(())
+    }
+
+    fn drag_scroll_target(
+        &self,
+        pixel: [u32; 2],
+        above_grid: bool,
+    ) -> Option<(i32, crate::terminal::SelectionPoint)> {
+        let origin = self.layout.content_origin_px;
+        let width = u32::from(self.layout.grid.columns.get())
+            .checked_mul(u32::from(self.layout.cell_px[0].get()))?;
+        let height = u32::from(self.layout.grid.lines.get())
+            .checked_mul(u32::from(self.layout.cell_px[1].get()))?;
+        if pixel[0] < origin[0] || pixel[0] >= origin[0].checked_add(width)? {
+            return None;
+        }
+        let column =
+            u16::try_from((pixel[0] - origin[0]) / u32::from(self.layout.cell_px[0].get())).ok()?;
+        if above_grid {
+            Some((1, crate::terminal::SelectionPoint { column, line: 0 }))
+        } else if pixel[1] >= origin[1].checked_add(height)? {
+            Some((
+                -1,
+                crate::terminal::SelectionPoint {
+                    column,
+                    line: self.layout.grid.lines.get() - 1,
+                },
+            ))
+        } else {
+            None
+        }
+    }
+
+    fn process_drag_scroll(&mut self) -> Result<(), UiRuntimeError> {
+        let Some(mut drag) = self.drag_scroll else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        if now < drag.deadline {
+            return Ok(());
+        }
+        self.session.scroll(drag.direction)?;
+        self.session.update_selection(drag.point)?;
+        drag.deadline = now + DRAG_SCROLL_INTERVAL;
+        self.drag_scroll = Some(drag);
+        Ok(())
+    }
+
+    fn cancel_pointer_gesture(&mut self) {
+        self.selecting = false;
+        self.selection_point = None;
+        self.drag_scroll = None;
+        self.link_candidate = None;
+        self.click_tracker.reset();
+    }
+
+    fn copy_selection(
+        &mut self,
+        target: leyline_gfx::SelectionTarget,
+    ) -> Result<(), UiRuntimeError> {
+        let (Some(serial), Some(text)) = (self.last_input_serial, self.session.selected_text())
+        else {
+            tracing::debug!(
+                ?target,
+                "copy ignored because no input serial or selection is available"
+            );
+            return Ok(());
+        };
+        let bytes = text.len();
+        let Some(source) = self.selection.publish(text) else {
+            tracing::warn!(?target, bytes, "copy selection rejected by size policy");
+            return Ok(());
+        };
+        let published = match self.gfx.publish_selection(target, source.get(), serial) {
+            Ok(published) => published,
+            Err(error) => {
+                self.selection.source_cancelled(source);
+                return Err(error.into());
+            }
+        };
+        if published {
+            tracing::debug!(
+                ?target,
+                source = source.get(),
+                bytes,
+                "selection source published"
+            );
+        } else {
+            self.selection.source_cancelled(source);
+            tracing::warn!(?target, "selection protocol is unavailable");
+        }
+        Ok(())
+    }
+
+    fn request_paste(
+        &mut self,
+        target: leyline_gfx::SelectionTarget,
+    ) -> Result<(), UiRuntimeError> {
+        self.cancel_paste_confirmation()?;
+        let transfer_target = match target {
+            leyline_gfx::SelectionTarget::Clipboard => crate::clipboard::TransferTarget::Clipboard,
+            leyline_gfx::SelectionTarget::Primary => crate::clipboard::TransferTarget::Primary,
+        };
+        let Some(start) = self.selection.begin_request(transfer_target) else {
+            return Ok(());
+        };
+        if let Some(request) = start.cancel {
+            self.clipboard_workers.cancel(request.get());
+        }
+        let fd = match self.gfx.receive_selection(target) {
+            Ok(Some(fd)) => fd,
+            Ok(None) => {
+                self.selection.request_failed(start.request);
+                tracing::warn!(
+                    ?target,
+                    "paste ignored because no compatible selection offer is available"
+                );
+                return Ok(());
+            }
+            Err(error) => {
+                self.selection.request_failed(start.request);
+                return Err(error.into());
+            }
+        };
+        tracing::debug!(
+            ?target,
+            request = start.request.get(),
+            "selection receive requested"
+        );
+        if let Err(error) = self
+            .clipboard_workers
+            .receive(start.request.get(), transfer_target, fd)
+        {
+            self.selection.request_failed(start.request);
+            tracing::warn!(%error, "clipboard receive queue rejected transfer");
+        }
+        Ok(())
+    }
+
+    fn handle_clipboard_event(
+        &mut self,
+        event: leyline_gfx::ClipboardEvent,
+    ) -> Result<(), UiRuntimeError> {
+        match event {
+            leyline_gfx::ClipboardEvent::Send {
+                source,
+                mime_type,
+                fd,
+            } => {
+                let supported = matches!(
+                    mime_type.as_str(),
+                    "text/plain;charset=utf-8" | "UTF8_STRING" | "text/plain"
+                );
+                if supported
+                    && let Some(bytes) = self
+                        .selection
+                        .source_bytes(crate::selection::SourceToken::from_raw(source))
+                    && let Err(error) = self.clipboard_workers.send(fd, bytes)
+                {
+                    tracing::warn!(%error, "clipboard send queue rejected transfer");
+                }
+            }
+            leyline_gfx::ClipboardEvent::SourceCancelled { source } => {
+                self.selection
+                    .source_cancelled(crate::selection::SourceToken::from_raw(source));
+            }
+            leyline_gfx::ClipboardEvent::Offer { .. } | leyline_gfx::ClipboardEvent::Cleared(_) => {
+                self.cancel_paste_confirmation()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_clipboard_results(&mut self) -> Result<(), UiRuntimeError> {
+        let mut results = Vec::new();
+        self.clipboard_workers.drain(|result| results.push(result));
+        for result in results {
+            match result {
+                crate::clipboard::TransferResult::Received {
+                    request,
+                    target,
+                    result,
+                } => {
+                    match self.selection.transfer_completed(
+                        crate::selection::RequestToken::from_raw(request),
+                        target,
+                        result,
+                        self.app.config().behavior.confirm_multiline_paste,
+                    ) {
+                        crate::selection::PasteTransition::Paste(text) => {
+                            self.session.paste(&text)?;
+                        }
+                        crate::selection::PasteTransition::Confirming => {
+                            self.enter_paste_confirmation()?;
+                        }
+                        crate::selection::PasteTransition::Rejected => {
+                            tracing::warn!("clipboard paste rejected by policy");
+                        }
+                        crate::selection::PasteTransition::Failed(error) => {
+                            tracing::warn!(%error, "clipboard transfer failed");
+                        }
+                        crate::selection::PasteTransition::IgnoreStale => {}
+                    }
+                }
+                crate::clipboard::TransferResult::WriteFailed(error) => {
+                    tracing::warn!(%error, "clipboard transfer failed");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn accumulate_wheel_steps(remainder_120: &mut i32, delta_120: i32) -> i32 {
+    let total = remainder_120.saturating_add(delta_120);
+    let steps = (total / 120).clamp(-4, 4);
+    *remainder_120 = total % 120;
+    steps
+}
+
+fn terminal_modifiers(key: &leyline_gfx::KeyInput) -> crate::terminal::Modifiers {
+    crate::terminal::Modifiers {
+        shift: key.modifiers.shift,
+        control: key.modifiers.control
+            && (!key.modifiers.alt_graph
+                || key
+                    .shortcut_modifiers
+                    .contains(leyline_gfx::ModifierMask::CONTROL)),
+        alt: key.modifiers.alt
+            && (!key.modifiers.alt_graph
+                || key
+                    .shortcut_modifiers
+                    .contains(leyline_gfx::ModifierMask::ALT)),
+        super_key: key.modifiers.super_key,
+    }
+}
+
+fn key_text(key: &leyline_gfx::KeyInput) -> Option<String> {
+    key.utf8
+        .as_ref()
+        .filter(|text| !text.is_empty())
+        .cloned()
+        .or_else(|| match key.logical_key {
+            leyline_gfx::LogicalKey::Character(ch) => Some(ch.to_string()),
+            _ => None,
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{accumulate_wheel_steps, key_text, terminal_modifiers};
+
+    fn key(keysym: u32, utf8: Option<&str>) -> leyline_gfx::KeyInput {
+        leyline_gfx::KeyInput {
+            serial: leyline_gfx::InputSerial {
+                seat: leyline_gfx::SeatToken::new(0, 1),
+                value: 1,
+                kind: leyline_gfx::SerialKind::Keyboard,
+            },
+            time_ms: 1,
+            physical_keycode: 1,
+            utf8: utf8.map(str::to_owned),
+            modifiers: leyline_gfx::ModifiersState::default(),
+            shortcut_modifiers: leyline_gfx::ModifierMask::empty(),
+            logical_key: leyline_gfx::logical_key_from_keysym(keysym),
+            state: leyline_gfx::KeyState::Pressed,
+            repeat: false,
+        }
+    }
+
+    #[test]
+    fn wheel_accumulates_partial_steps_and_caps_each_event() {
+        let mut remainder = 0;
+        assert_eq!(accumulate_wheel_steps(&mut remainder, 40), 0);
+        assert_eq!(accumulate_wheel_steps(&mut remainder, 80), 1);
+        assert_eq!(remainder, 0);
+        assert_eq!(accumulate_wheel_steps(&mut remainder, -60), 0);
+        assert_eq!(accumulate_wheel_steps(&mut remainder, -60), -1);
+        assert_eq!(accumulate_wheel_steps(&mut remainder, 1200), 4);
+    }
+
+    #[test]
+    fn keyboard_text_falls_back_to_printable_keysym() {
+        assert_eq!(key_text(&key(u32::from('a'), None)).as_deref(), Some("a"));
+        assert_eq!(
+            key_text(&key(u32::from('a'), Some(""))).as_deref(),
+            Some("a")
+        );
+        assert_eq!(key_text(&key(0x0100_4e2d, None)).as_deref(), Some("中"));
+        assert_eq!(key_text(&key(0xff51, None)), None);
+    }
+
+    #[test]
+    fn shift_insert_uses_the_configurable_shortcut_matcher() {
+        use crate::{
+            config::{Action, KeyBinding},
+            input::shortcut::{BindingOrigin, KeyChord, LogicalKeyPattern, ShortcutResult},
+        };
+
+        let mut input = key(0xff63, None);
+        input.modifiers.shift = true;
+        input.shortcut_modifiers = leyline_gfx::ModifierMask::SHIFT;
+        let bindings = [KeyBinding {
+            chord: KeyChord {
+                key: LogicalKeyPattern::Insert,
+                modifiers: leyline_gfx::ModifierMask::SHIFT,
+            },
+            action: Action::ScrollPageUp,
+            origin: BindingOrigin::User { index: 0 },
+        }];
+        assert_eq!(
+            crate::input::shortcut::resolve(&bindings, &input),
+            ShortcutResult::Matched(Action::ScrollPageUp)
+        );
+
+        input.modifiers.control = true;
+        input
+            .shortcut_modifiers
+            .insert(leyline_gfx::ModifierMask::CONTROL);
+        assert_eq!(
+            crate::input::shortcut::resolve(&bindings, &input),
+            ShortcutResult::NotMatched
+        );
+    }
+
+    #[test]
+    fn modifier_encoding_can_recover_the_unmodified_character() {
+        assert_eq!(
+            key(u32::from('c'), None).logical_key,
+            leyline_gfx::LogicalKey::Character('c')
+        );
+        assert!(matches!(
+            key(0x03, None).logical_key,
+            leyline_gfx::LogicalKey::Unidentified(_)
+        ));
+    }
+
+    #[test]
+    fn alt_graph_text_does_not_become_a_control_alt_terminal_key() {
+        let mut input = key(0x0100_20ac, Some("€"));
+        input.modifiers.control = true;
+        input.modifiers.alt = true;
+        input.modifiers.alt_graph = true;
+        assert_eq!(
+            terminal_modifiers(&input),
+            crate::terminal::Modifiers::default()
+        );
+
+        input
+            .shortcut_modifiers
+            .insert(leyline_gfx::ModifierMask::CONTROL);
+        input
+            .shortcut_modifiers
+            .insert(leyline_gfx::ModifierMask::ALT);
+        let modifiers = terminal_modifiers(&input);
+        assert!(modifiers.control);
+        assert!(modifiers.alt);
+    }
+}
+
+fn earliest_timeout(render: Option<Duration>, deadline: Option<Instant>) -> Option<Duration> {
+    let timer = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+    match (render, timer) {
+        (Some(render), Some(timer)) => Some(render.min(timer)),
+        (Some(render), None) => Some(render),
+        (None, Some(timer)) => Some(timer),
+        (None, None) => None,
     }
 }
 
@@ -429,6 +1239,8 @@ pub enum UiRuntimeError {
     Layout(#[from] crate::layout::LayoutError),
     #[error(transparent)]
     Compose(#[from] crate::frame_composer::ComposeError),
+    #[error(transparent)]
+    Ime(#[from] crate::interaction::ImeError),
 }
 
 impl ClassifiedError for UiRuntimeError {
@@ -439,7 +1251,7 @@ impl ClassifiedError for UiRuntimeError {
             | Self::Graphics(GfxError::Platform(_) | GfxError::Renderer(_)) => {
                 ErrorCategory::Environment
             }
-            Self::Init(GfxInitError::Platform(_)) => ErrorCategory::Platform,
+            Self::Init(GfxInitError::Platform(_)) | Self::Ime(_) => ErrorCategory::Platform,
             Self::Init(GfxInitError::Device(_)) => ErrorCategory::Renderer,
             Self::Graphics(GfxError::Internal(_))
             | Self::App(_)
