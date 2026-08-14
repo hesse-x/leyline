@@ -48,6 +48,7 @@ pub struct FrameSnapshot {
     pub cursor: CursorSnapshot,
     pub modes: TerminalModes,
     pub display_offset: usize,
+    pub history_size: usize,
     pub title: Option<Arc<str>>,
     pub hyperlinks: Arc<[SnapshotHyperlink]>,
 }

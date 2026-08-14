@@ -21,6 +21,46 @@ pub enum FontStyle {
     BoldItalic,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum HintingPreference {
+    None,
+    Slight,
+    Full,
+    System,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AntialiasPreference {
+    Grayscale,
+    System,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum HintingMode {
+    None,
+    Slight,
+    Full,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AntialiasMode {
+    Gray,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct RasterProfile {
+    pub hinting: HintingMode,
+    pub antialias: AntialiasMode,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedFace {
+    pub path: Arc<str>,
+    pub index: u32,
+    pub family: Arc<str>,
+    pub style: FontStyle,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FontRequest {
     pub family: Arc<str>,
@@ -28,6 +68,8 @@ pub struct FontRequest {
     pub logical_size_milli_pt: u32,
     pub scale_120: u32,
     pub ligatures: bool,
+    pub hinting: HintingPreference,
+    pub antialiasing: AntialiasPreference,
 }
 
 impl FontRequest {
@@ -56,7 +98,20 @@ impl FontRequest {
             logical_size_milli_pt,
             scale_120,
             ligatures,
+            hinting: HintingPreference::Slight,
+            antialiasing: AntialiasPreference::Grayscale,
         })
+    }
+
+    #[must_use]
+    pub const fn with_rendering(
+        mut self,
+        hinting: HintingPreference,
+        antialiasing: AntialiasPreference,
+    ) -> Self {
+        self.hinting = hinting;
+        self.antialiasing = antialiasing;
+        self
     }
 
     /// Returns a checked 26.6 physical size using Wayland as the only scale source.
@@ -103,10 +158,16 @@ pub struct GlyphKey {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GlyphBitmap {
+    pub format: GlyphFormat,
     pub size_px: [u16; 2],
     pub bearing_px: [i16; 2],
     pub advance_26_6: i32,
     pub coverage: Arc<[u8]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GlyphFormat {
+    Gray8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -357,6 +357,11 @@ impl TerminalSession {
         self.dirty = true;
         Ok(())
     }
+    pub fn scroll_to_display_offset(&mut self, offset: usize) -> Result<(), SessionError> {
+        self.core.scroll_to_display_offset(offset)?;
+        self.dirty = true;
+        Ok(())
+    }
     pub fn alternate_scroll(&mut self, lines: i32) -> Result<bool, SessionError> {
         let Some(bytes) = crate::terminal::encode_alternate_scroll(lines, self.core.input_modes())
         else {

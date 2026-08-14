@@ -8,7 +8,7 @@ pub fn format_debug_grid(snapshot: &FrameSnapshot) -> String {
     let mut output = String::with_capacity(snapshot.cells.len().saturating_add(256));
     let _ = writeln!(
         output,
-        "generation={} grid={}x{} cursor={},{} visible={} offset={} alt={} paste={} mouse={}",
+        "generation={} grid={}x{} cursor={},{} visible={} offset={}/{} alt={} paste={} mouse={}",
         snapshot.generation,
         snapshot.grid.columns,
         snapshot.grid.lines,
@@ -16,6 +16,7 @@ pub fn format_debug_grid(snapshot: &FrameSnapshot) -> String {
         snapshot.cursor.line,
         snapshot.cursor.visible,
         snapshot.display_offset,
+        snapshot.history_size,
         snapshot.modes.alternate_screen,
         snapshot.modes.bracketed_paste,
         snapshot.modes.mouse_protocol != super::MouseProtocol::None

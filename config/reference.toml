@@ -1,0 +1,30 @@
+# Ubuntu 24.04 visual-reference profile. The generic built-in family remains "monospace".
+[font]
+family = "Ubuntu Sans Mono"
+size = 13.0
+ligatures = false
+hinting = "slight"
+antialiasing = "grayscale"
+line_spacing = 1.0
+
+[colors]
+foreground = "#d8dcd8"
+background = "#2e3436e6"
+cursor = "#d8dcd8"
+selection_foreground = "#f4f6f4"
+selection_background = "#58656dcc"
+ansi = [
+  "#2e3436", "#cc6666", "#6fa66f", "#c8a85f",
+  "#5f87af", "#a27aa8", "#5f9ea0", "#d3d7cf",
+  "#6c7375", "#e07a7a", "#87bd87", "#d8bd73",
+  "#7aa2c8", "#b58abb", "#72b2b4", "#eeeeec",
+]
+
+[scrollbar]
+mode = "auto"
+width = 4.0
+hit_width = 12.0
+min_thumb_size = 24.0
+thumb = "#9aa2a680"
+thumb_hover = "#c1c7caff"
+track = "#00000000"

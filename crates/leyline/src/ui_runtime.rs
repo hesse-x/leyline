@@ -4,7 +4,7 @@ use leyline_gfx::{
     EventWake, GfxError, GfxInitError, GfxOptions, GfxRuntime, LinearColor, PlatformEvent,
     RenderOutcome, WakeError,
 };
-use leyline_text::{FontRequest, TextSystem};
+use leyline_text::{AntialiasPreference, FontRequest, HintingPreference, TextSystem};
 
 use crate::{
     app::{
@@ -14,8 +14,8 @@ use crate::{
     },
     diagnostics::{ClassifiedError, ErrorCategory},
     frame_composer::{FrameOverlays, compose},
-    interaction::{ClickTracker, ImeState, LinkCandidate},
-    layout::GridLayout,
+    interaction::{ClickTracker, ImeState, LinkCandidate, ScrollbarController, ScrollbarGeometry},
+    layout::{ContentInsets, GridLayout},
     session::{SessionAction, ShutdownPoll, TerminalSession},
 };
 
@@ -45,6 +45,7 @@ pub struct UiRuntime {
     selection: crate::selection::SelectionController,
     last_input_serial: Option<leyline_gfx::InputSerial>,
     wheel_remainder_120: i32,
+    scrollbar: ScrollbarController,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,13 +82,38 @@ impl UiRuntime {
             app.config().font.size,
             gfx.scale().0,
             app.config().font.ligatures,
-        )?;
+        )?
+        .with_rendering(
+            text_hinting(app.config().font.hinting),
+            text_antialiasing(app.config().font.antialiasing),
+        );
         let text = TextSystem::new(request)?;
-        let layout = GridLayout::calculate(
+        if let Some(face) = text.resolved_primary() {
+            tracing::info!(
+                category = "text_profile",
+                requested_family = %crate::diagnostics::escape_diagnostic(&app.config().font.family),
+                requested_size_pt = app.config().font.size,
+                resolved_family = %crate::diagnostics::escape_diagnostic(&face.family),
+                resolved_path = %crate::diagnostics::escape_diagnostic(&face.path),
+                face_index = face.index,
+                scale_120 = gfx.scale().0,
+                hinting = ?text.raster_profile().hinting,
+                antialias = ?text.raster_profile().antialias,
+                cell_width = text.metrics().width_px.get(),
+                cell_height = text.metrics().height_px.get(),
+                baseline = text.metrics().baseline_px,
+                line_spacing = app.config().font.line_spacing,
+                atlas_format = "R8_UNORM",
+                atlas_filter = "nearest",
+                "resolved terminal text profile"
+            );
+        }
+        let layout = GridLayout::calculate_with_style(
             gfx.logical_size(),
             gfx.scale(),
-            [app.config().window.padding_x, app.config().window.padding_y],
+            content_insets(app.config()),
             text.metrics(),
+            app.config().font.line_spacing,
             text.generation(),
         )?;
         let initial_size = layout.grid;
@@ -122,6 +148,7 @@ impl UiRuntime {
             selection: crate::selection::SelectionController::default(),
             last_input_serial: None,
             wheel_remainder_120: 0,
+            scrollbar: ScrollbarController::default(),
         })
     }
 
@@ -149,6 +176,7 @@ impl UiRuntime {
                         ))?;
                     }
                     PlatformEvent::Configured { .. } | PlatformEvent::ScaleChanged { .. } => {
+                        self.cancel_pointer_gesture();
                         self.resize_settle_deadline = Some(Instant::now() + RESIZE_SETTLE_INTERVAL);
                         self.gfx.acknowledge_resize()?;
                     }
@@ -169,9 +197,8 @@ impl UiRuntime {
                     PlatformEvent::Pointer(pointer) => self.handle_pointer(pointer)?,
                     PlatformEvent::TextInput(event) => self.handle_text_input(event)?,
                     PlatformEvent::Clipboard(event) => self.handle_clipboard_event(event)?,
-                    PlatformEvent::FrameReady
-                    | PlatformEvent::SurfaceSuspended
-                    | PlatformEvent::SurfaceResumed => {}
+                    PlatformEvent::SurfaceSuspended => self.cancel_pointer_gesture(),
+                    PlatformEvent::FrameReady | PlatformEvent::SurfaceResumed => {}
                 }
             }
             self.apply_settled_resize()?;
@@ -184,6 +211,9 @@ impl UiRuntime {
             }
             self.drain_clipboard_results()?;
             self.process_drag_scroll()?;
+            if self.scrollbar.expire(Instant::now()) {
+                self.compose_latest()?;
+            }
             if let Some(snapshot) = self.session.end_drain_round()? {
                 self.compose_snapshot(&snapshot)?;
             }
@@ -220,6 +250,7 @@ impl UiRuntime {
                 ),
                 shutdown_poll,
             );
+            let timeout = earliest_timeout(timeout, self.scrollbar.next_deadline());
             if self.app_runtime.inbox().prepare_to_wait() {
                 self.gfx.poll_wait(Some(self.wake.as_fd()), timeout)?;
                 self.wake.drain()?;
@@ -294,16 +325,18 @@ impl UiRuntime {
             font_size,
             scale.0,
             self.app.config().font.ligatures,
-        )?;
+        )?
+        .with_rendering(
+            text_hinting(self.app.config().font.hinting),
+            text_antialiasing(self.app.config().font.antialiasing),
+        );
         let mut prepared = self.text.prepare_configure(request)?;
-        let layout = GridLayout::calculate(
+        let layout = GridLayout::calculate_with_style(
             logical,
             scale,
-            [
-                self.app.config().window.padding_x,
-                self.app.config().window.padding_y,
-            ],
+            content_insets(self.app.config()),
             prepared.metrics(),
+            self.app.config().font.line_spacing,
             prepared.generation(),
         )?;
         let grid_changed = self.layout.grid != layout.grid;
@@ -318,6 +351,7 @@ impl UiRuntime {
                     selection: &selection,
                     preedit: self.ime.preedit.as_ref(),
                     paste_confirmation: self.paste_confirmation_overlay(),
+                    scrollbar: None,
                 },
                 &layout,
                 &self.app.config().colors,
@@ -345,14 +379,12 @@ impl UiRuntime {
         logical: leyline_gfx::LogicalSize,
         scale: leyline_gfx::Scale120,
     ) -> Result<(), UiRuntimeError> {
-        let layout = GridLayout::calculate(
+        let layout = GridLayout::calculate_with_style(
             logical,
             scale,
-            [
-                self.app.config().window.padding_x,
-                self.app.config().window.padding_y,
-            ],
+            content_insets(self.app.config()),
             self.text.metrics(),
+            self.app.config().font.line_spacing,
             self.text.generation(),
         )?;
         let grid_changed = self.layout.grid != layout.grid;
@@ -605,6 +637,20 @@ impl UiRuntime {
         self.refresh_text_input_rectangle()?;
         let paste_confirmation = self.paste_confirmation_overlay().copied();
         let selection = self.session.selection_overlay(snapshot.generation);
+        let geometry = ScrollbarGeometry::calculate(
+            snapshot,
+            &self.layout,
+            &self.app.config().scrollbar,
+            self.gfx.scale().0,
+        );
+        let scrollbar = geometry.and_then(|geometry| {
+            self.scrollbar.presentation(
+                geometry,
+                snapshot,
+                &self.app.config().scrollbar,
+                Instant::now(),
+            )
+        });
         let scene = compose(
             &mut self.text,
             snapshot,
@@ -612,6 +658,7 @@ impl UiRuntime {
                 selection: &selection,
                 preedit: self.ime.preedit.as_ref(),
                 paste_confirmation: paste_confirmation.as_ref(),
+                scrollbar: scrollbar.as_ref(),
             },
             &self.layout,
             &self.app.config().colors,
@@ -724,12 +771,18 @@ impl UiRuntime {
                     self.reset_font_size,
                 )?;
             }
-            Action::ScrollPageUp => self.session.scroll(
-                i32::try_from(self.layout.grid.lines().saturating_sub(1)).unwrap_or(i32::MAX),
-            )?,
-            Action::ScrollPageDown => self.session.scroll(
-                -i32::try_from(self.layout.grid.lines().saturating_sub(1)).unwrap_or(i32::MAX),
-            )?,
+            Action::ScrollPageUp => {
+                self.session.scroll(
+                    i32::try_from(self.layout.grid.lines().saturating_sub(1)).unwrap_or(i32::MAX),
+                )?;
+                self.scrollbar.note_scroll(Instant::now());
+            }
+            Action::ScrollPageDown => {
+                self.session.scroll(
+                    -i32::try_from(self.layout.grid.lines().saturating_sub(1)).unwrap_or(i32::MAX),
+                )?;
+                self.scrollbar.note_scroll(Instant::now());
+            }
             Action::PastePrimary => {
                 self.request_paste(leyline_gfx::SelectionTarget::Primary)?;
             }
@@ -749,7 +802,14 @@ impl UiRuntime {
             self.last_input_serial = Some(serial);
         }
         let scale = f64::from(self.gfx.scale().0) / 120.0;
-        if !event.position.0.is_finite() || !event.position.1.is_finite() || event.position.0 < 0.0
+        if !event.position.0.is_finite() || !event.position.1.is_finite() {
+            return Ok(());
+        }
+        if event.position.0 < 0.0
+            && !matches!(
+                self.scrollbar.interaction(),
+                crate::interaction::ScrollbarInteraction::Dragging { .. }
+            )
         {
             return Ok(());
         }
@@ -763,6 +823,9 @@ impl UiRuntime {
             .layout
             .cell_at_pixel(pixel)
             .map(|[column, line]| crate::terminal::SelectionPoint { column, line });
+        if self.handle_scrollbar_pointer(&event, [f64::from(pixel[0]), f64::from(pixel[1])])? {
+            return Ok(());
+        }
         let modifiers = crate::terminal::Modifiers {
             shift: self.modifiers.shift,
             control: self.modifiers.control,
@@ -879,6 +942,7 @@ impl UiRuntime {
                     let lines = -steps * 3;
                     if modifiers.shift || !self.session.alternate_scroll(lines)? {
                         self.session.scroll(lines)?;
+                        self.scrollbar.note_scroll(Instant::now());
                     }
                 }
             }
@@ -886,6 +950,93 @@ impl UiRuntime {
             _ => {}
         }
         Ok(())
+    }
+
+    fn handle_scrollbar_pointer(
+        &mut self,
+        event: &leyline_gfx::PointerInput,
+        point: [f64; 2],
+    ) -> Result<bool, UiRuntimeError> {
+        let Some(snapshot) = self.session.latest_snapshot().cloned() else {
+            return Ok(false);
+        };
+        let Some(geometry) = ScrollbarGeometry::calculate(
+            &snapshot,
+            &self.layout,
+            &self.app.config().scrollbar,
+            self.gfx.scale().0,
+        ) else {
+            return Ok(false);
+        };
+        let now = Instant::now();
+        let previous = self.scrollbar.interaction();
+        match event.kind {
+            leyline_gfx::PointerKind::Press { button: 0x110, .. }
+                if geometry.hit.contains(point) =>
+            {
+                self.selecting = false;
+                self.selection_point = None;
+                self.drag_scroll = None;
+                self.link_candidate = None;
+                self.click_tracker.reset();
+                if let Some(offset) = self.scrollbar.press(
+                    point,
+                    geometry,
+                    snapshot.grid.lines(),
+                    snapshot.display_offset,
+                    now,
+                ) {
+                    self.session.scroll_to_display_offset(offset)?;
+                }
+                self.compose_latest()?;
+                return Ok(true);
+            }
+            leyline_gfx::PointerKind::Motion { .. } | leyline_gfx::PointerKind::Enter { .. } => {
+                if let Some(offset) = self.scrollbar.pointer_motion(point, geometry, now) {
+                    self.session.scroll_to_display_offset(offset)?;
+                }
+                if previous != self.scrollbar.interaction() {
+                    self.compose_latest()?;
+                }
+                if matches!(
+                    self.scrollbar.interaction(),
+                    crate::interaction::ScrollbarInteraction::Dragging { .. }
+                ) || geometry.hit.contains(point)
+                {
+                    return Ok(true);
+                }
+            }
+            leyline_gfx::PointerKind::Release { button: 0x110, .. }
+                if matches!(
+                    previous,
+                    crate::interaction::ScrollbarInteraction::Dragging { .. }
+                ) =>
+            {
+                self.scrollbar.release();
+                self.compose_latest()?;
+                return Ok(true);
+            }
+            leyline_gfx::PointerKind::Axis { vertical_120, .. }
+                if geometry.hit.contains(point) && vertical_120 != 0 =>
+            {
+                let steps = accumulate_wheel_steps(&mut self.wheel_remainder_120, vertical_120);
+                if steps != 0 {
+                    self.session.scroll(-steps * 3)?;
+                    self.scrollbar.note_scroll(now);
+                }
+                return Ok(true);
+            }
+            leyline_gfx::PointerKind::Leave { .. }
+                if matches!(
+                    previous,
+                    crate::interaction::ScrollbarInteraction::Dragging { .. }
+                ) =>
+            {
+                return Ok(true);
+            }
+            _ => {}
+        }
+        Ok(false)
     }
 
     fn drag_scroll_target(
@@ -939,6 +1090,7 @@ impl UiRuntime {
         self.drag_scroll = None;
         self.link_candidate = None;
         self.click_tracker.reset();
+        self.scrollbar.cancel();
     }
 
     fn copy_selection(
@@ -1265,6 +1417,38 @@ impl WakeBackend for EventWake {
         if let Err(error) = self.signal() {
             tracing::error!(category = "runtime", %error, "cannot signal UI eventfd");
         }
+    }
+}
+
+fn text_hinting(value: crate::config::HintingPreference) -> HintingPreference {
+    match value {
+        crate::config::HintingPreference::None => HintingPreference::None,
+        crate::config::HintingPreference::Slight => HintingPreference::Slight,
+        crate::config::HintingPreference::Full => HintingPreference::Full,
+        crate::config::HintingPreference::System => HintingPreference::System,
+    }
+}
+
+fn text_antialiasing(value: crate::config::AntialiasPreference) -> AntialiasPreference {
+    match value {
+        crate::config::AntialiasPreference::Grayscale => AntialiasPreference::Grayscale,
+        crate::config::AntialiasPreference::System => AntialiasPreference::System,
+    }
+}
+
+fn content_insets(config: &crate::config::EffectiveConfig) -> ContentInsets {
+    let right = if config.scrollbar.mode == crate::config::ScrollbarMode::Hidden {
+        config.window.padding_x
+    } else {
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let gutter = config.scrollbar.hit_width.ceil() as u16;
+        config.window.padding_x.max(gutter.saturating_add(2))
+    };
+    ContentInsets {
+        left: config.window.padding_x,
+        right,
+        top: config.window.padding_y,
+        bottom: config.window.padding_y,
     }
 }
 

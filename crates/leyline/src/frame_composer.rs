@@ -12,7 +12,7 @@ use leyline_text::{
 use crate::{
     clipboard::{PasteConfirmationOverlay, PasteRisk, TransferTarget},
     config::{ColorsConfig, CursorStyle},
-    interaction::PreeditOverlay,
+    interaction::{PreeditOverlay, ScrollbarPresentation},
     layout::GridLayout,
     terminal::{CellWidth, FrameSnapshot, TerminalColor},
 };
@@ -40,6 +40,7 @@ pub struct FrameOverlays<'a> {
     pub selection: &'a SelectionOverlay,
     pub preedit: Option<&'a PreeditOverlay>,
     pub paste_confirmation: Option<&'a PasteConfirmationOverlay>,
+    pub scrollbar: Option<&'a ScrollbarPresentation>,
 }
 
 /// Converts one validated terminal snapshot into a bounded graphics scene.
@@ -102,7 +103,7 @@ fn compose_active_scene(
     )?;
     let mut rectangles = Vec::new();
     let mut glyphs = Vec::new();
-    let metrics = text.metrics();
+    let metrics = layout.cell_metrics;
     if let Some(confirmation) = overlays.paste_confirmation {
         compose_paste_confirmation(
             confirmation,
@@ -219,13 +220,16 @@ fn compose_active_scene(
                 let origin = cell_origin(layout, column, line);
                 let span = if cell.width == CellWidth::Wide { 2 } else { 1 };
                 if cell.flags.underline {
+                    let underline = cell
+                        .underline_color
+                        .map_or(foreground, |color| resolve_color(color, foreground, colors));
                     rectangles.push(line_rectangle(
                         origin,
                         layout,
                         span,
                         metrics.underline_y_px,
                         metrics.underline_thickness_px.get(),
-                        foreground,
+                        underline,
                     ));
                 }
                 if cell.flags.strikeout {
@@ -333,6 +337,20 @@ fn compose_active_scene(
             size_px: [underline_width as f32, 1.0],
             color: LinearColor::from_srgba8(colors.foreground.0),
         });
+    }
+    if let Some(scrollbar) = overlays.scrollbar {
+        for (rect, color) in [
+            (scrollbar.track, scrollbar.track_color),
+            (scrollbar.thumb, scrollbar.thumb_color),
+        ] {
+            if rect.width > 0.0 && rect.height > 0.0 && color.0.to_be_bytes()[3] != 0 {
+                rectangles.push(RectangleInstance {
+                    origin_px: [rect.x as f32, rect.y as f32],
+                    size_px: [rect.width as f32, rect.height as f32],
+                    color: LinearColor::from_srgba8(color.0),
+                });
+            }
+        }
     }
     validate_glyph_working_set(&glyphs, &assets)?;
     Ok(SceneData {
@@ -690,24 +708,18 @@ const fn cursor_glyph_color(
 fn resolve_color(color: TerminalColor, default: u32, colors: &ColorsConfig) -> u32 {
     match color {
         TerminalColor::Rgb(r, g, b) => u32::from_be_bytes([r, g, b, 255]),
-        TerminalColor::Indexed(index) => indexed(index),
+        TerminalColor::Indexed(index) => indexed(index, colors),
         TerminalColor::Named(256) => colors.foreground.0,
         TerminalColor::Named(257) => colors.background.0,
         TerminalColor::Named(258) => colors.cursor.0,
-        TerminalColor::Named(index @ 0..=15) => indexed(u8::try_from(index).unwrap_or(0)),
+        TerminalColor::Named(index @ 0..=15) => colors.ansi[usize::from(index)].0,
         TerminalColor::Named(_) => default,
     }
 }
 
-fn indexed(index: u8) -> u32 {
-    #[allow(clippy::unreadable_literal)]
-    const ANSI: [u32; 16] = [
-        0x000000ff, 0xcd0000ff, 0x00cd00ff, 0xcdcd00ff, 0x0000eeff, 0xcd00cdff, 0x00cdcdff,
-        0xe5e5e5ff, 0x7f7f7fff, 0xff0000ff, 0x00ff00ff, 0xffff00ff, 0x5c5cffff, 0xff00ffff,
-        0x00ffffff, 0xffffffff,
-    ];
+fn indexed(index: u8, colors: &ColorsConfig) -> u32 {
     if index < 16 {
-        return ANSI[index as usize];
+        return colors.ansi[index as usize].0;
     }
     if index < 232 {
         let value = index - 16;
@@ -725,7 +737,24 @@ fn indexed(index: u8) -> u32 {
 
 fn dim(color: u32) -> u32 {
     let [r, g, b, a] = color.to_be_bytes();
-    u32::from_be_bytes([r / 2, g / 2, b / 2, a])
+    let dim = |byte| {
+        let srgb = f64::from(byte) / 255.0;
+        let linear = if srgb <= 0.040_45 {
+            srgb / 12.92
+        } else {
+            ((srgb + 0.055) / 1.055).powf(2.4)
+        } * 0.5;
+        let srgb = if linear <= 0.003_130_8 {
+            linear * 12.92
+        } else {
+            1.055 * linear.powf(1.0 / 2.4) - 0.055
+        };
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        {
+            (srgb * 255.0).round() as u8
+        }
+    };
+    u32::from_be_bytes([dim(r), dim(g), dim(b), a])
 }
 #[allow(clippy::cast_possible_truncation)]
 fn cell_origin(layout: &GridLayout, column: usize, line: usize) -> [u32; 2] {
@@ -786,7 +815,7 @@ pub enum ComposeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{cursor_glyph_color, validate_glyph_budget};
+    use super::{cursor_glyph_color, dim, resolve_color, validate_glyph_budget};
     use crate::config::CursorStyle;
     use leyline_text::{MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS, MAX_PREPARED_GLYPHS};
 
@@ -822,5 +851,33 @@ mod tests {
         assert!(validate_glyph_budget(0, MAX_GLYPH_BITMAPS + 1, Some(0)).is_err());
         assert!(validate_glyph_budget(0, 0, Some(MAX_GLYPH_BITMAP_BYTES + 1)).is_err());
         assert!(validate_glyph_budget(0, 0, None).is_err());
+    }
+
+    #[test]
+    fn named_and_low_index_colors_use_the_configured_palette() {
+        let mut colors = crate::config::EffectiveConfig::default().colors;
+        colors.ansi[3] = crate::config::Color(0x1234_56ff);
+        assert_eq!(
+            resolve_color(crate::terminal::TerminalColor::Named(3), 0, &colors),
+            0x1234_56ff
+        );
+        assert_eq!(
+            resolve_color(crate::terminal::TerminalColor::Indexed(3), 0, &colors),
+            0x1234_56ff
+        );
+        assert_eq!(
+            resolve_color(crate::terminal::TerminalColor::Rgb(1, 2, 3), 0, &colors),
+            0x0102_03ff
+        );
+    }
+
+    #[test]
+    fn dim_halves_linear_light_instead_of_srgb_bytes() {
+        let [value, _, _, alpha] = dim(0x8080_80ff).to_be_bytes();
+        assert_eq!(alpha, 255);
+        assert!(
+            value > 64,
+            "linear-light dimming must remain brighter than byte halving"
+        );
     }
 }

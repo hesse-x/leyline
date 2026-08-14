@@ -10,8 +10,17 @@ pub struct GridLayout {
     pub viewport_px: PixelSize,
     pub content_origin_px: [u32; 2],
     pub cell_px: [NonZeroU16; 2],
+    pub cell_metrics: CellMetrics,
     pub grid: GridSize,
     pub font_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentInsets {
+    pub left: u16,
+    pub right: u16,
+    pub top: u16,
+    pub bottom: u16,
 }
 
 impl GridLayout {
@@ -40,25 +49,44 @@ impl GridLayout {
         metrics: CellMetrics,
         font_generation: u64,
     ) -> Result<Self, LayoutError> {
+        Self::calculate_with_style(
+            logical,
+            scale,
+            ContentInsets {
+                left: padding[0],
+                right: padding[0],
+                top: padding[1],
+                bottom: padding[1],
+            },
+            metrics,
+            0.0,
+            font_generation,
+        )
+    }
+
+    /// Calculates layout with asymmetric chrome insets and logical line spacing.
+    ///
+    /// # Errors
+    /// Returns [`LayoutError::Overflow`] for invalid spacing, scale, or metric overflow.
+    #[allow(clippy::similar_names)]
+    pub fn calculate_with_style(
+        logical: LogicalSize,
+        scale: Scale120,
+        insets: ContentInsets,
+        metrics: CellMetrics,
+        line_spacing: f64,
+        font_generation: u64,
+    ) -> Result<Self, LayoutError> {
+        let metrics = metrics_with_line_spacing(metrics, line_spacing, scale)?;
         let viewport_px = scale.pixels(logical).map_err(|_| LayoutError::Overflow)?;
-        let padding_px = scale
-            .pixels(LogicalSize {
-                width: u32::from(padding[0]).max(1),
-                height: u32::from(padding[1]).max(1),
-            })
-            .map_err(|_| LayoutError::Overflow)?;
-        let padding_x = if padding[0] == 0 { 0 } else { padding_px.width };
-        let padding_y = if padding[1] == 0 {
-            0
-        } else {
-            padding_px.height
-        };
-        let available_width = viewport_px
-            .width
-            .saturating_sub(padding_x.saturating_mul(2));
+        let left = scale_inset(insets.left, scale)?;
+        let right = scale_inset(insets.right, scale)?;
+        let top = scale_inset(insets.top, scale)?;
+        let bottom = scale_inset(insets.bottom, scale)?;
+        let available_width = viewport_px.width.saturating_sub(left.saturating_add(right));
         let available_height = viewport_px
             .height
-            .saturating_sub(padding_y.saturating_mul(2));
+            .saturating_sub(top.saturating_add(bottom));
         let columns = (available_width / u32::from(metrics.width_px.get()))
             .clamp(1, u32::from(GridSize::MAX_COLUMNS));
         let lines = (available_height / u32::from(metrics.height_px.get()))
@@ -73,14 +101,60 @@ impl GridLayout {
         Ok(Self {
             viewport_px,
             content_origin_px: [
-                padding_x + available_width.saturating_sub(used_width) / 2,
-                padding_y + available_height.saturating_sub(used_height) / 2,
+                left + available_width.saturating_sub(used_width) / 2,
+                top + available_height.saturating_sub(used_height) / 2,
             ],
             cell_px: [metrics.width_px, metrics.height_px],
+            cell_metrics: metrics,
             grid,
             font_generation,
         })
     }
+}
+
+fn scale_inset(value: u16, scale: Scale120) -> Result<u32, LayoutError> {
+    if value == 0 {
+        return Ok(0);
+    }
+    scale
+        .pixels(LogicalSize {
+            width: u32::from(value),
+            height: 1,
+        })
+        .map(|size| size.width)
+        .map_err(|_| LayoutError::Overflow)
+}
+
+fn metrics_with_line_spacing(
+    metrics: CellMetrics,
+    logical_spacing: f64,
+    scale: Scale120,
+) -> Result<CellMetrics, LayoutError> {
+    if !logical_spacing.is_finite() || !(0.0..=8.0).contains(&logical_spacing) {
+        return Err(LayoutError::Overflow);
+    }
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let spacing = (logical_spacing * f64::from(scale.0) / 120.0).round() as u16;
+    let top = spacing / 2;
+    let height = metrics
+        .height_px
+        .get()
+        .checked_add(spacing)
+        .ok_or(LayoutError::Overflow)?;
+    let shift = i16::try_from(top).map_err(|_| LayoutError::Overflow)?;
+    let max_y = i16::try_from(height.saturating_sub(1)).map_err(|_| LayoutError::Overflow)?;
+    Ok(CellMetrics {
+        width_px: metrics.width_px,
+        height_px: NonZeroU16::new(height).ok_or(LayoutError::Overflow)?,
+        baseline_px: metrics
+            .baseline_px
+            .checked_add(shift)
+            .ok_or(LayoutError::Overflow)?,
+        underline_y_px: metrics.underline_y_px.saturating_add(shift).clamp(0, max_y),
+        underline_thickness_px: metrics.underline_thickness_px,
+        strike_y_px: metrics.strike_y_px.saturating_add(shift).clamp(0, max_y),
+        strike_thickness_px: metrics.strike_thickness_px,
+    })
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -181,5 +255,29 @@ mod tests {
         let right =
             origin[0] + u32::from(layout.grid.columns.get()) * u32::from(layout.cell_px[0].get());
         assert_eq!(layout.cell_at_pixel([right, origin[1]]), None);
+    }
+
+    #[test]
+    fn line_spacing_is_scaled_once_and_moves_the_baseline_by_the_top_half() {
+        let layout = GridLayout::calculate_with_style(
+            LogicalSize {
+                width: 800,
+                height: 500,
+            },
+            Scale120(180),
+            ContentInsets {
+                left: 8,
+                right: 20,
+                top: 8,
+                bottom: 8,
+            },
+            metrics(),
+            1.0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(layout.cell_px[1].get(), 20);
+        assert_eq!(layout.cell_metrics.baseline_px, 15);
+        assert!(layout.content_origin_px[0] >= 12);
     }
 }

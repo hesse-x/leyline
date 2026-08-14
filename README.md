@@ -60,16 +60,25 @@ with a field-specific diagnostic. Example:
 ```toml
 [font]
 family = "monospace"
-size = 11.0
+size = 13.0
 ligatures = false
+hinting = "slight"         # none | slight | full | system
+antialiasing = "grayscale" # grayscale | system (LCD safely falls back today)
+line_spacing = 1.0          # logical pixels, 0.0..=8.0
 
 [colors]
-foreground = "#dce7f3"
+foreground = "#d8dcd8"
 # The final byte controls opacity; the compositor shows the desktop behind the window.
-background = "#101522dc"
-cursor = "#8bd5ff"
-selection_foreground = "#f6f9ff"
-selection_background = "#526ab8cc"
+background = "#2e3436e6"
+cursor = "#d8dcd8"
+selection_foreground = "#f4f6f4"
+selection_background = "#58656dcc"
+ansi = [
+  "#2e3436", "#cc6666", "#6fa66f", "#c8a85f",
+  "#5f87af", "#a27aa8", "#5f9ea0", "#d3d7cf",
+  "#6c7375", "#e07a7a", "#87bd87", "#d8bd73",
+  "#7aa2c8", "#b58abb", "#72b2b4", "#eeeeec",
+]
 
 [window]
 padding_x = 12
@@ -77,6 +86,15 @@ padding_y = 10
 
 [scrolling]
 history_lines = 10000
+
+[scrollbar]
+mode = "auto"              # auto | always | hidden
+width = 4.0
+hit_width = 12.0
+min_thumb_size = 24.0
+thumb = "#9aa2a680"
+thumb_hover = "#c1c7caff"
+track = "#00000000"
 
 [cursor]
 style = "block"
@@ -94,14 +112,22 @@ action = "ScrollPageUp"
 Selecting text publishes the primary selection; paste it with the middle mouse button or
 `Shift+Insert`.
 
+[`config/reference.toml`](config/reference.toml) fixes the Ubuntu Sans Mono 13 opaque screenshot
+baseline. [`config/legacy.toml`](config/legacy.toml) restores the previous font metrics, palette,
+background alpha, and gutter-free layout without relying on an implicit runtime preset.
+
 When paste confirmation is enabled, multiline or control-character clipboard content opens a
 modal warning that shows only its source, size, line count, and risk category. Press `Enter` or
 `Y` to paste; press `Escape` or `N` to reject. Any other key cancels the modal and is consumed.
 Losing keyboard focus, replacing the primary-selection offer, requesting another paste, or closing
 the session also cancels the pending paste.
 
-Unknown configuration fields produce warnings. Colors must be `#RRGGBB` or `#RRGGBBAA`; font size,
-padding, and scrollback are bounded to prevent accidental resource exhaustion.
+Unknown configuration fields produce warnings. General colors accept `#RRGGBB` or `#RRGGBBAA`;
+the ANSI palette must contain exactly 16 opaque `#RRGGBB` entries. Font size, line spacing,
+scrollbar geometry, padding, and scrollback are bounded to prevent accidental resource exhaustion.
+`auto` and `always` reserve the same right-side gutter, so thumb visibility never resizes the PTY;
+`hidden` removes the gutter. Gutter clicks, drags, and wheel events are consumed by window chrome and
+are never encoded as terminal mouse reports.
 
 `behavior.hold_after_exit = false` closes the window only after both the child status and PTY EOF
 have been observed, so trailing output is parsed first. Setting it to `true` retains the final
@@ -111,8 +137,12 @@ after a short grace period, so an uncooperative child cannot indefinitely block 
 
 ## Current limitations
 
-Text rendering uses system Fontconfig fallback, grayscale FreeType coverage, and a four-page
-`2048x2048 R8_UNORM` atlas. Color emoji are not supported; an outline fallback is used when one is
+Text rendering uses matched Fontconfig properties, configurable FreeType hinting, grayscale
+coverage, physical-pixel placement, nearest sampling, and a four-page `2048x2048 R8_UNORM` atlas.
+Startup logging reports the requested and resolved face, raster profile, scale, metrics, and atlas
+filter. LCD subpixel rendering remains disabled: `antialiasing = "system"` records a diagnostic and
+uses grayscale when the system requests RGB/BGR, since transparent or output-ambiguous Wayland
+surfaces cannot safely use subpixel coverage. Color emoji are not supported; an outline fallback is used when one is
 available. Ligatures are disabled by default and always remain constrained to terminal cell spans.
 Strong RTL runs are shaped, but v0.1 does not perform full Unicode bidi visual reordering: cursor
 and selection coordinates remain in logical cell order.

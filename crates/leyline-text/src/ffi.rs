@@ -12,9 +12,10 @@ use freetype_sys as ft;
 use harfbuzz_sys as hb;
 
 use crate::{
-    CacheStats, CellMetrics, FaceId, FontRequest, FontStyle, GlyphAsset, GlyphBitmap, GlyphKey,
-    MAX_FACES, MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS, MAX_PREPARED_GLYPHS, ShapedCluster,
-    ShapedGlyph, ShapedRun, TextError,
+    AntialiasMode, AntialiasPreference, CacheStats, CellMetrics, FaceId, FontRequest, FontStyle,
+    GlyphAsset, GlyphBitmap, GlyphFormat, GlyphKey, HintingMode, HintingPreference, MAX_FACES,
+    MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS, MAX_PREPARED_GLYPHS, RasterProfile, ResolvedFace,
+    ShapedCluster, ShapedGlyph, ShapedRun, TextError,
 };
 
 struct CachedGlyph {
@@ -105,6 +106,8 @@ pub struct TextSystem {
     request: FontRequest,
     generation: u64,
     metrics: CellMetrics,
+    raster_profile: RasterProfile,
+    resolved_primary: Option<ResolvedFace>,
 }
 
 /// Fully initialized font resources which can be committed without further native work.
@@ -147,6 +150,7 @@ impl TextSystem {
         generation: u64,
     ) -> Result<Self, TextError> {
         let library = initialize_freetype()?;
+        let raster_profile = requested_profile(&request);
         let mut system = Self {
             faces: Vec::new(),
             face_lookup: HashMap::new(),
@@ -160,6 +164,8 @@ impl TextSystem {
             request,
             generation,
             metrics: placeholder_metrics(),
+            raster_profile,
+            resolved_primary: None,
         };
         let primary = system.resolve_face(None, FontStyle::Regular)?;
         system.metrics = metrics(system.face(primary)?.raw)?;
@@ -174,6 +180,16 @@ impl TextSystem {
     #[must_use]
     pub const fn metrics(&self) -> CellMetrics {
         self.metrics
+    }
+
+    #[must_use]
+    pub const fn raster_profile(&self) -> RasterProfile {
+        self.raster_profile
+    }
+
+    #[must_use]
+    pub fn resolved_primary(&self) -> Option<&ResolvedFace> {
+        self.resolved_primary.as_ref()
     }
 
     #[must_use]
@@ -413,6 +429,7 @@ impl TextSystem {
         Ok(assets)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn rasterize(&mut self, key: GlyphKey) -> Result<GlyphBitmap, TextError> {
         self.cache_clock = self.cache_clock.saturating_add(1);
         if let Some(cached) = self.glyph_cache.get_mut(&key) {
@@ -424,7 +441,11 @@ impl TextSystem {
             return Ok(bitmap);
         }
         let face = self.face(key.face)?.raw;
-        let load = ft::FT_LOAD_DEFAULT | ft::FT_LOAD_TARGET_NORMAL;
+        let load = match self.raster_profile.hinting {
+            HintingMode::None => ft::FT_LOAD_NO_HINTING | ft::FT_LOAD_NO_AUTOHINT,
+            HintingMode::Slight => ft::FT_LOAD_DEFAULT | ft::FT_LOAD_TARGET_LIGHT,
+            HintingMode::Full => ft::FT_LOAD_DEFAULT | ft::FT_LOAD_TARGET_NORMAL,
+        };
         // SAFETY: face is UI-thread-owned and glyph slot data is copied before the next call.
         if unsafe { ft::FT_Load_Glyph(face, key.glyph_id, load) } != 0 {
             return Err(TextError::FontData(format!(
@@ -486,6 +507,7 @@ impl TextSystem {
                 .copy_from_slice(&source[source_row * pitch..source_row * pitch + width]);
         }
         let bitmap = GlyphBitmap {
+            format: GlyphFormat::Gray8,
             size_px: [
                 u16::try_from(width).map_err(|_| TextError::CapacityExceeded("glyph width"))?,
                 u16::try_from(rows).map_err(|_| TextError::CapacityExceeded("glyph height"))?,
@@ -561,7 +583,18 @@ impl TextSystem {
         {
             return Ok(face.id);
         }
-        let (path, index) = font_match(self.fontconfig.0, &self.request, cluster, style)?;
+        let matched = font_match(self.fontconfig.0, &self.request, cluster, style)?;
+        if self.faces.is_empty() {
+            self.raster_profile = matched.profile;
+            self.resolved_primary = Some(ResolvedFace {
+                path: Arc::clone(&matched.path),
+                index: matched.index,
+                family: Arc::clone(&matched.family),
+                style,
+            });
+        }
+        let path = matched.path;
+        let index = matched.index;
         if let Some(id) = self.face_lookup.get(&(path.clone(), index)) {
             return Ok(*id);
         }
@@ -688,12 +721,13 @@ fn initialize_fontconfig() -> Result<&'static fc::Fc, TextError> {
         .map_err(|error| TextError::Environment(error.clone()))
 }
 
+#[allow(clippy::too_many_lines)]
 fn font_match(
     fc: &'static fc::Fc,
     request: &FontRequest,
     cluster: Option<&str>,
     style: FontStyle,
-) -> Result<(Arc<str>, u32), TextError> {
+) -> Result<FontMatch, TextError> {
     let family = CString::new(request.family.as_bytes())
         .map_err(|_| TextError::InvalidRequest("font family contains NUL"))?;
     let pattern = unsafe { (fc.FcPatternCreate)() };
@@ -789,7 +823,106 @@ fn font_match(
     }
     let index =
         u32::try_from(index).map_err(|_| TextError::FontData("negative face index".into()))?;
-    Ok((Arc::from(path), index))
+    let family = pattern_string(fc, matched.1, fc::constants::FC_FAMILY)
+        .unwrap_or_else(|| request.family.to_string());
+    let profile = matched_profile(fc, matched.1, request);
+    Ok(FontMatch {
+        path: Arc::from(path),
+        index,
+        family: Arc::from(family),
+        profile,
+    })
+}
+
+struct FontMatch {
+    path: Arc<str>,
+    index: u32,
+    family: Arc<str>,
+    profile: RasterProfile,
+}
+
+fn requested_profile(request: &FontRequest) -> RasterProfile {
+    RasterProfile {
+        hinting: match request.hinting {
+            HintingPreference::None => HintingMode::None,
+            HintingPreference::Full => HintingMode::Full,
+            HintingPreference::Slight | HintingPreference::System => HintingMode::Slight,
+        },
+        antialias: AntialiasMode::Gray,
+    }
+}
+
+fn matched_profile(
+    fc: &'static fc::Fc,
+    pattern: *mut fc::FcPattern,
+    request: &FontRequest,
+) -> RasterProfile {
+    let mut profile = requested_profile(request);
+    if request.hinting == HintingPreference::System {
+        let enabled = pattern_bool(fc, pattern, fc::constants::FC_HINTING).unwrap_or(true);
+        profile.hinting = if enabled {
+            match pattern_integer(fc, pattern, fc::constants::FC_HINT_STYLE) {
+                Some(fc::constants::FC_HINT_NONE) => HintingMode::None,
+                Some(fc::constants::FC_HINT_FULL | fc::constants::FC_HINT_MEDIUM) => {
+                    HintingMode::Full
+                }
+                _ => HintingMode::Slight,
+            }
+        } else {
+            HintingMode::None
+        };
+    }
+    if request.antialiasing == AntialiasPreference::System
+        && !pattern_bool(fc, pattern, fc::constants::FC_ANTIALIAS).unwrap_or(true)
+    {
+        tracing::warn!(
+            category = "text_profile",
+            reason = "system-antialias-disabled-overridden",
+            "monochrome rendering is unsupported; using grayscale antialiasing"
+        );
+    }
+    if request.antialiasing == AntialiasPreference::System
+        && matches!(
+            pattern_integer(fc, pattern, fc::constants::FC_RGBA),
+            Some(fc::constants::FC_RGBA_RGB | fc::constants::FC_RGBA_BGR)
+        )
+    {
+        tracing::info!(
+            category = "text_profile",
+            reason = "lcd-not-enabled-grayscale-fallback",
+            "Fontconfig prefers subpixel antialiasing; using the safe grayscale path"
+        );
+    }
+    profile
+}
+
+fn pattern_integer(fc: &'static fc::Fc, pattern: *mut fc::FcPattern, key: &CStr) -> Option<c_int> {
+    let mut value = 0;
+    (unsafe { (fc.FcPatternGetInteger)(pattern, key.as_ptr(), 0, &raw mut value) }
+        == fc::FcResultMatch)
+        .then_some(value)
+}
+
+fn pattern_bool(fc: &'static fc::Fc, pattern: *mut fc::FcPattern, key: &CStr) -> Option<bool> {
+    let mut value = 0;
+    (unsafe { (fc.FcPatternGetBool)(pattern, key.as_ptr(), 0, &raw mut value) }
+        == fc::FcResultMatch)
+        .then_some(value != 0)
+}
+
+fn pattern_string(fc: &'static fc::Fc, pattern: *mut fc::FcPattern, key: &CStr) -> Option<String> {
+    let mut value = ptr::null_mut();
+    if unsafe { (fc.FcPatternGetString)(pattern, key.as_ptr(), 0, &raw mut value) }
+        != fc::FcResultMatch
+        || value.is_null()
+    {
+        return None;
+    }
+    Some(
+        unsafe { CStr::from_ptr(value.cast()) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn metrics(face: ft::FT_Face) -> Result<CellMetrics, TextError> {
@@ -890,6 +1023,7 @@ mod tests {
             synthetic_italic: false,
         };
         let bitmap = GlyphBitmap {
+            format: GlyphFormat::Gray8,
             size_px: [0, 0],
             bearing_px: [0, 0],
             advance_26_6: 0,

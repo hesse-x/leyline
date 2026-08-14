@@ -1,0 +1,30 @@
+# Restores the pre-UI-plan text, color, transparency, and no-gutter behavior.
+[font]
+family = "monospace"
+size = 11.0
+ligatures = false
+hinting = "full"
+antialiasing = "grayscale"
+line_spacing = 0.0
+
+[colors]
+foreground = "#dce7f3"
+background = "#101522dc"
+cursor = "#8bd5ff"
+selection_foreground = "#f6f9ff"
+selection_background = "#526ab8cc"
+ansi = [
+  "#000000", "#cd0000", "#00cd00", "#cdcd00",
+  "#0000ee", "#cd00cd", "#00cdcd", "#e5e5e5",
+  "#7f7f7f", "#ff0000", "#00ff00", "#ffff00",
+  "#5c5cff", "#ff00ff", "#00ffff", "#ffffff",
+]
+
+[scrollbar]
+mode = "hidden"
+width = 4.0
+hit_width = 12.0
+min_thumb_size = 24.0
+thumb = "#9aa2a680"
+thumb_hover = "#c1c7caff"
+track = "#00000000"

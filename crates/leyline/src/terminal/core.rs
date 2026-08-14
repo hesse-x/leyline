@@ -242,6 +242,7 @@ impl TerminalCoreAdapter {
             },
             modes: map_modes(mode),
             display_offset: content.display_offset,
+            history_size: self.term.history_size(),
             title: self.title.clone(),
             hyperlinks: links.into(),
         };
@@ -328,6 +329,20 @@ impl TerminalCoreAdapter {
             .ok_or(TerminalError::GenerationOverflow)?;
         self.cached.get_mut().take();
         Ok(())
+    }
+
+    pub fn scroll_to_display_offset(&mut self, offset: usize) -> Result<(), TerminalError> {
+        let target = offset.min(self.term.history_size());
+        let current = self.term.grid().display_offset();
+        if target == current {
+            return Ok(());
+        }
+        let delta = i64::try_from(target)
+            .ok()
+            .and_then(|target| i64::try_from(current).ok().map(|current| target - current))
+            .and_then(|delta| i32::try_from(delta).ok())
+            .ok_or(TerminalError::GenerationOverflow)?;
+        self.scroll_display(delta)
     }
 
     pub fn scroll_to_bottom(&mut self) -> Result<(), TerminalError> {
@@ -692,6 +707,18 @@ mod tests {
         core.scroll_display(1).unwrap();
         assert_eq!(core.snapshot().unwrap().display_offset, 1);
         core.scroll_to_bottom().unwrap();
+        assert_eq!(core.snapshot().unwrap().display_offset, 0);
+    }
+
+    #[test]
+    fn absolute_scrollback_offset_is_clamped_to_the_frozen_history_size() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 2).unwrap(), 10).unwrap();
+        core.advance(b"one\r\ntwo\r\nthree\r\nfour").unwrap();
+        let history = core.snapshot().unwrap().history_size;
+        assert!(history > 0);
+        core.scroll_to_display_offset(usize::MAX).unwrap();
+        assert_eq!(core.snapshot().unwrap().display_offset, history);
+        core.scroll_to_display_offset(0).unwrap();
         assert_eq!(core.snapshot().unwrap().display_offset, 0);
     }
 

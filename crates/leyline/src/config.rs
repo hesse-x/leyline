@@ -18,6 +18,7 @@ pub struct EffectiveConfig {
     pub colors: ColorsConfig,
     pub window: WindowConfig,
     pub scrolling: ScrollingConfig,
+    pub scrollbar: ScrollbarConfig,
     pub cursor: CursorConfig,
     pub behavior: BehaviorConfig,
     pub keybindings: Vec<KeyBinding>,
@@ -28,6 +29,23 @@ pub struct FontConfig {
     pub family: String,
     pub size: f64,
     pub ligatures: bool,
+    pub hinting: HintingPreference,
+    pub antialiasing: AntialiasPreference,
+    pub line_spacing: f64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HintingPreference {
+    None,
+    Slight,
+    Full,
+    System,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AntialiasPreference {
+    Grayscale,
+    System,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -40,6 +58,7 @@ pub struct ColorsConfig {
     pub cursor: Color,
     pub selection_foreground: Color,
     pub selection_background: Color,
+    pub ansi: [Color; 16],
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +71,43 @@ pub struct WindowConfig {
 pub struct ScrollingConfig {
     pub history_lines: u32,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ScrollbarMode {
+    Auto,
+    Always,
+    Hidden,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ScrollbarConfig {
+    pub mode: ScrollbarMode,
+    pub width: f64,
+    pub hit_width: f64,
+    pub min_thumb_size: f64,
+    pub thumb: Color,
+    pub thumb_hover: Color,
+    pub track: Color,
+}
+
+pub const DEFAULT_ANSI_PALETTE: [Color; 16] = [
+    Color(0x2e34_36ff),
+    Color(0xcc66_66ff),
+    Color(0x6fa6_6fff),
+    Color(0xc8a8_5fff),
+    Color(0x5f87_afff),
+    Color(0xa27a_a8ff),
+    Color(0x5f9e_a0ff),
+    Color(0xd3d7_cfff),
+    Color(0x6c73_75ff),
+    Color(0xe07a_7aff),
+    Color(0x87bd_87ff),
+    Color(0xd8bd_73ff),
+    Color(0x7aa2_c8ff),
+    Color(0xb58a_bbff),
+    Color(0x72b2_b4ff),
+    Color(0xeeee_ecff),
+];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CursorStyle {
@@ -101,15 +157,19 @@ impl Default for EffectiveConfig {
         Self {
             font: FontConfig {
                 family: "monospace".into(),
-                size: 11.0,
+                size: 13.0,
                 ligatures: false,
+                hinting: HintingPreference::Slight,
+                antialiasing: AntialiasPreference::Grayscale,
+                line_spacing: 1.0,
             },
             colors: ColorsConfig {
-                foreground: Color(0xdce7_f3ff),
-                background: Color(0x1015_22dc),
-                cursor: Color(0x8bd5_ffff),
-                selection_foreground: Color(0xf6f9_ffff),
-                selection_background: Color(0x526a_b8cc),
+                foreground: Color(0xd8dc_d8ff),
+                background: Color(0x2e34_36e6),
+                cursor: Color(0xd8dc_d8ff),
+                selection_foreground: Color(0xf4f6_f4ff),
+                selection_background: Color(0x5865_6dcc),
+                ansi: DEFAULT_ANSI_PALETTE,
             },
             window: WindowConfig {
                 padding_x: 12,
@@ -117,6 +177,15 @@ impl Default for EffectiveConfig {
             },
             scrolling: ScrollingConfig {
                 history_lines: 10_000,
+            },
+            scrollbar: ScrollbarConfig {
+                mode: ScrollbarMode::Auto,
+                width: 4.0,
+                hit_width: 12.0,
+                min_thumb_size: 24.0,
+                thumb: Color(0x9aa2_a680),
+                thumb_hover: Color(0xc1c7_caff),
+                track: Color(0x0000_0000),
             },
             cursor: CursorConfig {
                 style: CursorStyle::Block,
@@ -351,6 +420,7 @@ struct RawConfig {
     colors: RawColors,
     window: RawWindow,
     scrolling: RawScrolling,
+    scrollbar: RawScrollbar,
     cursor: RawCursor,
     behavior: RawBehavior,
     keybindings: Option<Vec<RawKeyBinding>>,
@@ -364,6 +434,9 @@ struct RawFont {
     family: Option<String>,
     size: Option<f64>,
     ligatures: Option<bool>,
+    hinting: Option<String>,
+    antialiasing: Option<String>,
+    line_spacing: Option<f64>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -375,6 +448,7 @@ struct RawColors {
     cursor: Option<String>,
     selection_foreground: Option<String>,
     selection_background: Option<String>,
+    ansi: Option<Vec<String>>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -390,6 +464,19 @@ struct RawWindow {
 #[serde(default)]
 struct RawScrolling {
     history_lines: Option<i64>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawScrollbar {
+    mode: Option<String>,
+    width: Option<f64>,
+    hit_width: Option<f64>,
+    min_thumb_size: Option<f64>,
+    thumb: Option<String>,
+    thumb_hover: Option<String>,
+    track: Option<String>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -432,7 +519,14 @@ impl RawConfig {
             source,
             "font",
             &self.font.unknown,
-            &["family", "size", "ligatures"],
+            &[
+                "family",
+                "size",
+                "ligatures",
+                "hinting",
+                "antialiasing",
+                "line_spacing",
+            ],
         );
         collect_unknown(
             &mut warnings,
@@ -445,6 +539,7 @@ impl RawConfig {
                 "cursor",
                 "selection_foreground",
                 "selection_background",
+                "ansi",
             ],
         );
         collect_unknown(
@@ -453,6 +548,21 @@ impl RawConfig {
             "window",
             &self.window.unknown,
             &["padding_x", "padding_y"],
+        );
+        collect_unknown(
+            &mut warnings,
+            source,
+            "scrollbar",
+            &self.scrollbar.unknown,
+            &[
+                "mode",
+                "width",
+                "hit_width",
+                "min_thumb_size",
+                "thumb",
+                "thumb_hover",
+                "track",
+            ],
         );
         collect_unknown(
             &mut warnings,
@@ -488,12 +598,67 @@ impl RawConfig {
         if let Some(value) = self.font.ligatures {
             result.font.ligatures = value;
         }
+        if let Some(value) = self.font.hinting {
+            result.font.hinting = match value.as_str() {
+                "none" => HintingPreference::None,
+                "slight" => HintingPreference::Slight,
+                "full" => HintingPreference::Full,
+                "system" => HintingPreference::System,
+                _ => {
+                    return semantic(
+                        path,
+                        "font.hinting",
+                        format!(
+                            "{} is not one of none, slight, full, system",
+                            escape_diagnostic(&value)
+                        ),
+                    );
+                }
+            };
+        }
+        if let Some(value) = self.font.antialiasing {
+            result.font.antialiasing = match value.as_str() {
+                "grayscale" => AntialiasPreference::Grayscale,
+                "system" => AntialiasPreference::System,
+                _ => {
+                    return semantic(
+                        path,
+                        "font.antialiasing",
+                        format!(
+                            "{} is not one of grayscale, system",
+                            escape_diagnostic(&value)
+                        ),
+                    );
+                }
+            };
+        }
+        if let Some(value) = self.font.line_spacing {
+            validate_float(path, "font.line_spacing", value, 0.0, 8.0)?;
+            result.font.line_spacing = value;
+        }
         set_color(
             path,
             "colors.foreground",
             self.colors.foreground,
             &mut result.colors.foreground,
         )?;
+        if let Some(values) = self.colors.ansi {
+            if values.len() != 16 {
+                return semantic(
+                    path,
+                    "colors.ansi",
+                    format!("must contain exactly 16 colors, got {}", values.len()),
+                );
+            }
+            for (index, raw) in values.into_iter().enumerate() {
+                let color = parse_opaque_color(&raw).ok_or_else(|| ConfigError::Semantic {
+                    path: path.into(),
+                    field: format!("colors.ansi[{index}]"),
+                    reason: format!("{} must be #RRGGBB", escape_diagnostic(&raw)),
+                })?;
+                result.colors.ansi[index] = color;
+            }
+        }
         set_color(
             path,
             "colors.background",
@@ -525,6 +690,72 @@ impl RawConfig {
             0,
             256,
             &mut result.window.padding_x,
+        )?;
+        if let Some(value) = self.scrollbar.mode {
+            result.scrollbar.mode = match value.as_str() {
+                "auto" => ScrollbarMode::Auto,
+                "always" => ScrollbarMode::Always,
+                "hidden" => ScrollbarMode::Hidden,
+                _ => {
+                    return semantic(
+                        path,
+                        "scrollbar.mode",
+                        format!(
+                            "{} is not one of auto, always, hidden",
+                            escape_diagnostic(&value)
+                        ),
+                    );
+                }
+            };
+        }
+        set_float(
+            path,
+            "scrollbar.width",
+            self.scrollbar.width,
+            2.0,
+            32.0,
+            &mut result.scrollbar.width,
+        )?;
+        set_float(
+            path,
+            "scrollbar.hit_width",
+            self.scrollbar.hit_width,
+            2.0,
+            32.0,
+            &mut result.scrollbar.hit_width,
+        )?;
+        set_float(
+            path,
+            "scrollbar.min_thumb_size",
+            self.scrollbar.min_thumb_size,
+            2.0,
+            32.0,
+            &mut result.scrollbar.min_thumb_size,
+        )?;
+        if result.scrollbar.hit_width < result.scrollbar.width {
+            return semantic(
+                path,
+                "scrollbar.hit_width",
+                "must be greater than or equal to scrollbar.width".into(),
+            );
+        }
+        set_color(
+            path,
+            "scrollbar.thumb",
+            self.scrollbar.thumb,
+            &mut result.scrollbar.thumb,
+        )?;
+        set_color(
+            path,
+            "scrollbar.thumb_hover",
+            self.scrollbar.thumb_hover,
+            &mut result.scrollbar.thumb_hover,
+        )?;
+        set_color(
+            path,
+            "scrollbar.track",
+            self.scrollbar.track,
+            &mut result.scrollbar.track,
         )?;
         set_bounded(
             path,
@@ -603,6 +834,7 @@ const TOP_FIELDS: &[&str] = &[
     "colors",
     "window",
     "scrolling",
+    "scrollbar",
     "cursor",
     "behavior",
     "keybindings",
@@ -687,6 +919,38 @@ fn parse_color(raw: &str) -> Option<Color> {
         value = (value << 8) | 0xff;
     }
     Some(Color(value))
+}
+
+fn parse_opaque_color(raw: &str) -> Option<Color> {
+    (raw.len() == 7).then(|| parse_color(raw)).flatten()
+}
+
+fn validate_float(
+    path: &Path,
+    field: &str,
+    value: f64,
+    min: f64,
+    max: f64,
+) -> Result<(), ConfigError> {
+    if !value.is_finite() || !(min..=max).contains(&value) {
+        return semantic(path, field, format!("{value:?} is outside {min}..={max}"));
+    }
+    Ok(())
+}
+
+fn set_float(
+    path: &Path,
+    field: &str,
+    raw: Option<f64>,
+    min: f64,
+    max: f64,
+    target: &mut f64,
+) -> Result<(), ConfigError> {
+    if let Some(value) = raw {
+        validate_float(path, field, value, min, max)?;
+        *target = value;
+    }
+    Ok(())
 }
 
 fn set_bounded<T>(
@@ -858,17 +1122,58 @@ mod tests {
 
     #[test]
     fn validates_and_merges_configuration() {
-        let raw: RawConfig = toml::from_str("[font]\nsize=72\n[colors]\nforeground=\"#01020304\"\n[window]\npadding_x=0\n[[keybindings]]\nkey=\"PageUp\"\nmods=[\"Shift\"]\naction=\"ScrollPageUp\"\n").expect("raw config");
+        let ansi = (0..16)
+            .map(|index| format!("\"#{index:02x}{index:02x}{index:02x}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let source = format!(
+            "[font]\nsize=72\nhinting=\"full\"\nantialiasing=\"system\"\nline_spacing=2.5\n[colors]\nforeground=\"#01020304\"\nansi=[{ansi}]\n[scrollbar]\nmode=\"always\"\nwidth=5\nhit_width=14\nmin_thumb_size=20\n[window]\npadding_x=0\n[[keybindings]]\nkey=\"PageUp\"\nmods=[\"Shift\"]\naction=\"ScrollPageUp\"\n"
+        );
+        let raw: RawConfig = toml::from_str(&source).expect("raw config");
         let (effective, warnings) = raw
             .into_effective(Path::new("config.toml"), "")
             .expect("effective config");
         assert!((effective.font.size - 72.0).abs() < f64::EPSILON);
         assert_eq!(effective.colors.foreground, Color(0x0102_0304));
         assert_eq!(effective.window.padding_x, 0);
+        assert_eq!(effective.font.hinting, HintingPreference::Full);
+        assert_eq!(effective.font.antialiasing, AntialiasPreference::System);
+        assert!((effective.font.line_spacing - 2.5).abs() < f64::EPSILON);
+        assert_eq!(effective.colors.ansi[15], Color(0x0f0f_0fff));
+        assert_eq!(effective.scrollbar.mode, ScrollbarMode::Always);
         assert!(effective.keybindings.iter().any(|binding| binding.chord.key
             == crate::input::shortcut::LogicalKeyPattern::PageUp
             && binding.action == Action::ScrollPageUp));
         assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn rejects_transparent_or_wrong_length_ansi_palettes_and_narrow_hit_targets() {
+        for source in [
+            "[colors]\nansi=[\"#01020304\"]\n",
+            "[colors]\nansi=[\"#010203\"]\n",
+            "[scrollbar]\nwidth=12\nhit_width=4\n",
+        ] {
+            let raw: RawConfig = toml::from_str(source).unwrap();
+            assert!(
+                raw.into_effective(Path::new("config.toml"), source)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn shipped_reference_and_legacy_profiles_validate() {
+        for source in [
+            include_str!("../../../config/reference.toml"),
+            include_str!("../../../config/legacy.toml"),
+        ] {
+            let raw: RawConfig = toml::from_str(source).unwrap();
+            let (_, warnings) = raw
+                .into_effective(Path::new("profile.toml"), source)
+                .unwrap();
+            assert!(warnings.is_empty());
+        }
     }
 
     #[test]

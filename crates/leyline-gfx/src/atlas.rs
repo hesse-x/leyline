@@ -88,6 +88,7 @@ impl AtlasManager {
         let mut next = self.clone();
         let mut uploads = Vec::new();
         for asset in assets {
+            validate_bitmap(asset)?;
             if asset.bitmap.size_px == [0, 0] || next.entries.contains_key(&asset.key) {
                 continue;
             }
@@ -118,6 +119,7 @@ impl AtlasManager {
         next.repacks = self.repacks.saturating_add(1);
         let mut uploads = Vec::new();
         for asset in assets {
+            validate_bitmap(asset)?;
             if asset.bitmap.size_px == [0, 0] || next.entries.contains_key(&asset.key) {
                 continue;
             }
@@ -178,6 +180,19 @@ impl AtlasManager {
             self.pages.push(ShelfPage::default());
         }
     }
+}
+
+fn validate_bitmap(asset: &GlyphAsset) -> Result<(), AtlasError> {
+    if asset.bitmap.format != leyline_text::GlyphFormat::Gray8 {
+        return Err(AtlasError::UnsupportedFormat);
+    }
+    let expected = usize::from(asset.bitmap.size_px[0])
+        .checked_mul(usize::from(asset.bitmap.size_px[1]))
+        .ok_or(AtlasError::Overflow)?;
+    if asset.bitmap.coverage.len() != expected {
+        return Err(AtlasError::InvalidBitmap);
+    }
+    Ok(())
 }
 
 pub struct AtlasCommit {
@@ -264,6 +279,10 @@ pub enum AtlasError {
     Overflow,
     #[error("placement has no glyph asset")]
     MissingAsset,
+    #[error("glyph bitmap length does not match its declared dimensions")]
+    InvalidBitmap,
+    #[error("glyph bitmap format is unsupported by the grayscale atlas")]
+    UnsupportedFormat,
 }
 
 #[cfg(test)]
@@ -282,10 +301,11 @@ mod tests {
                 synthetic_italic: false,
             },
             bitmap: GlyphBitmap {
+                format: leyline_text::GlyphFormat::Gray8,
                 size_px: size,
                 bearing_px: [0, 0],
                 advance_26_6: 64,
-                coverage: Arc::from([]),
+                coverage: Arc::from(vec![0; usize::from(size[0]) * usize::from(size[1])]),
             },
         }
     }
