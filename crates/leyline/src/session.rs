@@ -317,6 +317,11 @@ impl TerminalSession {
         self.dirty = true;
         Ok(())
     }
+    pub fn clear_selection(&mut self) -> Result<(), SessionError> {
+        self.core.clear_selection()?;
+        self.dirty = true;
+        Ok(())
+    }
     pub fn selection_overlay(&self, generation: u64) -> crate::frame_composer::SelectionOverlay {
         let ranges = self.core.projected_selection().map_or_else(
             || Arc::from([]),

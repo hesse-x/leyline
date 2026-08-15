@@ -188,7 +188,9 @@ impl ScrollbarController {
             return None;
         }
         self.visible_until = Some(now + SCROLLBAR_VISIBILITY);
-        if geometry.thumb.contains(point) && geometry.travel > 0.0 {
+        let over_thumb =
+            point[1] >= geometry.thumb.y && point[1] < geometry.thumb.y + geometry.thumb.height;
+        if over_thumb && geometry.travel > 0.0 {
             self.interaction = ScrollbarInteraction::Dragging {
                 grab_offset_px: point[1] - geometry.thumb.y,
             };
@@ -612,6 +614,48 @@ mod tests {
         assert_eq!(geometry.offset_for_pointer(80.0, 0.0), 0);
         assert_eq!(geometry.offset_for_pointer(40.0, 0.0), 5_000);
         assert_eq!(geometry.offset_for_pointer(0.0, 0.0), 10_000);
+    }
+
+    #[test]
+    fn scrollbar_thumb_uses_the_full_gutter_as_its_drag_hit_width() {
+        let geometry = ScrollbarGeometry {
+            hit: PixelRect {
+                x: 88.0,
+                y: 0.0,
+                width: 12.0,
+                height: 100.0,
+            },
+            track: PixelRect {
+                x: 88.0,
+                y: 0.0,
+                width: 12.0,
+                height: 100.0,
+            },
+            thumb: PixelRect {
+                x: 94.0,
+                y: 80.0,
+                width: 4.0,
+                height: 20.0,
+            },
+            travel: 80.0,
+            history_size: 10_000,
+        };
+        let mut scrollbar = ScrollbarController::default();
+
+        assert_eq!(
+            scrollbar.press([89.0, 90.0], geometry, 24, 0, Instant::now()),
+            Some(0)
+        );
+        assert_eq!(
+            scrollbar.interaction(),
+            ScrollbarInteraction::Dragging {
+                grab_offset_px: 10.0
+            }
+        );
+        assert_eq!(
+            scrollbar.pointer_motion([89.0, 50.0], geometry, Instant::now()),
+            Some(5_000)
+        );
     }
 
     #[test]

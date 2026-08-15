@@ -43,6 +43,8 @@ pub struct UiRuntime {
     keyboard_focused: bool,
     selecting: bool,
     selection_point: Option<crate::terminal::SelectionPoint>,
+    selection_kind: Option<crate::terminal::SelectionKind>,
+    selection_dragged: bool,
     click_tracker: ClickTracker,
     drag_scroll: Option<DragScroll>,
     link_candidate: Option<LinkCandidate>,
@@ -277,6 +279,8 @@ impl UiRuntime {
             keyboard_focused: false,
             selecting: false,
             selection_point: None,
+            selection_kind: None,
+            selection_dragged: false,
             click_tracker: ClickTracker::default(),
             drag_scroll: None,
             link_candidate: None,
@@ -1297,6 +1301,8 @@ impl UiRuntime {
                         .start_selection_kind(kind, point)?;
                     self.selecting = true;
                     self.selection_point = Some(point);
+                    self.selection_kind = Some(kind);
+                    self.selection_dragged = false;
                 }
             }
             leyline_gfx::PointerKind::Release { button: 0x110, .. } => {
@@ -1316,6 +1322,7 @@ impl UiRuntime {
                     self.cancel_pointer_gesture();
                     return Ok(());
                 };
+                self.selection_dragged |= self.selection_point != Some(point);
                 if !self.active_session_mut().pointer_report(
                     crate::terminal::MouseButton::Left,
                     crate::terminal::ButtonState::Released,
@@ -1325,11 +1332,17 @@ impl UiRuntime {
                 {
                     self.active_session_mut().update_selection(point)?;
                 }
-                if self.selecting {
+                if self.selecting
+                    && keep_selection_after_release(self.selection_kind, self.selection_dragged)
+                {
                     self.copy_selection(leyline_gfx::SelectionTarget::Primary)?;
+                } else if self.selecting {
+                    self.active_session_mut().clear_selection()?;
                 }
                 self.selecting = false;
                 self.selection_point = None;
+                self.selection_kind = None;
+                self.selection_dragged = false;
                 self.drag_scroll = None;
             }
             leyline_gfx::PointerKind::Press { button: 0x112, .. } if point.is_some() => {
@@ -1337,11 +1350,13 @@ impl UiRuntime {
             }
             leyline_gfx::PointerKind::Motion { .. } if self.selecting => {
                 if let Some(point) = point {
+                    self.selection_dragged |= self.selection_point != Some(point);
                     self.active_session_mut().update_selection(point)?;
                     self.selection_point = Some(point);
                     self.drag_scroll = None;
                 } else if let Some((direction, point)) = self.drag_scroll_target(pixel, above_grid)
                 {
+                    self.selection_dragged = true;
                     self.selection_point = Some(point);
                     self.drag_scroll = Some(DragScroll {
                         direction,
@@ -1412,6 +1427,8 @@ impl UiRuntime {
             {
                 self.selecting = false;
                 self.selection_point = None;
+                self.selection_kind = None;
+                self.selection_dragged = false;
                 self.drag_scroll = None;
                 self.link_candidate = None;
                 self.click_tracker.reset();
@@ -1523,6 +1540,8 @@ impl UiRuntime {
     fn cancel_pointer_gesture(&mut self) {
         self.selecting = false;
         self.selection_point = None;
+        self.selection_kind = None;
+        self.selection_dragged = false;
         self.drag_scroll = None;
         self.link_candidate = None;
         self.click_tracker.reset();
@@ -1697,6 +1716,17 @@ impl UiRuntime {
     }
 }
 
+fn keep_selection_after_release(
+    kind: Option<crate::terminal::SelectionKind>,
+    dragged: bool,
+) -> bool {
+    dragged
+        || matches!(
+            kind,
+            Some(crate::terminal::SelectionKind::Semantic | crate::terminal::SelectionKind::Lines)
+        )
+}
+
 fn accumulate_wheel_steps(remainder_120: &mut i32, delta_120: i32) -> i32 {
     let total = remainder_120.saturating_add(delta_120);
     let steps = (total / 120).clamp(-4, 4);
@@ -1756,7 +1786,31 @@ fn window_title(ordinal: usize, count: usize, title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{accumulate_wheel_steps, key_text, terminal_modifiers};
+    use super::{
+        accumulate_wheel_steps, keep_selection_after_release, key_text, terminal_modifiers,
+    };
+
+    #[test]
+    fn plain_click_clears_selection_but_drag_and_multi_click_keep_it() {
+        use crate::terminal::SelectionKind;
+
+        assert!(!keep_selection_after_release(
+            Some(SelectionKind::Simple),
+            false
+        ));
+        assert!(keep_selection_after_release(
+            Some(SelectionKind::Simple),
+            true
+        ));
+        assert!(keep_selection_after_release(
+            Some(SelectionKind::Semantic),
+            false
+        ));
+        assert!(keep_selection_after_release(
+            Some(SelectionKind::Lines),
+            false
+        ));
+    }
 
     fn key(keysym: u32, utf8: Option<&str>) -> leyline_gfx::KeyInput {
         leyline_gfx::KeyInput {
