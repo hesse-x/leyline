@@ -123,8 +123,10 @@ fn validate_cells(snapshot: &leyline::terminal::FrameSnapshot) -> ProbeResult<()
 }
 
 fn validate_interactions(modes: leyline::terminal::TerminalModes) -> ProbeResult<()> {
-    if modes.mouse_protocol != MouseProtocol::Normal
-        || modes.mouse_encoding != MouseEncoding::Sgr
+    if !matches!(
+        modes.mouse_protocol,
+        MouseProtocol::Normal | MouseProtocol::ButtonEvent
+    ) || modes.mouse_encoding != MouseEncoding::Sgr
         || !modes.focus_reporting
         || !modes.bracketed_paste
     {
@@ -164,5 +166,14 @@ mod tests {
     #[test]
     fn builtin_fixture_crosses_the_product_snapshot_boundary() {
         run(&mut Reporter::new(false, false), None).unwrap();
+    }
+
+    #[test]
+    fn tmux_drag_mouse_mode_satisfies_the_interaction_contract() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(10, 2).unwrap(), 0).unwrap();
+        core.advance(b"\x1b[?1002h\x1b[?1006h\x1b[?1004h\x1b[?2004h")
+            .unwrap();
+        let modes = core.snapshot().unwrap().modes;
+        validate_interactions(modes).unwrap();
     }
 }

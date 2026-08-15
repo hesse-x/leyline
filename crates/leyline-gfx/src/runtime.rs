@@ -67,8 +67,9 @@ enum SwapchainState {
 }
 
 pub struct GfxRuntime {
-    wayland: WaylandWindow,
+    // Vulkan owns a swapchain backed by the Wayland surface, so it must drop first.
     renderer: VulkanRenderer,
+    wayland: WaylandWindow,
     logical_size: LogicalSize,
     scale: Scale120,
     scene: SceneData,
@@ -128,8 +129,8 @@ impl GfxRuntime {
             .map_err(|error| GfxInitError::Platform(error.to_string()))?;
         let renderer = VulkanRenderer::new(&wayland, pixels)?;
         Ok(Self {
-            wayland,
             renderer,
+            wayland,
             logical_size,
             scale,
             scene: SceneData {

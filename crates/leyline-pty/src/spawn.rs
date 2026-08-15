@@ -863,6 +863,52 @@ mod tests {
     }
 
     #[test]
+    fn latest_resize_bypasses_saturated_input_lane() {
+        let size = PtySize::new(40, 12, 0, 0).unwrap();
+        let script = "stty -echo; trap 'printf RESIZE:; stty size' WINCH; \
+                      printf ready; while :; do :; done";
+        let spec =
+            SpawnSpec::command("/bin/sh".into(), vec!["-c".into(), script.into()], size).unwrap();
+        let (process, output, _done) = collect(spec);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !output
+            .lock()
+            .unwrap()
+            .windows(5)
+            .any(|bytes| bytes == b"ready")
+        {
+            assert!(Instant::now() < deadline, "helper did not become ready");
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let batch = vec![b'x'; MAX_BATCH];
+        let mut saturated = false;
+        for _ in 0..64 {
+            if process.try_write(batch.clone()).unwrap() == WriteStatus::WouldBlock {
+                saturated = true;
+                break;
+            }
+        }
+        assert!(saturated, "input lane did not reach bounded backpressure");
+
+        for columns in 80..93 {
+            process
+                .resize(PtySize::new(columns, 37, 0, 0).unwrap())
+                .unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !String::from_utf8_lossy(&output.lock().unwrap()).contains("RESIZE:37 92") {
+            assert!(
+                Instant::now() < deadline,
+                "final resize did not bypass input backpressure"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        process.request_shutdown().unwrap();
+        process.join().unwrap();
+    }
+
+    #[test]
     fn shutdown_escalates_for_child_ignoring_sigterm() {
         let size = PtySize::new(40, 12, 0, 0).unwrap();
         let script = "trap '' TERM HUP; printf ready; while :; do :; done";

@@ -39,6 +39,7 @@ pub struct UiRuntime {
     font_size: f64,
     reset_font_size: f64,
     modifiers: leyline_gfx::ModifiersState,
+    terminal_control_gesture: bool,
     keyboard_focused: bool,
     selecting: bool,
     selection_point: Option<crate::terminal::SelectionPoint>,
@@ -272,6 +273,7 @@ impl UiRuntime {
             font_size: reset_font_size,
             reset_font_size,
             modifiers: leyline_gfx::ModifiersState::default(),
+            terminal_control_gesture: false,
             keyboard_focused: false,
             selecting: false,
             selection_point: None,
@@ -328,6 +330,7 @@ impl UiRuntime {
                         self.keyboard_focused = focused;
                         self.active_session_mut().focus_changed(focused)?;
                         if !focused {
+                            self.terminal_control_gesture = false;
                             self.cancel_paste_confirmation()?;
                             self.cancel_pointer_gesture();
                             if let Some(serial) = self.gfx.disable_text_input()? {
@@ -338,7 +341,7 @@ impl UiRuntime {
                         }
                     }
                     PlatformEvent::Key(key) => self.handle_key(&key)?,
-                    PlatformEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers,
+                    PlatformEvent::ModifiersChanged(modifiers) => self.modifiers_changed(modifiers),
                     PlatformEvent::Pointer(pointer) => self.handle_pointer(pointer)?,
                     PlatformEvent::TextInput(event) => self.handle_text_input(event)?,
                     PlatformEvent::Clipboard(event) => self.handle_clipboard_event(event)?,
@@ -348,6 +351,10 @@ impl UiRuntime {
             }
             self.apply_settled_resize()?;
             self.drain_sessions()?;
+            if self.tabs.is_empty() {
+                self.finish_last_tab_shutdown()?;
+                break;
+            }
             self.drain_clipboard_results()?;
             self.process_drag_scroll()?;
             if self.scrollbar.expire(Instant::now()) {
@@ -402,6 +409,17 @@ impl UiRuntime {
             }
         }
         self.app.stop()?;
+        Ok(())
+    }
+
+    fn finish_last_tab_shutdown(&mut self) -> Result<(), UiRuntimeError> {
+        // drain_sessions moves the final completed tab into the closing set. From this point,
+        // avoid active-tab and compositor-input paths while the owned PTY workers finish.
+        while !self.poll_shutdown()? {
+            self.gfx
+                .poll_wait(Some(self.wake.as_fd()), Some(SHUTDOWN_POLL_INTERVAL))?;
+            self.wake.drain()?;
+        }
         Ok(())
     }
 
@@ -704,20 +722,10 @@ impl UiRuntime {
                     leyline_gfx::LogicalKey::Character(ch) => Some(ch),
                     _ => text.chars().next(),
                 } {
-                    match self
-                        .active_session_mut()
-                        .input_key(crate::terminal::TerminalKey::Char(ch), modifiers)
-                    {
-                        Ok(()) => {}
-                        Err(crate::session::SessionError::Input(
-                            crate::terminal::InputError::UnsupportedControl(_),
-                        )) => {
-                            tracing::debug!(
-                                character = ?ch,
-                                "ignored character without a terminal control mapping"
-                            );
-                        }
-                        Err(error) => return Err(error.into()),
+                    self.active_session_mut()
+                        .input_key(crate::terminal::TerminalKey::Char(ch), modifiers)?;
+                    if modifiers.control {
+                        self.terminal_control_gesture = true;
                     }
                 }
             } else {
@@ -726,6 +734,13 @@ impl UiRuntime {
             }
         }
         Ok(())
+    }
+
+    fn modifiers_changed(&mut self, modifiers: leyline_gfx::ModifiersState) {
+        self.modifiers = modifiers;
+        if !modifiers.control {
+            self.terminal_control_gesture = false;
+        }
     }
 
     fn handle_text_input(
@@ -975,7 +990,11 @@ impl UiRuntime {
     }
 
     fn resolve_shortcut(&self, key: &leyline_gfx::KeyInput) -> Option<crate::config::Action> {
-        match crate::input::shortcut::resolve(&self.app.config().keybindings, key) {
+        match crate::input::shortcut::resolve_with_terminal_gesture(
+            &self.app.config().keybindings,
+            key,
+            self.terminal_control_gesture,
+        ) {
             crate::input::shortcut::ShortcutResult::Matched(action) => Some(action),
             crate::input::shortcut::ShortcutResult::NotMatched => None,
         }

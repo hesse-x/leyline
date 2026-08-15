@@ -7,7 +7,7 @@ rust-version.workspace = true
 build = "build.rs"
 
 [dependencies]
-leyline = { path = "../leyline" }
+leyline = { version = "0.1.0", path = "../leyline" }
 alacritty_terminal.workspace = true
 ash.workspace = true
 freetype-sys.workspace = true

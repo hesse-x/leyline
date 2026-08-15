@@ -70,7 +70,7 @@ pub fn encode_key(
             | TerminalKey::Function(_)
     );
     let mut encoded = match key {
-        TerminalKey::Char(ch) => encode_char(ch, modifiers)?,
+        TerminalKey::Char(ch) => encode_char(ch, modifiers),
         TerminalKey::Backspace => vec![0x7f],
         TerminalKey::Tab if modifiers.shift => b"\x1b[Z".to_vec(),
         TerminalKey::Tab => vec![b'\t'],
@@ -94,13 +94,16 @@ pub fn encode_key(
     Ok(encoded)
 }
 
-fn encode_char(ch: char, modifiers: Modifiers) -> Result<Vec<u8>, InputError> {
+fn encode_char(ch: char, modifiers: Modifiers) -> Vec<u8> {
     let mut bytes = if modifiers.control {
         let upper = ch.to_ascii_uppercase();
         match upper {
             '@'..='_' => vec![(upper as u8) & 0x1f],
             '?' => vec![0x7f],
-            _ => return Err(InputError::UnsupportedControl(ch)),
+            _ => {
+                let mut storage = [0; 4];
+                ch.encode_utf8(&mut storage).as_bytes().to_vec()
+            }
         }
     } else {
         let mut storage = [0; 4];
@@ -109,7 +112,7 @@ fn encode_char(ch: char, modifiers: Modifiers) -> Result<Vec<u8>, InputError> {
     if modifiers.alt {
         bytes.insert(0, 0x1b);
     }
-    Ok(bytes)
+    bytes
 }
 
 fn modifier_parameter(modifiers: Modifiers) -> u8 {
@@ -298,8 +301,6 @@ pub fn commit_text(text: &str) -> Result<Vec<u8>, InputError> {
 
 #[derive(Debug, thiserror::Error, Eq, PartialEq)]
 pub enum InputError {
-    #[error("unsupported control mapping for {0:?}")]
-    UnsupportedControl(char),
     #[error("only F1 through F12 are supported")]
     UnsupportedFunction(u8),
     #[error("mouse coordinate is outside the selected encoding range")]
@@ -377,6 +378,32 @@ mod tests {
             )
             .unwrap(),
             b"\x1b\r"
+        );
+        assert_eq!(
+            encode_key(
+                TerminalKey::Char('"'),
+                Modifiers {
+                    shift: true,
+                    control: true,
+                    ..Modifiers::default()
+                },
+                modes()
+            )
+            .unwrap(),
+            b"\""
+        );
+        assert_eq!(
+            encode_key(
+                TerminalKey::Char('%'),
+                Modifiers {
+                    shift: true,
+                    control: true,
+                    ..Modifiers::default()
+                },
+                modes()
+            )
+            .unwrap(),
+            b"%"
         );
     }
 

@@ -551,6 +551,23 @@ mod tests {
     }
 
     #[test]
+    fn osc52_set_query_and_clear_are_rejected_without_a_reply() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(20, 4).unwrap(), 100).unwrap();
+        let delta = core
+            .advance(b"\x1b]52;c;Zm9v\x07\x1b]52;c;?\x07\x1b]52;c;\x07")
+            .unwrap();
+        let mut actions = Vec::new();
+        core.drain_actions(&mut actions);
+
+        assert_eq!(delta.audit.rejected_actions, 3);
+        assert_eq!(delta.audit.reply_bytes, 0);
+        assert!(
+            actions.is_empty(),
+            "OSC 52 reached the application boundary"
+        );
+    }
+
+    #[test]
     fn overlong_title_is_rejected_instead_of_byte_unsafe_truncation() {
         let mut core = TerminalCoreAdapter::new(GridSize::new(4, 2).unwrap(), 0).unwrap();
         let input = format!("\x1b]0;{}\x07", "中".repeat(342));

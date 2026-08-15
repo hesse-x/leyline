@@ -89,6 +89,19 @@ pub fn resolve(bindings: &[crate::config::KeyBinding], key: &KeyInput) -> Shortc
         })
 }
 
+#[must_use]
+pub fn resolve_with_terminal_gesture(
+    bindings: &[crate::config::KeyBinding],
+    key: &KeyInput,
+    terminal_control_gesture: bool,
+) -> ShortcutResult {
+    if terminal_control_gesture {
+        ShortcutResult::NotMatched
+    } else {
+        resolve(bindings, key)
+    }
+}
+
 #[derive(Clone, Copy, Debug, thiserror::Error, Eq, PartialEq)]
 #[error("unknown logical key")]
 pub struct ParseKeyError;
@@ -198,10 +211,28 @@ mod tests {
         };
         assert_eq!(
             resolve(
-                &[default, user],
+                &[default.clone(), user],
                 &input(LogicalKey::Character('!'), Some(1))
             ),
             ShortcutResult::Matched(Action::ScrollPageUp)
+        );
+
+        let tab_five = crate::config::KeyBinding {
+            chord: KeyChord {
+                key: LogicalKeyPattern::Character('5'),
+                modifiers: chord_modifiers,
+            },
+            action: Action::ActivateTab(5),
+            origin: BindingOrigin::Default,
+        };
+        let shifted_five = input(LogicalKey::Character('%'), Some(5));
+        assert_eq!(
+            resolve(std::slice::from_ref(&tab_five), &shifted_five),
+            ShortcutResult::Matched(Action::ActivateTab(5))
+        );
+        assert_eq!(
+            resolve_with_terminal_gesture(std::slice::from_ref(&tab_five), &shifted_five, true),
+            ShortcutResult::NotMatched
         );
     }
 }
