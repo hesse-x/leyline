@@ -23,6 +23,7 @@ pub struct EffectiveConfig {
     pub scrollbar: ScrollbarConfig,
     pub cursor: CursorConfig,
     pub behavior: BehaviorConfig,
+    pub unicode: UnicodeConfig,
     pub tabs: TabsConfig,
     pub keybindings: Vec<KeyBinding>,
 }
@@ -154,6 +155,12 @@ pub struct BehaviorConfig {
     pub confirm_multiline_paste: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UnicodeConfig {
+    pub bidi: bool,
+    pub color_glyphs: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyBinding {
     pub chord: crate::input::shortcut::KeyChord,
@@ -230,6 +237,10 @@ impl Default for EffectiveConfig {
             behavior: BehaviorConfig {
                 hold_after_exit: false,
                 confirm_multiline_paste: true,
+            },
+            unicode: UnicodeConfig {
+                bidi: false,
+                color_glyphs: true,
             },
             tabs: TabsConfig {
                 max_count: MAX_TABS,
@@ -509,6 +520,7 @@ struct RawConfig {
     scrollbar: RawScrollbar,
     cursor: RawCursor,
     behavior: RawBehavior,
+    unicode: RawUnicode,
     tabs: RawTabs,
     keybindings: Option<Vec<RawKeyBinding>>,
     #[serde(flatten)]
@@ -601,6 +613,14 @@ struct RawCursor {
 struct RawBehavior {
     hold_after_exit: Option<bool>,
     confirm_multiline_paste: Option<bool>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawUnicode {
+    bidi: Option<bool>,
+    color_glyphs: Option<bool>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -716,6 +736,13 @@ impl RawConfig {
         collect_unknown(
             &mut warnings,
             source,
+            "unicode",
+            &self.unicode.unknown,
+            &["bidi", "color_glyphs"],
+        );
+        collect_unknown(
+            &mut warnings,
+            source,
             "tabs",
             &self.tabs.unknown,
             &[
@@ -778,6 +805,12 @@ impl RawConfig {
         if let Some(value) = self.font.line_spacing {
             validate_float(path, "font.line_spacing", value, 0.0, 8.0)?;
             result.font.line_spacing = value;
+        }
+        if let Some(value) = self.unicode.bidi {
+            result.unicode.bidi = value;
+        }
+        if let Some(value) = self.unicode.color_glyphs {
+            result.unicode.color_glyphs = value;
         }
         set_color(
             path,
@@ -1063,6 +1096,7 @@ const TOP_FIELDS: &[&str] = &[
     "scrollbar",
     "cursor",
     "behavior",
+    "unicode",
     "tabs",
     "keybindings",
 ];

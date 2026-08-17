@@ -382,8 +382,15 @@ impl TerminalSession {
         kind: crate::terminal::SelectionKind,
         point: crate::terminal::SelectionPoint,
     ) -> Result<(), SessionError> {
-        self.core
-            .start_selection(kind, point, crate::terminal::SelectionSide::Left)?;
+        self.start_selection_kind_with_side(kind, point, crate::terminal::SelectionSide::Left)
+    }
+    pub fn start_selection_kind_with_side(
+        &mut self,
+        kind: crate::terminal::SelectionKind,
+        point: crate::terminal::SelectionPoint,
+        side: crate::terminal::SelectionSide,
+    ) -> Result<(), SessionError> {
+        self.core.start_selection(kind, point, side)?;
         self.dirty = true;
         Ok(())
     }
@@ -391,8 +398,14 @@ impl TerminalSession {
         &mut self,
         point: crate::terminal::SelectionPoint,
     ) -> Result<(), SessionError> {
-        self.core
-            .update_selection(point, crate::terminal::SelectionSide::Right)?;
+        self.update_selection_with_side(point, crate::terminal::SelectionSide::Right)
+    }
+    pub fn update_selection_with_side(
+        &mut self,
+        point: crate::terminal::SelectionPoint,
+        side: crate::terminal::SelectionSide,
+    ) -> Result<(), SessionError> {
+        self.core.update_selection(point, side)?;
         self.dirty = true;
         Ok(())
     }

@@ -52,6 +52,8 @@ pub enum GfxError {
     Renderer(#[from] crate::RendererFault),
     #[error("graphics state invariant failed: {0}")]
     Internal(String),
+    #[error("graphics capacity exceeded: {0}")]
+    Capacity(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -85,6 +87,10 @@ pub struct GfxRuntime {
 }
 
 impl GfxRuntime {
+    #[must_use]
+    pub const fn color_glyphs_supported(&self) -> bool {
+        self.renderer.color_glyphs_supported()
+    }
     /// Connects Wayland, creates a native window and initializes Vulkan 1.3 WSI.
     ///
     /// # Errors
@@ -140,6 +146,7 @@ impl GfxRuntime {
                 glyph_assets: Vec::new(),
                 source_generation: 0,
                 font_generation: 0,
+                frame_key: crate::FrameKey::default(),
             },
             atlas: AtlasManager::new(),
             pending_atlas: None,
@@ -228,7 +235,7 @@ impl GfxRuntime {
                 let prepared = self
                     .atlas
                     .prepare(&scene.glyphs, &scene.glyph_assets)
-                    .map_err(|error| GfxError::Internal(error.to_string()))?;
+                    .map_err(atlas_error)?;
                 self.renderer
                     .upload_glyphs(&prepared.uploads, prepared.is_repack())
                     .map_err(GfxError::Renderer)?;
@@ -327,7 +334,12 @@ impl GfxRuntime {
         };
         self.dirty = recreate_after_present;
         self.frame_ready = false;
-        Ok(RenderOutcome::Rendered)
+        Ok(RenderOutcome::Rendered {
+            committed: crate::CommittedFrameKey {
+                frame: self.scene.frame_key,
+                atlas_epoch: self.atlas.stats().epoch,
+            },
+        })
     }
 
     fn commit_pending_atlas(&mut self) {
@@ -388,6 +400,18 @@ impl GfxRuntime {
     #[must_use]
     pub fn atlas_stats(&self) -> crate::AtlasStats {
         self.atlas.stats()
+    }
+
+    /// Preflights the bounded atlas without changing the active or pending frame.
+    ///
+    /// # Errors
+    /// Returns an invariant error for malformed assets.
+    pub fn scene_fits_atlas(&self, scene: &SceneData) -> Result<bool, GfxError> {
+        match self.atlas.prepare(&scene.glyphs, &scene.glyph_assets) {
+            Ok(_) => Ok(true),
+            Err(crate::atlas::AtlasError::Full) => Ok(false),
+            Err(error) => Err(atlas_error(error)),
+        }
     }
 
     #[must_use]
@@ -471,6 +495,13 @@ impl GfxRuntime {
     #[must_use]
     pub const fn retry_delay() -> Duration {
         Duration::from_millis(4)
+    }
+}
+
+fn atlas_error(error: crate::atlas::AtlasError) -> GfxError {
+    match error {
+        crate::atlas::AtlasError::Full => GfxError::Capacity(error.to_string()),
+        _ => GfxError::Internal(error.to_string()),
     }
 }
 

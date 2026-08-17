@@ -330,6 +330,9 @@ impl TerminalCoreAdapter {
             } else {
                 None
             };
+            // Alacritty stores HT in the originating cell as an internal marker. It is not a
+            // printable glyph; exposing it to the renderer produces a missing-glyph box.
+            let ch = if cell.c == '\t' { ' ' } else { cell.c };
             let zerowidth = cell.zerowidth().filter(|value| {
                 !value.is_empty()
                     && value.len() <= MAX_ZERO_WIDTH_PER_CELL
@@ -341,7 +344,7 @@ impl TerminalCoreAdapter {
                 zero_width_total += value.len();
             }
             cells.push(SnapshotCell {
-                ch: cell.c,
+                ch,
                 zerowidth: zerowidth.map(Arc::from),
                 foreground: map_color(cell.fg),
                 background: map_color(cell.bg),
@@ -776,6 +779,17 @@ mod tests {
         assert!(snapshot.modes.bracketed_paste);
         assert_eq!(snapshot.title.as_deref(), Some("safe"));
         assert_eq!(delta.audit.rejected_actions, 1);
+    }
+
+    #[test]
+    fn horizontal_tab_advances_without_exposing_a_control_glyph() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(16, 2).unwrap(), 0).unwrap();
+        core.advance(b"\tX").unwrap();
+
+        let snapshot = core.snapshot().unwrap();
+        assert_eq!(snapshot.cells[8].ch, 'X');
+        assert!(!snapshot.cells.iter().any(|cell| cell.ch == '\t'));
+        assert_eq!(snapshot.cursor.column, 9);
     }
 
     #[test]

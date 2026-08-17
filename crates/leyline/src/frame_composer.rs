@@ -6,8 +6,9 @@ use std::{
 use leyline_gfx::{GlyphPlacement, LinearColor, RectangleInstance, SceneData};
 use leyline_text::{
     CellMetrics, FontStyle, GlyphAsset, GlyphKey, MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS,
-    MAX_PREPARED_GLYPHS, ShapedRun, TextError, TextSystem,
+    MAX_PREPARED_GLYPHS, ShapedRun, TextDirection, TextError, TextSystem,
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     clipboard::{PasteConfirmationOverlay, PasteRisk, TransferTarget},
@@ -18,6 +19,7 @@ use crate::{
         CellWidth, CursorBlink, CursorShape, FrameSnapshot, SnapshotCell, TerminalColor,
         UnderlineStyle,
     },
+    unicode_layout::VisualGridMap,
 };
 
 pub const MAX_UNIQUE_GLYPHS: usize = MAX_GLYPH_BITMAPS;
@@ -47,6 +49,11 @@ const TAB_CLOSE_MARK: &str = "\u{00d7}";
 const TAB_FONT_KEY_NAMESPACE: u64 = 1 << 63;
 
 type ShapedCache = HashMap<(String, FontStyle), ShapedRun>;
+struct TerminalShape {
+    run: ShapedRun,
+    span: u8,
+}
+type TerminalShapes = HashMap<(usize, usize), TerminalShape>;
 type GlyphAssets = HashMap<GlyphKey, GlyphAsset>;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -76,6 +83,7 @@ pub struct FrameOverlays<'a> {
 /// # Errors
 /// Returns a typed error for invalid snapshot contracts, font failures, or capacity limits.
 #[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -89,6 +97,8 @@ pub fn compose(
     layout: &GridLayout,
     colors: &ColorsConfig,
     cursor_policy: impl Into<CursorPresentationPolicy>,
+    visual_map: &VisualGridMap,
+    layout_generation: u64,
 ) -> Result<SceneData, ComposeError> {
     text.begin_scene();
     tab_text.begin_scene();
@@ -100,13 +110,38 @@ pub fn compose(
         layout,
         colors,
         cursor_policy.into(),
+        visual_map,
+        layout_generation,
     );
     text.end_scene();
     tab_text.end_scene();
     result
 }
 
+/// Rebuilds a prepared scene's color working set as grayscale coverage.
+///
+/// This is the sole capacity fallback and intentionally preserves glyph keys and placements.
+pub(crate) fn downgrade_color_working_set(scene: &mut SceneData) -> bool {
+    let mut changed = false;
+    for asset in &mut scene.glyph_assets {
+        if asset.bitmap.format != leyline_text::GlyphFormat::ColorSrgba8 {
+            continue;
+        }
+        let coverage = asset
+            .bitmap
+            .pixels
+            .chunks_exact(4)
+            .map(|pixel| pixel[3])
+            .collect::<Vec<_>>();
+        asset.bitmap.format = leyline_text::GlyphFormat::Gray8;
+        asset.bitmap.pixels = Arc::from(coverage);
+        changed = true;
+    }
+    changed
+}
+
 #[allow(
+    clippy::too_many_arguments,
     clippy::too_many_lines,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap,
@@ -120,9 +155,13 @@ fn compose_active_scene(
     layout: &GridLayout,
     colors: &ColorsConfig,
     cursor_policy: CursorPresentationPolicy,
+    visual_map: &VisualGridMap,
+    layout_generation: u64,
 ) -> Result<SceneData, ComposeError> {
     if snapshot.grid != layout.grid
         || snapshot.cells.len() != snapshot.grid.columns() * snapshot.grid.lines()
+        || visual_map.grid != snapshot.grid
+        || visual_map.snapshot_generation != snapshot.generation
     {
         return Err(ComposeError::Snapshot("snapshot and layout grids differ"));
     }
@@ -135,11 +174,12 @@ fn compose_active_scene(
                 .iter()
                 .any(|range| point_in_range([column, line], *range))
     };
-    let (shaped_cache, mut assets) = prepare_glyph_working_set(
+    let (shaped_cache, terminal_shapes, mut assets) = prepare_glyph_working_set(
         text,
         snapshot,
         overlays.paste_confirmation,
         overlays.preedit,
+        visual_map,
     )?;
     let (tab_shaped_cache, tab_assets) =
         match prepare_tab_glyph_working_set(tab_text, overlays.tab_bar) {
@@ -177,15 +217,20 @@ fn compose_active_scene(
             clear: LinearColor::from_srgba8(colors.background.0),
             rectangles,
             glyphs,
-            glyph_assets: assets.into_values().collect(),
+            glyph_assets: sorted_assets(assets),
             source_generation: snapshot.generation,
             font_generation: layout.font_generation,
+            frame_key: leyline_gfx::FrameKey {
+                snapshot_generation: snapshot.generation,
+                layout_generation,
+                font_generation: layout.font_generation,
+                unicode_policy_generation: visual_map.policy_generation,
+            },
         });
     }
     for line in 0..snapshot.grid.lines() {
-        let mut background_start = 0_usize;
-        let mut background_color = None;
         for column in 0..snapshot.grid.columns() {
+            let visual_column = usize::from(visual_map.lines[line].logical_to_visual_cell[column]);
             let index = line * snapshot.grid.columns() + column;
             let cell = &snapshot.cells[index];
             let is_selected = selected(column as u16, line as u16);
@@ -206,18 +251,8 @@ fn compose_active_scene(
             let painted_background =
                 (cell.background != TerminalColor::Named(257) || cell.flags.inverse || is_selected)
                     .then_some(background);
-            if background_color != painted_background {
-                if let Some(previous) = background_color {
-                    rectangles.push(cell_rectangle(
-                        layout,
-                        background_start,
-                        line,
-                        column - background_start,
-                        previous,
-                    ));
-                }
-                background_start = column;
-                background_color = painted_background;
+            if let Some(background) = painted_background {
+                rectangles.push(cell_rectangle(layout, visual_column, line, 1, background));
             }
             let glyph_color = cursor_glyph_color(
                 foreground,
@@ -229,6 +264,7 @@ fn compose_active_scene(
             );
             if !matches!(cell.width, CellWidth::Spacer | CellWidth::LeadingSpacer)
                 && !cell.flags.hidden
+                && !is_bidi_control(cell.ch)
                 && (cell.ch != ' ' || cell.zerowidth.is_some())
             {
                 let mut cluster = String::from(cell.ch);
@@ -241,11 +277,32 @@ fn compose_active_scene(
                     (false, true) => FontStyle::Italic,
                     (false, false) => FontStyle::Regular,
                 };
-                let shaped = shaped_cache
-                    .get(&(cluster, style))
+                let shaped = terminal_shapes
+                    .get(&(line, column))
+                    .map(|shape| &shape.run)
+                    .or_else(|| shaped_cache.get(&(cluster, style)))
                     .ok_or(ComposeError::Snapshot("missing shaped cell cluster"))?;
-                let span = if cell.width == CellWidth::Wide { 2 } else { 1 };
-                let origin = cell_origin(layout, column, line);
+                let span = terminal_shapes.get(&(line, column)).map_or_else(
+                    || if cell.width == CellWidth::Wide { 2 } else { 1 },
+                    |shape| usize::from(shape.span),
+                );
+                let glyph_visual_column =
+                    terminal_shapes
+                        .get(&(line, column))
+                        .map_or(visual_column, |shape| {
+                            (column
+                                ..column
+                                    .saturating_add(usize::from(shape.span))
+                                    .min(snapshot.grid.columns()))
+                                .map(|logical| {
+                                    usize::from(
+                                        visual_map.lines[line].logical_to_visual_cell[logical],
+                                    )
+                                })
+                                .min()
+                                .unwrap_or(visual_column)
+                        });
+                let origin = cell_origin(layout, glyph_visual_column, line);
                 let mut pen_x = 0_i32;
                 for glyph in &shaped.glyphs {
                     let bitmap = assets
@@ -265,10 +322,13 @@ fn compose_active_scene(
                             clip_px: [
                                 origin[0],
                                 origin[1],
-                                u32::from(layout.cell_px[0].get()) * span,
+                                u32::from(layout.cell_px[0].get())
+                                    * u32::try_from(span)
+                                        .map_err(|_| ComposeError::Capacity("cluster clip"))?,
                                 u32::from(layout.cell_px[1].get()),
                             ],
                             color: LinearColor::from_srgba8(glyph_color),
+                            color_scale: if cell.flags.dim { 0.5 } else { 1.0 },
                         });
                     }
                     pen_x = pen_x.saturating_add(glyph.advance_26_6[0]);
@@ -277,7 +337,7 @@ fn compose_active_scene(
             let underline_style = effective_underline_style(cell);
             let underlined = underline_style != UnderlineStyle::None;
             if underlined || cell.flags.strikeout {
-                let origin = cell_origin(layout, column, line);
+                let origin = cell_origin(layout, visual_column, line);
                 let span = if cell.width == CellWidth::Wide { 2 } else { 1 };
                 if underlined {
                     let underline = if cell.underline_style == UnderlineStyle::None {
@@ -308,15 +368,6 @@ fn compose_active_scene(
                 }
             }
         }
-        if let Some(color) = background_color {
-            rectangles.push(cell_rectangle(
-                layout,
-                background_start,
-                line,
-                snapshot.grid.columns() - background_start,
-                color,
-            ));
-        }
     }
     if cursor_visible
         && usize::from(snapshot.cursor.column) < snapshot.grid.columns()
@@ -324,7 +375,10 @@ fn compose_active_scene(
     {
         let origin = cell_origin(
             layout,
-            usize::from(snapshot.cursor.column),
+            usize::from(
+                visual_map.lines[usize::from(snapshot.cursor.line)].logical_to_visual_cell
+                    [usize::from(snapshot.cursor.column)],
+            ),
             usize::from(snapshot.cursor.line),
         );
         let (cursor_origin, cursor_size) = match cursor_style {
@@ -446,6 +500,7 @@ fn compose_active_scene(
                             } else {
                                 TAB_INACTIVE_TEXT
                             }),
+                            color_scale: 1.0,
                         });
                     }
                     pen_x = pen_x.saturating_add(glyph.advance_26_6[0]);
@@ -484,6 +539,7 @@ fn compose_active_scene(
                             } else {
                                 TAB_INACTIVE_TEXT
                             }),
+                            color_scale: 1.0,
                         });
                     }
                     pen_x = pen_x.saturating_add(glyph.advance_26_6[0]);
@@ -500,7 +556,10 @@ fn compose_active_scene(
     {
         let origin = cell_origin(
             layout,
-            usize::from(preedit.anchor[0]),
+            usize::from(
+                visual_map.lines[usize::from(preedit.anchor[1])].logical_to_visual_cell
+                    [usize::from(preedit.anchor[0])],
+            ),
             usize::from(preedit.anchor[1]),
         );
         let shaped = shaped_cache
@@ -529,6 +588,7 @@ fn compose_active_scene(
                         u32::from(layout.cell_px[1].get()),
                     ],
                     color: LinearColor::from_srgba8(colors.foreground.0),
+                    color_scale: 1.0,
                 });
             }
             pen_x = pen_x.saturating_add(glyph.advance_26_6[0]);
@@ -562,9 +622,15 @@ fn compose_active_scene(
         clear: LinearColor::from_srgba8(colors.background.0),
         rectangles,
         glyphs,
-        glyph_assets: assets.into_values().collect(),
+        glyph_assets: sorted_assets(assets),
         source_generation: snapshot.generation,
         font_generation: layout.font_generation,
+        frame_key: leyline_gfx::FrameKey {
+            snapshot_generation: snapshot.generation,
+            layout_generation,
+            font_generation: layout.font_generation,
+            unicode_policy_generation: visual_map.policy_generation,
+        },
     })
 }
 
@@ -573,7 +639,8 @@ fn prepare_glyph_working_set(
     snapshot: &FrameSnapshot,
     paste_confirmation: Option<&PasteConfirmationOverlay>,
     preedit: Option<&PreeditOverlay>,
-) -> Result<(ShapedCache, GlyphAssets), ComposeError> {
+    visual_map: &VisualGridMap,
+) -> Result<(ShapedCache, TerminalShapes, GlyphAssets), ComposeError> {
     let mut request_set = HashSet::<(String, FontStyle)>::new();
     let mut requests = Vec::<(String, FontStyle)>::new();
     let mut request = |cluster: String, style: FontStyle| {
@@ -589,6 +656,7 @@ fn prepare_glyph_working_set(
         for cell in snapshot.cells.iter() {
             if matches!(cell.width, CellWidth::Spacer | CellWidth::LeadingSpacer)
                 || cell.flags.hidden
+                || is_bidi_control(cell.ch)
                 || (cell.ch == ' ' && cell.zerowidth.is_none())
             {
                 continue;
@@ -627,7 +695,18 @@ fn prepare_glyph_working_set(
         }
         shaped.insert((cluster, style), run);
     }
-    let placements = count_prepared_placements(snapshot, paste_confirmation, preedit, &shaped);
+    let terminal_shapes = if paste_confirmation.is_none() && visual_map.bidi_enabled {
+        prepare_terminal_runs(text, snapshot, visual_map, &mut key_set, &mut keys)?
+    } else {
+        TerminalShapes::new()
+    };
+    let placements = if paste_confirmation.is_some() {
+        count_prepared_placements(snapshot, paste_confirmation, preedit, &shaped)
+    } else {
+        terminal_shapes.values().try_fold(0_usize, |total, shape| {
+            total.checked_add(shape.run.glyphs.len())
+        })
+    };
     if placements.is_none_or(|count| count > MAX_PREPARED_GLYPHS) {
         return Err(ComposeError::Capacity("glyph placements"));
     }
@@ -636,7 +715,163 @@ fn prepare_glyph_working_set(
         .into_iter()
         .map(|asset| (asset.key, asset))
         .collect();
-    Ok((shaped, assets))
+    Ok((shaped, terminal_shapes, assets))
+}
+
+#[allow(clippy::too_many_lines)]
+fn prepare_terminal_runs(
+    text: &mut TextSystem,
+    snapshot: &FrameSnapshot,
+    visual_map: &VisualGridMap,
+    key_set: &mut HashSet<GlyphKey>,
+    keys: &mut Vec<GlyphKey>,
+) -> Result<TerminalShapes, ComposeError> {
+    let columns = snapshot.grid.columns();
+    let mut result = TerminalShapes::new();
+    for line in 0..snapshot.grid.lines() {
+        let mut column = 0;
+        while column < columns {
+            let cell = &snapshot.cells[line * columns + column];
+            if matches!(cell.width, CellWidth::Spacer | CellWidth::LeadingSpacer)
+                || cell.flags.hidden
+            {
+                column += 1;
+                continue;
+            }
+            let style = cell_style(cell);
+            let emoji = cell_is_emoji(cell);
+            let visual = usize::from(visual_map.lines[line].logical_to_visual_cell[column]);
+            let rtl = visual_map.lines[line].atom_levels[visual] % 2 == 1;
+            let mut run_text = String::new();
+            let mut provenance = Vec::new();
+            let mut next = column;
+            while next < columns {
+                let candidate = &snapshot.cells[line * columns + next];
+                if matches!(
+                    candidate.width,
+                    CellWidth::Spacer | CellWidth::LeadingSpacer
+                ) || candidate.flags.hidden
+                    || is_bidi_control(candidate.ch)
+                {
+                    break;
+                }
+                let candidate_visual =
+                    usize::from(visual_map.lines[line].logical_to_visual_cell[next]);
+                if cell_style(candidate) != style
+                    || cell_is_emoji(candidate) != emoji
+                    || (visual_map.lines[line].atom_levels[candidate_visual] % 2 == 1) != rtl
+                {
+                    break;
+                }
+                provenance.push((run_text.len(), next));
+                run_text.push(candidate.ch);
+                if let Some(extra) = &candidate.zerowidth {
+                    run_text.extend(extra.iter());
+                }
+                next += if candidate.width == CellWidth::Wide {
+                    2
+                } else {
+                    1
+                };
+            }
+            let shaped = text.shape_run_only(
+                &run_text,
+                style,
+                if rtl {
+                    TextDirection::RightToLeft
+                } else {
+                    TextDirection::LeftToRight
+                },
+            )?;
+            let graphemes = run_text.grapheme_indices(true).collect::<Vec<_>>();
+            for glyph in shaped.glyphs {
+                let cluster = usize::try_from(glyph.cluster)
+                    .map_err(|_| ComposeError::Snapshot("invalid shaping cluster"))?;
+                let owner_index = provenance
+                    .partition_point(|(offset, _)| *offset <= cluster)
+                    .saturating_sub(1);
+                let owner = provenance
+                    .get(owner_index)
+                    .ok_or(ComposeError::Snapshot("missing shaping provenance"))?
+                    .1;
+                let grapheme_end = graphemes
+                    .iter()
+                    .find(|(offset, grapheme)| {
+                        *offset <= cluster && cluster < offset.saturating_add(grapheme.len())
+                    })
+                    .map_or(cluster.saturating_add(1), |(offset, grapheme)| {
+                        offset.saturating_add(grapheme.len())
+                    });
+                let end_index = provenance
+                    .partition_point(|(offset, _)| *offset < grapheme_end)
+                    .saturating_sub(1);
+                let end_owner = provenance.get(end_index).map_or(owner, |(_, cell)| *cell);
+                let end_cell = &snapshot.cells[line * columns + end_owner];
+                let logical_end = end_owner.saturating_add(if end_cell.width == CellWidth::Wide {
+                    2
+                } else {
+                    1
+                });
+                let span = u8::try_from(logical_end.saturating_sub(owner))
+                    .map_err(|_| ComposeError::Capacity("shape cluster span"))?;
+                if key_set.insert(glyph.key) {
+                    keys.push(glyph.key);
+                }
+                let shape = result
+                    .entry((line, owner))
+                    .or_insert_with(|| TerminalShape {
+                        run: ShapedRun { glyphs: Vec::new() },
+                        span,
+                    });
+                shape.span = shape.span.max(span);
+                shape.run.glyphs.push(glyph);
+            }
+            if keys.len() > MAX_UNIQUE_GLYPHS {
+                return Err(ComposeError::Capacity("unique glyphs"));
+            }
+            column = next.max(column + 1);
+        }
+    }
+    Ok(result)
+}
+
+fn cell_style(cell: &SnapshotCell) -> FontStyle {
+    match (cell.flags.bold, cell.flags.italic) {
+        (true, true) => FontStyle::BoldItalic,
+        (true, false) => FontStyle::Bold,
+        (false, true) => FontStyle::Italic,
+        (false, false) => FontStyle::Regular,
+    }
+}
+
+fn cell_is_emoji(cell: &SnapshotCell) -> bool {
+    std::iter::once(cell.ch)
+        .chain(
+            cell.zerowidth
+                .iter()
+                .flat_map(|chars| chars.iter().copied()),
+        )
+        .any(|ch| {
+            matches!(
+                ch,
+                '\u{200d}'
+                    | '\u{fe0f}'
+                    | '\u{1f1e6}'..='\u{1f1ff}'
+                    | '\u{1f300}'..='\u{1faff}'
+                    | '\u{2600}'..='\u{27bf}'
+            )
+        })
+}
+
+const fn is_bidi_control(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+    )
 }
 
 fn prepare_tab_glyph_working_set(
@@ -736,9 +971,26 @@ fn validate_glyph_working_set(
     assets: &GlyphAssets,
 ) -> Result<(), ComposeError> {
     let bitmap_bytes = assets.values().try_fold(0_usize, |total, asset| {
-        total.checked_add(asset.bitmap.coverage.len())
+        total.checked_add(asset.bitmap.pixels.len())
     });
     validate_glyph_budget(glyphs.len(), assets.len(), bitmap_bytes)
+}
+
+fn sorted_assets(assets: GlyphAssets) -> Vec<GlyphAsset> {
+    let mut assets = assets.into_values().collect::<Vec<_>>();
+    assets.sort_by_key(|asset| {
+        (
+            asset.key.face.0,
+            asset.key.glyph_id,
+            asset.key.synthetic_bold,
+            asset.key.synthetic_italic,
+            match asset.key.presentation {
+                leyline_text::GlyphPresentation::Text => 0_u8,
+                leyline_text::GlyphPresentation::Emoji => 1_u8,
+            },
+        )
+    });
+    assets
 }
 
 fn validate_glyph_budget(
@@ -865,6 +1117,7 @@ fn append_overlay_text(
                     panel_size[1],
                 ],
                 color: LinearColor::from_srgba8(color),
+                color_scale: 1.0,
             });
         }
         pen_x = pen_x.saturating_add(glyph.advance_26_6[0]);
@@ -1172,13 +1425,18 @@ pub enum ComposeError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{
-        cursor_glyph_color, dim, effective_underline_style, push_underline_primitives,
-        resolve_color, validate_glyph_budget,
+        cursor_glyph_color, dim, downgrade_color_working_set, effective_underline_style,
+        push_underline_primitives, resolve_color, validate_glyph_budget,
     };
     use crate::config::CursorStyle;
     use crate::terminal::{CellFlags, CellWidth, SnapshotCell, TerminalColor, UnderlineStyle};
-    use leyline_text::{MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS, MAX_PREPARED_GLYPHS};
+    use leyline_text::{
+        FaceId, GlyphAsset, GlyphBitmap, GlyphFormat, GlyphKey, GlyphPresentation,
+        MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS, MAX_PREPARED_GLYPHS,
+    };
 
     #[test]
     fn block_cursor_preserves_the_character_with_contrasting_color() {
@@ -1212,6 +1470,41 @@ mod tests {
         assert!(validate_glyph_budget(0, MAX_GLYPH_BITMAPS + 1, Some(0)).is_err());
         assert!(validate_glyph_budget(0, 0, Some(MAX_GLYPH_BITMAP_BYTES + 1)).is_err());
         assert!(validate_glyph_budget(0, 0, None).is_err());
+    }
+
+    #[test]
+    fn color_capacity_fallback_preserves_keys_and_uses_alpha_coverage() {
+        let key = GlyphKey {
+            font_generation: 3,
+            face: FaceId(2),
+            glyph_id: 1,
+            synthetic_bold: false,
+            synthetic_italic: false,
+            presentation: GlyphPresentation::Emoji,
+        };
+        let mut scene = leyline_gfx::SceneData {
+            clear: leyline_gfx::LinearColor::from_srgba8(0),
+            rectangles: Vec::new(),
+            glyphs: Vec::new(),
+            glyph_assets: vec![GlyphAsset {
+                key,
+                bitmap: GlyphBitmap {
+                    format: GlyphFormat::ColorSrgba8,
+                    size_px: [2, 1],
+                    bearing_px: [0, 0],
+                    advance_26_6: 64,
+                    pixels: Arc::from([10, 20, 30, 40, 50, 60, 70, 80]),
+                },
+            }],
+            source_generation: 1,
+            font_generation: 3,
+            frame_key: leyline_gfx::FrameKey::default(),
+        };
+        assert!(downgrade_color_working_set(&mut scene));
+        assert_eq!(scene.glyph_assets[0].key, key);
+        assert_eq!(scene.glyph_assets[0].bitmap.format, GlyphFormat::Gray8);
+        assert_eq!(&*scene.glyph_assets[0].bitmap.pixels, &[40, 80]);
+        assert!(!downgrade_color_working_set(&mut scene));
     }
 
     #[test]

@@ -15,7 +15,7 @@ use crate::{
     AntialiasMode, AntialiasPreference, CacheStats, CellMetrics, FaceId, FontRequest, FontStyle,
     GlyphAsset, GlyphBitmap, GlyphFormat, GlyphKey, HintingMode, HintingPreference, MAX_FACES,
     MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS, MAX_PREPARED_GLYPHS, RasterProfile, ResolvedFace,
-    ShapedCluster, ShapedGlyph, ShapedRun, TextError,
+    ShapedCluster, ShapedGlyph, ShapedRun, TextDirection, TextError,
 };
 
 struct CachedGlyph {
@@ -291,6 +291,20 @@ impl TextSystem {
         text: &str,
         style: FontStyle,
     ) -> Result<ShapedRun, TextError> {
+        self.shape_run_only(text, style, TextDirection::Auto)
+    }
+
+    /// Shapes a complete directional run without rasterizing it.
+    ///
+    /// # Errors
+    /// Returns a typed shaping, font-data, or capacity error.
+    #[allow(clippy::too_many_lines)]
+    pub fn shape_run_only(
+        &mut self,
+        text: &str,
+        style: FontStyle,
+        direction: TextDirection,
+    ) -> Result<ShapedRun, TextError> {
         if text.is_empty() || text.len() > 4096 {
             return Err(TextError::Shape(
                 "cluster text is empty or excessive".into(),
@@ -312,6 +326,15 @@ impl TextSystem {
                 buffer.0,
                 hb::HB_BUFFER_CLUSTER_LEVEL_MONOTONE_GRAPHEMES,
             );
+            match direction {
+                TextDirection::Auto => {}
+                TextDirection::LeftToRight => {
+                    hb::hb_buffer_set_direction(buffer.0, hb::HB_DIRECTION_LTR);
+                }
+                TextDirection::RightToLeft => {
+                    hb::hb_buffer_set_direction(buffer.0, hb::HB_DIRECTION_RTL);
+                }
+            }
             hb::hb_buffer_guess_segment_properties(buffer.0);
             let language = hb::hb_language_from_string(c"und".as_ptr(), -1);
             hb::hb_buffer_set_language(buffer.0, language);
@@ -379,6 +402,7 @@ impl TextSystem {
                 glyph_id: info.codepoint,
                 synthetic_bold,
                 synthetic_italic,
+                presentation: infer_presentation(text),
             };
             glyphs.push(ShapedGlyph {
                 key,
@@ -419,7 +443,7 @@ impl TextSystem {
         for key in unique {
             let bitmap = self.rasterize(key)?;
             bitmap_bytes = bitmap_bytes
-                .checked_add(bitmap.coverage.len())
+                .checked_add(bitmap.pixels.len())
                 .ok_or(TextError::CapacityExceeded("glyph working-set bytes"))?;
             if bitmap_bytes > MAX_GLYPH_BITMAP_BYTES {
                 return Err(TextError::CapacityExceeded("glyph working-set bytes"));
@@ -441,11 +465,14 @@ impl TextSystem {
             return Ok(bitmap);
         }
         let face = self.face(key.face)?.raw;
-        let load = match self.raster_profile.hinting {
+        let mut load = match self.raster_profile.hinting {
             HintingMode::None => ft::FT_LOAD_NO_HINTING | ft::FT_LOAD_NO_AUTOHINT,
             HintingMode::Slight => ft::FT_LOAD_DEFAULT | ft::FT_LOAD_TARGET_LIGHT,
             HintingMode::Full => ft::FT_LOAD_DEFAULT | ft::FT_LOAD_TARGET_NORMAL,
         };
+        if self.request.color_glyphs {
+            load |= ft::FT_LOAD_COLOR;
+        }
         // SAFETY: face is UI-thread-owned and glyph slot data is copied before the next call.
         if unsafe { ft::FT_Load_Glyph(face, key.glyph_id, load) } != 0 {
             return Err(TextError::FontData(format!(
@@ -462,23 +489,33 @@ impl TextSystem {
         if key.synthetic_bold {
             unsafe { ft::FT_GlyphSlot_Embolden(slot) };
         }
-        if unsafe { ft::FT_Render_Glyph(slot, ft::FT_RENDER_MODE_NORMAL) } != 0 {
+        if unsafe { (*slot).format != ft::FT_GLYPH_FORMAT_BITMAP }
+            && unsafe { ft::FT_Render_Glyph(slot, ft::FT_RENDER_MODE_NORMAL) } != 0
+        {
             return Err(TextError::FontData(format!(
                 "cannot render glyph {}",
                 key.glyph_id
             )));
         }
         let raw = unsafe { &(*slot).bitmap };
-        if raw.pixel_mode != i8::try_from(ft::FT_PIXEL_MODE_GRAY).expect("gray mode fits i8") {
-            return Err(TextError::FontData(
-                "glyph is not grayscale coverage".into(),
-            ));
+        let gray_mode = i8::try_from(ft::FT_PIXEL_MODE_GRAY).expect("gray mode fits i8");
+        let bgra_mode = i8::try_from(ft::FT_PIXEL_MODE_BGRA).expect("BGRA mode fits i8");
+        if raw.pixel_mode != gray_mode
+            && raw.pixel_mode != bgra_mode
+            && (raw.width != 0 || raw.rows != 0)
+        {
+            return Err(TextError::FontData(format!(
+                "glyph bitmap has unsupported pixel mode {}",
+                raw.pixel_mode
+            )));
         }
-        let width = usize::try_from(raw.width)
+        let color = raw.pixel_mode == bgra_mode;
+        let mut width = usize::try_from(raw.width)
             .map_err(|_| TextError::FontData("negative glyph width".into()))?;
-        let rows = usize::try_from(raw.rows)
+        let mut rows = usize::try_from(raw.rows)
             .map_err(|_| TextError::FontData("negative glyph height".into()))?;
-        if width > 2046 || rows > 2046 {
+        let max_dimension = if color { 1022 } else { 2046 };
+        if width > max_dimension || rows > max_dimension {
             return Err(TextError::CapacityExceeded("glyph dimensions"));
         }
         let pitch = usize::try_from(raw.pitch.unsigned_abs())
@@ -486,8 +523,10 @@ impl TextSystem {
         let source_len = rows
             .checked_mul(pitch)
             .ok_or(TextError::CapacityExceeded("glyph bitmap"))?;
+        let bytes_per_pixel = if color { 4 } else { 1 };
         let output_len = rows
             .checked_mul(width)
+            .and_then(|pixels| pixels.checked_mul(bytes_per_pixel))
             .ok_or(TextError::CapacityExceeded("glyph bitmap"))?;
         if output_len > MAX_GLYPH_BITMAP_BYTES {
             return Err(TextError::CapacityExceeded("glyph bitmap cache bytes"));
@@ -500,30 +539,68 @@ impl TextSystem {
         } else {
             unsafe { std::slice::from_raw_parts(raw.buffer, source_len) }
         };
-        let mut coverage = vec![0_u8; output_len];
+        if pitch < width.saturating_mul(bytes_per_pixel) {
+            return Err(TextError::FontData(
+                "glyph pitch is shorter than a row".into(),
+            ));
+        }
+        let mut pixels = vec![0_u8; output_len];
         for row in 0..rows {
             let source_row = if raw.pitch < 0 { rows - 1 - row } else { row };
-            coverage[row * width..(row + 1) * width]
-                .copy_from_slice(&source[source_row * pitch..source_row * pitch + width]);
+            if color {
+                for column in 0..width {
+                    let source_offset = source_row * pitch + column * 4;
+                    let target_offset = (row * width + column) * 4;
+                    pixels[target_offset..target_offset + 4].copy_from_slice(
+                        &bgra_to_straight_rgba(
+                            source[source_offset..source_offset + 4]
+                                .try_into()
+                                .expect("four-byte BGRA pixel"),
+                        ),
+                    );
+                }
+            } else {
+                pixels[row * width..(row + 1) * width]
+                    .copy_from_slice(&source[source_row * pitch..source_row * pitch + width]);
+            }
+        }
+        let mut bearing = [
+            checked_i16(unsafe { (*slot).bitmap_left })?,
+            checked_i16(unsafe { (*slot).bitmap_top })?,
+        ];
+        if color {
+            let max_width = usize::from(self.metrics.width_px.get()).saturating_mul(2);
+            let max_height = usize::from(self.metrics.height_px.get());
+            if width > max_width || rows > max_height {
+                let (scaled, scaled_width, scaled_rows) =
+                    downscale_color_srgba(&pixels, width, rows, max_width, max_height)?;
+                bearing[0] = scale_bearing(bearing[0], scaled_width, width)?;
+                bearing[1] = scale_bearing(bearing[1], scaled_rows, rows)?;
+                pixels = scaled;
+                width = scaled_width;
+                rows = scaled_rows;
+            }
         }
         let bitmap = GlyphBitmap {
-            format: GlyphFormat::Gray8,
+            format: if color {
+                GlyphFormat::ColorSrgba8
+            } else {
+                GlyphFormat::Gray8
+            },
             size_px: [
                 u16::try_from(width).map_err(|_| TextError::CapacityExceeded("glyph width"))?,
                 u16::try_from(rows).map_err(|_| TextError::CapacityExceeded("glyph height"))?,
             ],
-            bearing_px: [
-                checked_i16(unsafe { (*slot).bitmap_left })?,
-                checked_i16(unsafe { (*slot).bitmap_top })?,
-            ],
+            bearing_px: bearing,
             advance_26_6: i32::try_from(unsafe { (*slot).advance.x })
                 .map_err(|_| TextError::FontData("glyph advance overflow".into()))?,
-            coverage: Arc::from(coverage),
+            pixels: Arc::from(pixels),
         };
-        self.make_cache_room(output_len)?;
+        let bitmap_len = bitmap.pixels.len();
+        self.make_cache_room(bitmap_len)?;
         self.glyph_cache_bytes = self
             .glyph_cache_bytes
-            .checked_add(output_len)
+            .checked_add(bitmap_len)
             .ok_or(TextError::CapacityExceeded("glyph bitmap cache bytes"))?;
         self.glyph_cache.insert(
             key,
@@ -563,13 +640,14 @@ impl TextSystem {
                 .ok_or(TextError::CapacityExceeded("glyph bitmap cache entries"))?;
             self.glyph_cache_bytes = self
                 .glyph_cache_bytes
-                .checked_sub(removed.bitmap.coverage.len())
+                .checked_sub(removed.bitmap.pixels.len())
                 .ok_or(TextError::CapacityExceeded("glyph bitmap cache accounting"))?;
             self.cache_evictions = self.cache_evictions.saturating_add(1);
         }
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn resolve_face(
         &mut self,
         cluster: Option<&str>,
@@ -583,7 +661,16 @@ impl TextSystem {
         {
             return Ok(face.id);
         }
-        let matched = font_match(self.fontconfig.0, &self.request, cluster, style)?;
+        let matched = if let Some(path) = &self.request.face_path_override {
+            FontMatch {
+                path: Arc::clone(path),
+                index: 0,
+                family: Arc::from(self.request.family.as_ref()),
+                profile: requested_profile(&self.request),
+            }
+        } else {
+            font_match(self.fontconfig.0, &self.request, cluster, style)?
+        };
         if self.faces.is_empty() {
             self.raster_profile = matched.profile;
             self.resolved_primary = Some(ResolvedFace {
@@ -628,8 +715,44 @@ impl TextSystem {
                 "cannot open matched font {path}"
             )));
         }
-        let size = self.request.physical_size_26_6()?;
-        if unsafe { ft::FT_Set_Char_Size(raw_face, 0, size, 72, 72) } != 0 {
+        let requested_size = self.request.physical_size_26_6()?;
+        let scalable = unsafe { (*raw_face).face_flags & ft::FT_FACE_FLAG_SCALABLE != 0 };
+        let size = if scalable {
+            requested_size
+        } else {
+            let count = usize::try_from(unsafe { (*raw_face).num_fixed_sizes })
+                .map_err(|_| TextError::FontData("invalid bitmap strike count".into()))?;
+            let strikes = if count == 0 || unsafe { (*raw_face).available_sizes.is_null() } {
+                &[][..]
+            } else {
+                unsafe { std::slice::from_raw_parts((*raw_face).available_sizes, count) }
+            };
+            let target = requested_size;
+            let selected = strikes
+                .iter()
+                .enumerate()
+                .filter(|(_, strike)| strike.y_ppem >= target)
+                .min_by_key(|(_, strike)| strike.y_ppem)
+                .or_else(|| {
+                    strikes
+                        .iter()
+                        .enumerate()
+                        .max_by_key(|(_, strike)| strike.y_ppem)
+                })
+                .map(|(index, strike)| (index, strike.y_ppem))
+                .ok_or_else(|| TextError::FontData("bitmap face has no usable strike".into()))?;
+            if unsafe {
+                ft::FT_Select_Size(raw_face, i32::try_from(selected.0).unwrap_or(i32::MAX))
+            } != 0
+            {
+                unsafe { ft::FT_Done_Face(raw_face) };
+                return Err(TextError::FontData(
+                    "cannot select bitmap font strike".into(),
+                ));
+            }
+            selected.1
+        };
+        if scalable && unsafe { ft::FT_Set_Char_Size(raw_face, 0, size, 72, 72) } != 0 {
             unsafe { ft::FT_Done_Face(raw_face) };
             return Err(TextError::FontData(
                 "cannot set FreeType character size".into(),
@@ -655,11 +778,25 @@ impl TextSystem {
                 "cannot create HarfBuzz font objects".into(),
             ));
         }
-        let hb_scale =
-            i32::try_from(size).map_err(|_| TextError::CapacityExceeded("HarfBuzz scale"))?;
+        let ft_size = unsafe { (*raw_face).size };
+        if ft_size.is_null() {
+            unsafe {
+                hb::hb_font_destroy(hb_font);
+                hb::hb_face_destroy(hb_face);
+                hb::hb_blob_destroy(hb_blob);
+                ft::FT_Done_Face(raw_face);
+            }
+            return Err(TextError::FontData("face has no selected size".into()));
+        }
+        let size_metrics = unsafe { (*ft_size).metrics };
+        let x_ppem = size_metrics.x_ppem;
+        let y_ppem = size_metrics.y_ppem;
+        let x_scale = i32::from(x_ppem).saturating_mul(64);
+        let y_scale = i32::from(y_ppem).saturating_mul(64);
         unsafe {
             hb::hb_ot_font_set_funcs(hb_font);
-            hb::hb_font_set_scale(hb_font, hb_scale, hb_scale);
+            hb::hb_font_set_scale(hb_font, x_scale, y_scale);
+            hb::hb_font_set_ppem(hb_font, u32::from(x_ppem), u32::from(y_ppem));
         }
         let id = FaceId(
             u32::try_from(self.faces.len())
@@ -685,9 +822,180 @@ impl TextSystem {
     }
 }
 
+fn bgra_to_straight_rgba([blue, green, red, alpha]: [u8; 4]) -> [u8; 4] {
+    let unpremultiply = |component: u8| -> u8 {
+        if alpha == 0 {
+            0
+        } else {
+            ((u32::from(component) * 255 + u32::from(alpha) / 2) / u32::from(alpha)).min(255) as u8
+        }
+    };
+    [
+        unpremultiply(red),
+        unpremultiply(green),
+        unpremultiply(blue),
+        alpha,
+    ]
+}
+
+fn scale_bearing(value: i16, destination: usize, source: usize) -> Result<i16, TextError> {
+    if source == 0 {
+        return Ok(value);
+    }
+    let numerator = i64::from(value)
+        .checked_mul(
+            i64::try_from(destination).map_err(|_| TextError::CapacityExceeded("bearing"))?,
+        )
+        .ok_or(TextError::CapacityExceeded("bearing"))?;
+    let source = i64::try_from(source).map_err(|_| TextError::CapacityExceeded("bearing"))?;
+    let rounded = if numerator >= 0 {
+        numerator.saturating_add(source / 2) / source
+    } else {
+        numerator.saturating_sub(source / 2) / source
+    };
+    i16::try_from(rounded).map_err(|_| TextError::CapacityExceeded("bearing"))
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn downscale_color_srgba(
+    source: &[u8],
+    width: usize,
+    height: usize,
+    max_width: usize,
+    max_height: usize,
+) -> Result<(Vec<u8>, usize, usize), TextError> {
+    if width == 0 || height == 0 || max_width == 0 || max_height == 0 {
+        return Ok((Vec::new(), 0, 0));
+    }
+    let (out_width, out_height) =
+        if width.saturating_mul(max_height) > height.saturating_mul(max_width) {
+            (
+                max_width,
+                height.saturating_mul(max_width).div_ceil(width).max(1),
+            )
+        } else {
+            (
+                width.saturating_mul(max_height).div_ceil(height).max(1),
+                max_height,
+            )
+        };
+    let output_len = out_width
+        .checked_mul(out_height)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or(TextError::CapacityExceeded("color glyph scaling"))?;
+    if source
+        .len()
+        .checked_add(output_len)
+        .is_none_or(|bytes| bytes > MAX_GLYPH_BITMAP_BYTES)
+    {
+        return Err(TextError::CapacityExceeded("color glyph scaling"));
+    }
+    let mut output = vec![0_u8; output_len];
+    for out_y in 0..out_height {
+        let y0 = out_y * height;
+        let y1 = (out_y + 1) * height;
+        for out_x in 0..out_width {
+            let x0 = out_x * width;
+            let x1 = (out_x + 1) * width;
+            let mut premultiplied = [0.0_f64; 3];
+            let mut alpha_sum = 0.0_f64;
+            let mut weight_sum = 0.0_f64;
+            for source_y in y0 / out_height..y1.div_ceil(out_height) {
+                let overlap_y = y1
+                    .min((source_y + 1) * out_height)
+                    .saturating_sub(y0.max(source_y * out_height));
+                for source_x in x0 / out_width..x1.div_ceil(out_width) {
+                    let overlap_x = x1
+                        .min((source_x + 1) * out_width)
+                        .saturating_sub(x0.max(source_x * out_width));
+                    let weight = (overlap_x * overlap_y) as f64;
+                    let offset = (source_y * width + source_x) * 4;
+                    let alpha = f64::from(source[offset + 3]) / 255.0;
+                    for channel in 0..3 {
+                        premultiplied[channel] +=
+                            srgb_decode(source[offset + channel]) * alpha * weight;
+                    }
+                    alpha_sum += alpha * weight;
+                    weight_sum += weight;
+                }
+            }
+            let target = (out_y * out_width + out_x) * 4;
+            let alpha = if weight_sum == 0.0 {
+                0.0
+            } else {
+                alpha_sum / weight_sum
+            };
+            if alpha > 0.0 {
+                for channel in 0..3 {
+                    output[target + channel] =
+                        srgb_encode(premultiplied[channel] / weight_sum / alpha);
+                }
+            }
+            output[target + 3] = (alpha * 255.0).round().clamp(0.0, 255.0) as u8;
+        }
+    }
+    Ok((output, out_width, out_height))
+}
+
+fn srgb_decode(byte: u8) -> f64 {
+    let value = f64::from(byte) / 255.0;
+    if value <= 0.040_45 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn srgb_encode(value: f64) -> u8 {
+    let value = value.clamp(0.0, 1.0);
+    let encoded = if value <= 0.003_130_8 {
+        value * 12.92
+    } else {
+        1.055 * value.powf(1.0 / 2.4) - 0.055
+    };
+    (encoded * 255.0).round().clamp(0.0, 255.0) as u8
+}
+
 fn face_supports(face: ft::FT_Face, text: &str) -> bool {
-    text.chars()
-        .all(|ch| unsafe { ft::FT_Get_Char_Index(face, u64::from(u32::from(ch))) } != 0)
+    text.chars().all(|ch| {
+        is_fallback_ignorable(ch)
+            || unsafe { ft::FT_Get_Char_Index(face, u64::from(u32::from(ch))) } != 0
+    })
+}
+
+fn infer_presentation(text: &str) -> crate::GlyphPresentation {
+    if text.contains('\u{fe0e}') {
+        return crate::GlyphPresentation::Text;
+    }
+    if text.chars().any(|ch| {
+        matches!(
+            ch,
+            '\u{fe0f}'
+                | '\u{1f1e6}'..='\u{1f1ff}'
+                | '\u{1f300}'..='\u{1faff}'
+                | '\u{2600}'..='\u{27bf}'
+        )
+    }) {
+        crate::GlyphPresentation::Emoji
+    } else {
+        crate::GlyphPresentation::Text
+    }
+}
+
+const fn is_fallback_ignorable(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{200c}'
+            | '\u{200d}'
+            | '\u{fe00}'..='\u{fe0f}'
+            | '\u{e0100}'..='\u{e01ef}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
 }
 
 fn initialize_freetype() -> Result<Library, TextError> {
@@ -777,13 +1085,25 @@ fn font_match(
             ));
         }
         for ch in text.chars() {
-            unsafe { (fc.FcCharSetAddChar)(charset.1, ch as u32) };
+            if !is_fallback_ignorable(ch) {
+                unsafe { (fc.FcCharSetAddChar)(charset.1, ch as u32) };
+            }
         }
         if unsafe {
             (fc.FcPatternAddCharSet)(pattern.1, fc::constants::FC_CHARSET.as_ptr(), charset.1)
         } == 0
         {
             return Err(TextError::Environment("Fontconfig rejected charset".into()));
+        }
+        if text.contains('\u{fe0e}') || infer_presentation(text) == crate::GlyphPresentation::Emoji
+        {
+            unsafe {
+                (fc.FcPatternAddBool)(
+                    pattern.1,
+                    fc::constants::FC_COLOR.as_ptr(),
+                    i32::from(request.color_glyphs && !text.contains('\u{fe0e}')),
+                )
+            };
         }
     }
     if unsafe { (fc.FcConfigSubstitute)(ptr::null_mut(), pattern.1, fc::FcMatchPattern) } == 0 {
@@ -997,6 +1317,79 @@ mod tests {
     use super::*;
 
     #[test]
+    fn freetype_bgra_is_unpremultiplied_and_swizzled() {
+        assert_eq!(bgra_to_straight_rgba([0, 0, 0, 0]), [0, 0, 0, 0]);
+        assert_eq!(bgra_to_straight_rgba([10, 20, 30, 255]), [30, 20, 10, 255]);
+        assert_eq!(
+            bgra_to_straight_rgba([25, 50, 100, 128]),
+            [199, 100, 50, 128]
+        );
+    }
+
+    #[test]
+    fn color_downscale_filters_in_linear_premultiplied_space() {
+        let source = [255, 0, 0, 255, 0, 0, 0, 0];
+        let (scaled, width, height) = downscale_color_srgba(&source, 2, 1, 1, 1).unwrap();
+        assert_eq!((width, height), (1, 1));
+        assert_eq!(&scaled[..3], &[255, 0, 0]);
+        assert_eq!(scaled[3], 128);
+    }
+
+    #[test]
+    fn locked_cbdt_fixture_rasterizes_as_bounded_straight_srgba() {
+        let fixture = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/fonts/noto-color-emoji/NotoColorEmoji.ttf");
+        let request = FontRequest::from_points("Noto Color Emoji", 13.0, 120, false)
+            .unwrap()
+            .with_monospace(false)
+            .with_face_path_override(fixture.to_string_lossy().into_owned());
+        let mut system = TextSystem::new(request).unwrap();
+        let shaped = system
+            .shape_cluster("\u{1f600}\u{fe0f}", FontStyle::Regular)
+            .unwrap();
+        assert!(!shaped.glyphs.is_empty());
+        assert!(shaped.assets.iter().any(|asset| {
+            asset.bitmap.format == GlyphFormat::ColorSrgba8
+                && asset.bitmap.pixels.len()
+                    == usize::from(asset.bitmap.size_px[0])
+                        * usize::from(asset.bitmap.size_px[1])
+                        * 4
+        }));
+        assert!(shaped.assets.iter().all(|asset| {
+            asset.bitmap.size_px[0] <= system.metrics().width_px.get().saturating_mul(2)
+                && asset.bitmap.size_px[1] <= system.metrics().height_px.get()
+        }));
+        for cluster in [
+            "\u{1f44d}\u{1f3fd}",
+            "\u{1f1fa}\u{1f1f8}",
+            "1\u{fe0f}\u{20e3}",
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}",
+        ] {
+            let shaped = system.shape_cluster(cluster, FontStyle::Regular).unwrap();
+            assert!(!shaped.glyphs.is_empty());
+            assert!(shaped.glyphs.iter().all(|glyph| glyph.key.glyph_id != 0));
+            assert!(
+                shaped
+                    .assets
+                    .iter()
+                    .any(|asset| asset.bitmap.format == GlyphFormat::ColorSrgba8)
+            );
+        }
+        let mut text_system =
+            TextSystem::new(FontRequest::from_points("monospace", 13.0, 120, false).unwrap())
+                .unwrap();
+        let text_presentation = text_system
+            .shape_cluster("\u{2600}\u{fe0e}", FontStyle::Regular)
+            .unwrap();
+        assert!(
+            text_presentation
+                .assets
+                .iter()
+                .all(|asset| asset.bitmap.format == GlyphFormat::Gray8)
+        );
+    }
+
+    #[test]
     fn cell_height_includes_the_complete_descender_pixel_extent() {
         assert_eq!(cell_height_26_6(17 * 64, 14 * 64, -4 * 64).unwrap(), 18);
     }
@@ -1023,13 +1416,14 @@ mod tests {
             glyph_id: id,
             synthetic_bold: false,
             synthetic_italic: false,
+            presentation: crate::GlyphPresentation::Text,
         };
         let bitmap = GlyphBitmap {
             format: GlyphFormat::Gray8,
             size_px: [0, 0],
             bearing_px: [0, 0],
             advance_26_6: 0,
-            coverage: Arc::from(vec![0; bytes]),
+            pixels: Arc::from(vec![0; bytes]),
         };
         (key, CachedGlyph { bitmap, last_used })
     }

@@ -22,6 +22,13 @@ pub enum FontStyle {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TextDirection {
+    Auto,
+    LeftToRight,
+    RightToLeft,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum HintingPreference {
     None,
     Slight,
@@ -71,6 +78,8 @@ pub struct FontRequest {
     pub ligatures: bool,
     pub hinting: HintingPreference,
     pub antialiasing: AntialiasPreference,
+    pub color_glyphs: bool,
+    face_path_override: Option<Arc<str>>,
 }
 
 impl FontRequest {
@@ -102,6 +111,8 @@ impl FontRequest {
             ligatures,
             hinting: HintingPreference::Slight,
             antialiasing: AntialiasPreference::Grayscale,
+            color_glyphs: true,
+            face_path_override: None,
         })
     }
 
@@ -119,6 +130,20 @@ impl FontRequest {
     #[must_use]
     pub const fn with_monospace(mut self, monospace: bool) -> Self {
         self.monospace = monospace;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_color_glyphs(mut self, enabled: bool) -> Self {
+        self.color_glyphs = enabled;
+        self
+    }
+
+    /// Selects an exact fixture face without mutating process-global Fontconfig state.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_face_path_override(mut self, path: impl Into<Arc<str>>) -> Self {
+        self.face_path_override = Some(path.into());
         self
     }
 
@@ -162,6 +187,13 @@ pub struct GlyphKey {
     pub glyph_id: u32,
     pub synthetic_bold: bool,
     pub synthetic_italic: bool,
+    pub presentation: GlyphPresentation,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum GlyphPresentation {
+    Text,
+    Emoji,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -170,12 +202,13 @@ pub struct GlyphBitmap {
     pub size_px: [u16; 2],
     pub bearing_px: [i16; 2],
     pub advance_26_6: i32,
-    pub coverage: Arc<[u8]>,
+    pub pixels: Arc<[u8]>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum GlyphFormat {
     Gray8,
+    ColorSrgba8,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -256,8 +289,44 @@ mod tests {
             .shape_cluster("e\u{301}", FontStyle::Regular)
             .unwrap();
         assert!(!shaped.glyphs.is_empty());
-        assert!(shaped.assets.iter().all(|asset| asset.bitmap.coverage.len()
-            == usize::from(asset.bitmap.size_px[0]) * usize::from(asset.bitmap.size_px[1])));
+        assert!(shaped.assets.iter().all(|asset| asset.bitmap.pixels.len()
+            >= usize::from(asset.bitmap.size_px[0]) * usize::from(asset.bitmap.size_px[1])));
+    }
+
+    #[test]
+    fn explicit_rtl_run_preserves_arabic_context_across_cell_boundaries() {
+        let request = FontRequest::from_points("monospace", 13.0, 120, false).unwrap();
+        let mut system = TextSystem::new(request).unwrap();
+        let joined = system
+            .shape_run_only(
+                "\u{0633}\u{0644}\u{0627}\u{0645}",
+                FontStyle::Regular,
+                TextDirection::RightToLeft,
+            )
+            .unwrap();
+        let isolated = "\u{0633}\u{0644}\u{0627}\u{0645}"
+            .chars()
+            .flat_map(|ch| {
+                system
+                    .shape_run_only(
+                        &ch.to_string(),
+                        FontStyle::Regular,
+                        TextDirection::RightToLeft,
+                    )
+                    .unwrap()
+                    .glyphs
+            })
+            .map(|glyph| glyph.key.glyph_id)
+            .collect::<Vec<_>>();
+        assert!(joined.glyphs.iter().all(|glyph| glyph.key.glyph_id != 0));
+        assert_ne!(
+            joined
+                .glyphs
+                .iter()
+                .map(|glyph| glyph.key.glyph_id)
+                .collect::<Vec<_>>(),
+            isolated
+        );
     }
 
     #[test]

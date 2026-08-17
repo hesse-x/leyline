@@ -18,6 +18,7 @@ pub mod tab;
 pub mod terminal;
 pub mod terminfo;
 pub mod ui_runtime;
+pub mod unicode_layout;
 
 use std::{ffi::OsString, sync::Arc};
 

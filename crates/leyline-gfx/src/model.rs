@@ -243,6 +243,21 @@ pub struct SceneData {
     pub glyph_assets: Vec<GlyphAsset>,
     pub source_generation: u64,
     pub font_generation: u64,
+    pub frame_key: FrameKey,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct FrameKey {
+    pub snapshot_generation: u64,
+    pub layout_generation: u64,
+    pub font_generation: u64,
+    pub unicode_policy_generation: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub struct CommittedFrameKey {
+    pub frame: FrameKey,
+    pub atlas_epoch: u64,
 }
 
 pub struct RenderScene<'a> {
@@ -258,6 +273,7 @@ pub struct GlyphPlacement {
     pub origin_px: [i32; 2],
     pub clip_px: [u32; 4],
     pub color: LinearColor,
+    pub color_scale: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -268,6 +284,15 @@ pub struct GlyphInstance {
     pub uv_max: [f32; 2],
     pub color: LinearColor,
     pub atlas_page: u16,
+    pub render_mode: GlyphRenderMode,
+    pub color_scale: f32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum GlyphRenderMode {
+    Gray = 0,
+    Color = 1,
 }
 
 pub enum GfxCommand {
@@ -279,7 +304,7 @@ pub enum GfxCommand {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RenderOutcome {
-    Rendered,
+    Rendered { committed: CommittedFrameKey },
     WaitingForFrame,
     Deferred,
     Idle,

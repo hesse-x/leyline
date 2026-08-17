@@ -18,12 +18,21 @@ use crate::{
         runtime::{AppRuntime, AppRuntimeBuilder, WakeBackend},
     },
     diagnostics::{ClassifiedError, ErrorCategory},
-    frame_composer::{FrameOverlays, compose},
+    frame_composer::{FrameOverlays, compose, downgrade_color_working_set},
     interaction::{ClickTracker, ImeState, LinkCandidate, ScrollbarController, ScrollbarGeometry},
     layout::{ContentInsets, GridLayout, TerminalGeometry},
     session::{SessionAction, SessionReplyRequest, ShutdownPoll, TerminalSession},
     tab::TabManager,
+    unicode_layout::{
+        BuildStep, CaretAffinity, UnicodePolicy, VisualGridMap, VisualHit, VisualMapBuilder,
+        begin_visual_map,
+    },
 };
+
+struct PendingVisualBuild {
+    snapshot: crate::terminal::FrameSnapshot,
+    builder: VisualMapBuilder,
+}
 
 #[allow(clippy::struct_excessive_bools)]
 pub struct UiRuntime {
@@ -62,6 +71,9 @@ pub struct UiRuntime {
     wheel_remainder_120: i32,
     scrollbar: ScrollbarController,
     tab_bar: crate::tab::TabBarPresentation,
+    visual_build: Option<PendingVisualBuild>,
+    pending_visual_map: Option<(leyline_gfx::FrameKey, Arc<VisualGridMap>)>,
+    published_visual_map: Option<Arc<VisualGridMap>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -252,6 +264,7 @@ impl UiRuntime {
     ///
     /// # Errors
     /// Returns a typed graphics initialization failure.
+    #[allow(clippy::too_many_lines)]
     pub fn new(app: App, app_runtime: AppRuntime, wake: EventWake) -> Result<Self, UiRuntimeError> {
         let clear = LinearColor::from_srgba8(app.config().colors.background.0);
         let gfx = GfxRuntime::new(&GfxOptions {
@@ -267,10 +280,19 @@ impl UiRuntime {
         .with_rendering(
             text_hinting(app.config().font.hinting),
             text_antialiasing(app.config().font.antialiasing),
-        );
+        )
+        .with_color_glyphs(app.config().unicode.color_glyphs && gfx.color_glyphs_supported());
         let text = TextSystem::new(request)?;
         let tab_request = tab_font_request(app.config().font.size, gfx.scale().0)?;
         let tab_text = TextSystem::new(tab_request)?;
+        tracing::info!(
+            category = "unicode_profile",
+            bidi = app.config().unicode.bidi,
+            color_glyphs = app.config().unicode.color_glyphs && gfx.color_glyphs_supported(),
+            unicode_bidi = crate::unicode_layout::UNICODE_BIDI_VERSION,
+            unicode_version = "16.0.0",
+            "resolved Unicode layout profile"
+        );
         if let Some(face) = text.resolved_primary() {
             tracing::info!(
                 category = "text_profile",
@@ -286,7 +308,9 @@ impl UiRuntime {
                 cell_height = text.metrics().height_px.get(),
                 baseline = text.metrics().baseline_px,
                 line_spacing = app.config().font.line_spacing,
-                atlas_format = "R8_UNORM",
+                gray_atlas_format = "R8_UNORM",
+                color_atlas_format = "R8G8B8A8_SRGB",
+                color_glyphs = app.config().unicode.color_glyphs && gfx.color_glyphs_supported(),
                 atlas_filter = "nearest",
                 "resolved terminal text profile"
             );
@@ -351,6 +375,9 @@ impl UiRuntime {
             wheel_remainder_120: 0,
             scrollbar: ScrollbarController::default(),
             tab_bar: crate::tab::TabBarPresentation::default(),
+            visual_build: None,
+            pending_visual_map: None,
+            published_visual_map: None,
         })
     }
 
@@ -427,6 +454,7 @@ impl UiRuntime {
             if let Some(snapshot) = self.active_session_mut().end_drain_round()? {
                 self.compose_snapshot(&snapshot)?;
             }
+            self.advance_visual_build()?;
             self.advance_cursor_blink(Instant::now())?;
             self.refresh_active_title()?;
             if self.poll_shutdown()? {
@@ -435,16 +463,40 @@ impl UiRuntime {
             let render_timeout = if self.resize_settle_deadline.is_some() {
                 match self.gfx.try_render_resize_preview()? {
                     RenderOutcome::Deferred => Some(GfxRuntime::retry_delay()),
-                    RenderOutcome::Rendered
-                    | RenderOutcome::WaitingForFrame
-                    | RenderOutcome::Idle => None,
+                    RenderOutcome::Rendered { committed } => {
+                        if let Some(map) =
+                            take_matching_pending(&mut self.pending_visual_map, committed)
+                        {
+                            let mapping_changed =
+                                visual_mapping_changed(self.published_visual_map.as_deref(), &map);
+                            self.published_visual_map = Some(map);
+                            if mapping_changed {
+                                self.cancel_pointer_gesture();
+                            }
+                            self.refresh_text_input_rectangle()?;
+                        }
+                        None
+                    }
+                    RenderOutcome::WaitingForFrame | RenderOutcome::Idle => None,
                 }
             } else {
                 match self.gfx.try_render()? {
                     RenderOutcome::Deferred => Some(GfxRuntime::retry_delay()),
-                    RenderOutcome::Rendered
-                    | RenderOutcome::WaitingForFrame
-                    | RenderOutcome::Idle => None,
+                    RenderOutcome::Rendered { committed } => {
+                        if let Some(map) =
+                            take_matching_pending(&mut self.pending_visual_map, committed)
+                        {
+                            let mapping_changed =
+                                visual_mapping_changed(self.published_visual_map.as_deref(), &map);
+                            self.published_visual_map = Some(map);
+                            if mapping_changed {
+                                self.cancel_pointer_gesture();
+                            }
+                            self.refresh_text_input_rectangle()?;
+                        }
+                        None
+                    }
+                    RenderOutcome::WaitingForFrame | RenderOutcome::Idle => None,
                 }
             };
             let shutdown_poll = self
@@ -471,6 +523,11 @@ impl UiRuntime {
             let timeout = earliest_timeout(timeout, self.scrollbar.next_deadline());
             let timeout = earliest_timeout(timeout, sync_deadline);
             let timeout = earliest_timeout(timeout, self.cursor_blink_deadline);
+            let timeout = if self.visual_build.is_some() {
+                Some(Duration::ZERO)
+            } else {
+                timeout
+            };
             if self
                 .tabs
                 .tabs()
@@ -581,6 +638,7 @@ impl UiRuntime {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn reconfigure_layout(
         &mut self,
         logical: leyline_gfx::LogicalSize,
@@ -599,9 +657,12 @@ impl UiRuntime {
         .with_rendering(
             text_hinting(self.app.config().font.hinting),
             text_antialiasing(self.app.config().font.antialiasing),
+        )
+        .with_color_glyphs(
+            self.app.config().unicode.color_glyphs && self.gfx.color_glyphs_supported(),
         );
-        let mut prepared = self.text.prepare_configure(request)?;
-        let mut prepared_tab = self
+        let prepared = self.text.prepare_configure(request)?;
+        let prepared_tab = self
             .tab_text
             .prepare_configure(tab_font_request(font_size, scale.0)?)?;
         let layout = GridLayout::calculate_with_style(
@@ -620,30 +681,6 @@ impl UiRuntime {
             &self.app.config().tabs,
             self.tab_bar.offset,
         );
-        let scene = if grid_changed {
-            None
-        } else if let Some(snapshot) = self.active_session().latest_snapshot().cloned() {
-            let selection = self.active_session().selection_overlay(snapshot.generation);
-            Some(compose(
-                prepared.text_system_mut(),
-                prepared_tab.text_system_mut(),
-                &snapshot,
-                FrameOverlays {
-                    selection: &selection,
-                    preedit: self.ime.preedit.as_ref(),
-                    paste_confirmation: self.paste_confirmation_overlay(),
-                    scrollbar: None,
-                    tab_bar: Some(&tab_bar),
-                },
-                &layout,
-                &self.app.config().colors,
-                crate::frame_composer::CursorPresentationPolicy {
-                    blink_phase_visible: self.cursor_blink_visible,
-                },
-            )?)
-        } else {
-            None
-        };
         if grid_changed {
             for tab in self.tabs.tabs_mut() {
                 if let Err(error) = tab.session.resize(layout.grid) {
@@ -658,14 +695,18 @@ impl UiRuntime {
         self.text_scale = scale;
         self.font_size = font_size;
         self.layout = layout;
+        self.visual_build = None;
+        self.pending_visual_map = None;
+        self.published_visual_map = None;
+        self.cancel_pointer_gesture();
         self.layout_generation = self
             .layout_generation
             .checked_add(1)
             .ok_or_else(|| UiRuntimeError::Grid("layout generation overflow".into()))?;
         self.tab_bar = tab_bar;
         self.refresh_text_input_rectangle()?;
-        if let Some(scene) = scene {
-            self.gfx.apply(leyline_gfx::GfxCommand::SetScene(scene))?;
+        if !grid_changed {
+            self.compose_latest()?;
         }
         Ok(())
     }
@@ -694,6 +735,10 @@ impl UiRuntime {
             }
         }
         self.layout = layout;
+        self.visual_build = None;
+        self.pending_visual_map = None;
+        self.published_visual_map = None;
+        self.cancel_pointer_gesture();
         self.layout_generation = self
             .layout_generation
             .checked_add(1)
@@ -965,9 +1010,22 @@ impl UiRuntime {
     fn text_input_rectangle(&self) -> Option<leyline_gfx::TextInputRectangle> {
         let snapshot = self.active_session().latest_snapshot()?;
         let scale = self.gfx.scale().0.max(1);
-        let physical_x = self.layout.content_origin_px[0].saturating_add(
-            u32::from(snapshot.cursor.column) * u32::from(self.layout.cell_px[0].get()),
-        );
+        let visual_column = self.published_visual_map.as_ref().map_or_else(
+            || (!self.app.config().unicode.bidi).then_some(snapshot.cursor.column),
+            |map| {
+                (map.snapshot_generation == snapshot.generation)
+                    .then(|| {
+                        map.lines
+                            .get(usize::from(snapshot.cursor.line))?
+                            .logical_to_visual_cell
+                            .get(usize::from(snapshot.cursor.column))
+                            .copied()
+                    })
+                    .flatten()
+            },
+        )?;
+        let physical_x = self.layout.content_origin_px[0]
+            .saturating_add(u32::from(visual_column) * u32::from(self.layout.cell_px[0].get()));
         let physical_y = self.layout.content_origin_px[1].saturating_add(
             u32::from(snapshot.cursor.line) * u32::from(self.layout.cell_px[1].get()),
         );
@@ -993,6 +1051,41 @@ impl UiRuntime {
         &mut self,
         snapshot: &crate::terminal::FrameSnapshot,
     ) -> Result<(), UiRuntimeError> {
+        let builder = begin_visual_map(
+            snapshot,
+            UnicodePolicy {
+                bidi: self.app.config().unicode.bidi,
+                generation: self.layout_generation,
+            },
+        )?;
+        self.visual_build = Some(PendingVisualBuild {
+            snapshot: snapshot.clone(),
+            builder,
+        });
+        Ok(())
+    }
+
+    fn advance_visual_build(&mut self) -> Result<(), UiRuntimeError> {
+        let Some(mut pending) = self.visual_build.take() else {
+            return Ok(());
+        };
+        match pending
+            .builder
+            .step(Instant::now() + Duration::from_millis(2))?
+        {
+            BuildStep::Pending => self.visual_build = Some(pending),
+            BuildStep::Ready(map) => {
+                self.compose_with_visual_map(&pending.snapshot, Arc::new(map))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn compose_with_visual_map(
+        &mut self,
+        snapshot: &crate::terminal::FrameSnapshot,
+        visual_map: Arc<VisualGridMap>,
+    ) -> Result<(), UiRuntimeError> {
         self.update_tab_bar();
         self.ime.reanchor_preedit(
             snapshot.generation,
@@ -1015,7 +1108,7 @@ impl UiRuntime {
                 Instant::now(),
             )
         });
-        let scene = compose(
+        let mut scene = compose(
             &mut self.text,
             &mut self.tab_text,
             snapshot,
@@ -1031,8 +1124,22 @@ impl UiRuntime {
             crate::frame_composer::CursorPresentationPolicy {
                 blink_phase_visible: self.cursor_blink_visible,
             },
+            &visual_map,
+            self.layout_generation,
         )?;
+        if !self.gfx.scene_fits_atlas(&scene)? {
+            if !downgrade_color_working_set(&mut scene) {
+                return Err(crate::frame_composer::ComposeError::Capacity("glyph atlas").into());
+            }
+            tracing::warn!(
+                category = "capacity_pressure",
+                operation = "color_to_gray_rebuild",
+                "mixed atlas exceeded four pages; rebuilt the frame with grayscale emoji"
+            );
+        }
+        let key = scene.frame_key;
         self.gfx.apply(leyline_gfx::GfxCommand::SetScene(scene))?;
+        self.pending_visual_map = Some((key, visual_map));
         Ok(())
     }
 
@@ -1350,6 +1457,9 @@ impl UiRuntime {
     fn quiesce_active_interaction(&mut self) -> Result<(), UiRuntimeError> {
         self.cancel_paste_confirmation()?;
         self.cancel_pointer_gesture();
+        self.visual_build = None;
+        self.pending_visual_map = None;
+        self.published_visual_map = None;
         if let Some(serial) = self.gfx.disable_text_input()? {
             self.ime.record_commit_serial(serial);
         }
@@ -1442,10 +1552,41 @@ impl UiRuntime {
             return Ok(());
         }
         let above_grid = event.position.1 * scale < f64::from(self.layout.content_origin_px[1]);
-        let point = self
-            .layout
-            .cell_at_pixel(pixel)
-            .map(|[column, line]| crate::terminal::SelectionPoint { column, line });
+        let (point, owner_point, selection_endpoint) =
+            self.published_visual_map.as_ref().map_or_else(
+                || (None, None, None),
+                |map| match crate::unicode_layout::hit_test(map, &self.layout, pixel) {
+                    VisualHit::Cell {
+                        physical_point,
+                        owner_point,
+                        caret,
+                    } => {
+                        let columns = map.grid.columns.get();
+                        let endpoint = if caret.logical_boundary >= columns {
+                            (
+                                crate::terminal::SelectionPoint {
+                                    column: columns - 1,
+                                    line: physical_point.line,
+                                },
+                                crate::terminal::SelectionSide::Right,
+                            )
+                        } else {
+                            (
+                                crate::terminal::SelectionPoint {
+                                    column: caret.logical_boundary,
+                                    line: physical_point.line,
+                                },
+                                match caret.affinity {
+                                    CaretAffinity::Before => crate::terminal::SelectionSide::Left,
+                                    CaretAffinity::After => crate::terminal::SelectionSide::Right,
+                                },
+                            )
+                        };
+                        (Some(physical_point), Some(owner_point), Some(endpoint))
+                    }
+                    VisualHit::Outside => (None, None, None),
+                },
+            );
         if self.handle_scrollbar_pointer(&event, [f64::from(pixel[0]), f64::from(pixel[1])])? {
             return Ok(());
         }
@@ -1463,11 +1604,12 @@ impl UiRuntime {
             } if point.is_some() => {
                 let point = point.expect("guarded pointer cell");
                 if modifiers.control && !modifiers.shift && !modifiers.alt && !modifiers.super_key {
-                    self.link_candidate = self.active_session().hyperlink_at(point).map(
+                    let link_point = owner_point.unwrap_or(point);
+                    self.link_candidate = self.active_session().hyperlink_at(link_point).map(
                         |(snapshot_generation, hyperlink, _)| LinkCandidate {
                             snapshot_generation,
                             hyperlink,
-                            point,
+                            point: link_point,
                             modifiers: self.modifiers,
                         },
                     );
@@ -1481,11 +1623,17 @@ impl UiRuntime {
                     point,
                     modifiers,
                 )? {
-                    let kind = self.click_tracker.register(0x110, point, time_ms);
-                    self.active_session_mut()
-                        .start_selection_kind(kind, point)?;
+                    let selection_point = selection_endpoint.map_or(point, |endpoint| endpoint.0);
+                    let kind = self.click_tracker.register(0x110, selection_point, time_ms);
+                    if let Some((point, side)) = selection_endpoint {
+                        self.active_session_mut()
+                            .start_selection_kind_with_side(kind, point, side)?;
+                    } else {
+                        self.active_session_mut()
+                            .start_selection_kind(kind, selection_point)?;
+                    }
                     self.selecting = true;
-                    self.selection_point = Some(point);
+                    self.selection_point = Some(selection_point);
                     self.selection_kind = Some(kind);
                     self.selection_dragged = false;
                 }
@@ -1493,9 +1641,15 @@ impl UiRuntime {
             leyline_gfx::PointerKind::Release { button: 0x110, .. } => {
                 if let Some(candidate) = self.link_candidate.take() {
                     if let Some(point) = point
-                        && let Some((generation, hyperlink, uri)) =
-                            self.active_session().hyperlink_at(point)
-                        && candidate.matches(generation, hyperlink, point, self.modifiers)
+                        && let Some((generation, hyperlink, uri)) = self
+                            .active_session()
+                            .hyperlink_at(owner_point.unwrap_or(point))
+                        && candidate.matches(
+                            generation,
+                            hyperlink,
+                            owner_point.unwrap_or(point),
+                            self.modifiers,
+                        )
                         && let Err(error) = self.desktop_launcher.open(&uri)
                     {
                         tracing::warn!(%error, "link open request rejected");
@@ -1515,7 +1669,12 @@ impl UiRuntime {
                     modifiers,
                 )? && self.selecting
                 {
-                    self.active_session_mut().update_selection(point)?;
+                    if let Some((selection_point, side)) = selection_endpoint {
+                        self.active_session_mut()
+                            .update_selection_with_side(selection_point, side)?;
+                    } else {
+                        self.active_session_mut().update_selection(point)?;
+                    }
                 }
                 if self.selecting
                     && keep_selection_after_release(self.selection_kind, self.selection_dragged)
@@ -1535,9 +1694,15 @@ impl UiRuntime {
             }
             leyline_gfx::PointerKind::Motion { .. } if self.selecting => {
                 if let Some(point) = point {
-                    self.selection_dragged |= self.selection_point != Some(point);
-                    self.active_session_mut().update_selection(point)?;
-                    self.selection_point = Some(point);
+                    let endpoint = selection_endpoint.map_or(point, |endpoint| endpoint.0);
+                    self.selection_dragged |= self.selection_point != Some(endpoint);
+                    if let Some((endpoint, side)) = selection_endpoint {
+                        self.active_session_mut()
+                            .update_selection_with_side(endpoint, side)?;
+                    } else {
+                        self.active_session_mut().update_selection(endpoint)?;
+                    }
+                    self.selection_point = Some(endpoint);
                     self.drag_scroll = None;
                 } else if let Some((direction, point)) = self.drag_scroll_target(pixel, above_grid)
                 {
@@ -2108,7 +2273,8 @@ fn window_title(ordinal: usize, count: usize, title: &str) -> String {
 mod tests {
     use super::{
         accumulate_wheel_steps, format_terminal_query, ignores_key_repeat,
-        keep_selection_after_release, key_text, select_new_tab_cwd, terminal_modifiers,
+        keep_selection_after_release, key_text, select_new_tab_cwd, take_matching_pending,
+        terminal_modifiers, visual_mapping_changed,
     };
 
     #[test]
@@ -2242,6 +2408,54 @@ mod tests {
         assert!(ignores_key_repeat(crate::config::Action::PasteClipboard));
         assert!(ignores_key_repeat(crate::config::Action::PastePrimary));
         assert!(!ignores_key_repeat(crate::config::Action::ScrollPageDown));
+    }
+
+    #[test]
+    fn visual_map_publication_requires_the_exact_committed_frame_key() {
+        let key = leyline_gfx::FrameKey {
+            snapshot_generation: 4,
+            layout_generation: 5,
+            font_generation: 6,
+            unicode_policy_generation: 7,
+        };
+        let mut pending = Some((key, "map"));
+        let stale = leyline_gfx::CommittedFrameKey {
+            frame: leyline_gfx::FrameKey {
+                snapshot_generation: 3,
+                ..key
+            },
+            atlas_epoch: 9,
+        };
+        assert_eq!(take_matching_pending(&mut pending, stale), None);
+        assert!(pending.is_none());
+
+        pending = Some((key, "map"));
+        let matching = leyline_gfx::CommittedFrameKey {
+            frame: key,
+            atlas_epoch: 10,
+        };
+        assert_eq!(take_matching_pending(&mut pending, matching), Some("map"));
+        assert!(pending.is_none());
+    }
+
+    #[test]
+    fn selection_repaint_does_not_invalidate_the_pointer_mapping() {
+        let current = crate::unicode_layout::VisualGridMap {
+            snapshot_generation: 4,
+            policy_generation: 5,
+            grid: crate::terminal::GridSize::new(80, 24).unwrap(),
+            bidi_enabled: true,
+            lines: std::sync::Arc::from([]),
+        };
+        let repaint = current.clone();
+        assert!(!visual_mapping_changed(Some(&current), &repaint));
+
+        let next_snapshot = crate::unicode_layout::VisualGridMap {
+            snapshot_generation: 6,
+            ..current.clone()
+        };
+        assert!(visual_mapping_changed(Some(&current), &next_snapshot));
+        assert!(visual_mapping_changed(None, &current));
     }
 
     #[test]
@@ -2422,6 +2636,24 @@ fn content_insets(config: &crate::config::EffectiveConfig) -> ContentInsets {
     }
 }
 
+fn take_matching_pending<T>(
+    pending: &mut Option<(leyline_gfx::FrameKey, T)>,
+    committed: leyline_gfx::CommittedFrameKey,
+) -> Option<T> {
+    pending
+        .take()
+        .and_then(|(key, value)| (key == committed.frame).then_some(value))
+}
+
+fn visual_mapping_changed(current: Option<&VisualGridMap>, next: &VisualGridMap) -> bool {
+    current.is_none_or(|current| {
+        current.snapshot_generation != next.snapshot_generation
+            || current.policy_generation != next.policy_generation
+            || current.grid != next.grid
+            || current.bidi_enabled != next.bidi_enabled
+    })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum UiRuntimeError {
     #[error(transparent)]
@@ -2449,6 +2681,8 @@ pub enum UiRuntimeError {
     #[error(transparent)]
     Compose(#[from] crate::frame_composer::ComposeError),
     #[error(transparent)]
+    UnicodeLayout(#[from] crate::unicode_layout::UnicodeLayoutError),
+    #[error(transparent)]
     Ime(#[from] crate::interaction::ImeError),
 }
 
@@ -2463,7 +2697,7 @@ impl ClassifiedError for UiRuntimeError {
             Self::Init(GfxInitError::Device(_)) | Self::Graphics(GfxError::Renderer(_)) => {
                 ErrorCategory::Renderer
             }
-            Self::Graphics(GfxError::Internal(_))
+            Self::Graphics(GfxError::Internal(_) | GfxError::Capacity(_))
             | Self::App(_)
             | Self::Wake(_)
             | Self::Session(_)
@@ -2471,7 +2705,8 @@ impl ClassifiedError for UiRuntimeError {
             | Self::Grid(_)
             | Self::Text(_)
             | Self::Layout(_)
-            | Self::Compose(_) => ErrorCategory::Internal,
+            | Self::Compose(_)
+            | Self::UnicodeLayout(_) => ErrorCategory::Internal,
         }
     }
 }

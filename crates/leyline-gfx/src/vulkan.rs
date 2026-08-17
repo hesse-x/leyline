@@ -19,7 +19,7 @@ use gpu_allocator::{
     vulkan::{Allocation, AllocationCreateDesc, AllocationScheme, Allocator, AllocatorCreateDesc},
 };
 
-use crate::atlas::{ATLAS_PAGE_SIZE, AtlasRect, MAX_ATLAS_PAGES};
+use crate::atlas::{AtlasPageFormat, AtlasRect, GRAY_ATLAS_PAGE_SIZE, MAX_ATLAS_PAGES};
 use crate::wayland::WaylandWindow;
 use crate::{
     GfxInitError, GlyphInstance, LinearColor, PixelSize, RectangleInstance, RenderScene, select,
@@ -51,6 +51,7 @@ struct AtlasPage {
     view: vk::ImageView,
     allocation: Allocation,
     initialized: bool,
+    format: AtlasPageFormat,
 }
 struct GlyphResources {
     instances: InstanceBuffer,
@@ -74,6 +75,8 @@ struct GpuGlyph {
     uv_min: [f32; 2],
     uv_max: [f32; 2],
     color: [f32; 4],
+    render_mode: u32,
+    color_scale: f32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -173,6 +176,7 @@ pub(crate) struct VulkanRenderer {
     surface_loader: ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
     physical: vk::PhysicalDevice,
+    color_glyphs_supported: bool,
     device: ash::Device,
     allocator: Option<Allocator>,
     instances: Option<InstanceBuffer>,
@@ -251,6 +255,12 @@ impl VulkanRenderer {
                 return Err(error);
             }
         };
+        let color_properties = unsafe {
+            instance.get_physical_device_format_properties(physical, vk::Format::R8G8B8A8_SRGB)
+        };
+        let color_glyphs_supported = color_properties
+            .optimal_tiling_features
+            .contains(vk::FormatFeatureFlags::SAMPLED_IMAGE | vk::FormatFeatureFlags::TRANSFER_DST);
         let priorities = [1.0];
         let queue_info = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(queue_family)
@@ -280,6 +290,7 @@ impl VulkanRenderer {
             surface_loader,
             surface,
             physical,
+            color_glyphs_supported,
             device,
             allocator: None,
             instances: None,
@@ -335,12 +346,17 @@ impl VulkanRenderer {
         Ok(renderer)
     }
 
+    pub(crate) const fn color_glyphs_supported(&self) -> bool {
+        self.color_glyphs_supported
+    }
+
     pub(crate) fn upload_glyphs(
         &mut self,
         uploads: &[(AtlasRect, GlyphAsset)],
         replace_pending: bool,
     ) -> Result<(), RendererFault> {
         self.health.guard()?;
+        self.ensure_atlas_formats(uploads)?;
         let retained_bytes = if replace_pending {
             0
         } else {
@@ -350,14 +366,14 @@ impl VulkanRenderer {
                 .pending
                 .iter()
                 .try_fold(0usize, |total, (_, asset)| {
-                    total.checked_add(asset.bitmap.coverage.len())
+                    total.checked_add(asset.bitmap.pixels.len())
                 })
                 .ok_or_else(|| RendererFault::Invariant("glyph upload size overflow".into()))?
         };
         let bytes = uploads
             .iter()
             .try_fold(retained_bytes, |total, (_, asset)| {
-                total.checked_add(asset.bitmap.coverage.len())
+                total.checked_add(asset.bitmap.pixels.len())
             })
             .ok_or_else(|| RendererFault::Invariant("glyph upload size overflow".into()))?;
         if bytes > GLYPH_STAGING_PER_SLOT {
@@ -371,6 +387,60 @@ impl VulkanRenderer {
             glyphs.pending_repack = true;
         }
         glyphs.pending.extend_from_slice(uploads);
+        Ok(())
+    }
+
+    fn ensure_atlas_formats(
+        &mut self,
+        uploads: &[(AtlasRect, GlyphAsset)],
+    ) -> Result<(), RendererFault> {
+        let mut changes = Vec::new();
+        for (rect, _) in uploads {
+            let index = usize::from(rect.page);
+            let current = self
+                .glyph
+                .as_ref()
+                .and_then(|glyph| glyph.pages.get(index))
+                .ok_or_else(|| RendererFault::Invariant("atlas page index is invalid".into()))?;
+            if current.format != rect.format && !changes.contains(&(index, rect.format)) {
+                changes.push((index, rect.format));
+            }
+        }
+        if changes.is_empty() {
+            return Ok(());
+        }
+        self.wait_frames()?;
+        for (index, format) in changes {
+            let replacement = self
+                .create_atlas_page(format)
+                .map_err(RendererFault::Invariant)?;
+            let (old, descriptor, sampler) = {
+                let glyph = self.glyph.as_mut().expect("glyph resources");
+                let old = std::mem::replace(&mut glyph.pages[index], replacement);
+                (old, glyph.descriptors[index], glyph.sampler)
+            };
+            let image = [vk::DescriptorImageInfo::default()
+                .sampler(sampler)
+                .image_view(self.glyph.as_ref().expect("glyph resources").pages[index].view)
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)];
+            let write = [vk::WriteDescriptorSet::default()
+                .dst_set(descriptor)
+                .dst_binding(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .image_info(&image)];
+            unsafe {
+                self.device.update_descriptor_sets(&write, &[]);
+                self.device.destroy_image_view(old.view, None);
+                self.device.destroy_image(old.image, None);
+            }
+            self.allocator
+                .as_mut()
+                .expect("allocator initialized")
+                .free(old.allocation)
+                .map_err(|error| {
+                    RendererFault::Invariant(format!("free old atlas page: {error}"))
+                })?;
+        }
         Ok(())
     }
 
@@ -500,6 +570,79 @@ impl VulkanRenderer {
         Ok(InstanceBuffer { buffer, allocation })
     }
 
+    fn create_atlas_page(&mut self, format: AtlasPageFormat) -> Result<AtlasPage, String> {
+        if format == AtlasPageFormat::ColorSrgba8 && !self.color_glyphs_supported {
+            return Err("device does not support sampled sRGBA glyph atlas pages".into());
+        }
+        let image_format = match format {
+            AtlasPageFormat::Gray8 => vk::Format::R8_UNORM,
+            AtlasPageFormat::ColorSrgba8 => vk::Format::R8G8B8A8_SRGB,
+        };
+        let extent = u32::from(format.extent());
+        let image = unsafe {
+            self.device.create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(image_format)
+                    .extent(vk::Extent3D {
+                        width: extent,
+                        height: extent,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .initial_layout(vk::ImageLayout::UNDEFINED),
+                None,
+            )
+        }
+        .map_err(vk_error("create glyph atlas image"))?;
+        let requirements = unsafe { self.device.get_image_memory_requirements(image) };
+        let allocation = self
+            .allocator
+            .as_mut()
+            .expect("allocator initialized")
+            .allocate(&AllocationCreateDesc {
+                name: "glyph atlas",
+                requirements,
+                location: MemoryLocation::GpuOnly,
+                linear: false,
+                allocation_scheme: AllocationScheme::GpuAllocatorManaged,
+            })
+            .map_err(|error| format!("allocate glyph atlas: {error}"))?;
+        unsafe {
+            self.device
+                .bind_image_memory(image, allocation.memory(), allocation.offset())
+        }
+        .map_err(vk_error("bind glyph atlas image"))?;
+        let view = unsafe {
+            self.device.create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(image_format)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        level_count: 1,
+                        layer_count: 1,
+                        ..Default::default()
+                    }),
+                None,
+            )
+        }
+        .map_err(vk_error("create glyph atlas view"))?;
+        Ok(AtlasPage {
+            image,
+            view,
+            allocation,
+            initialized: false,
+            format,
+        })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn create_glyph_resources(&mut self) -> Result<GlyphResources, String> {
         let instances = self.create_buffer(
@@ -513,72 +656,12 @@ impl VulkanRenderer {
             "glyph staging",
         )?;
         let properties = unsafe { self.instance.get_physical_device_properties(self.physical) };
-        if properties.limits.max_image_dimension2_d < u32::from(ATLAS_PAGE_SIZE) {
+        if properties.limits.max_image_dimension2_d < u32::from(GRAY_ATLAS_PAGE_SIZE) {
             return Err("device cannot create 2048x2048 glyph atlas".into());
         }
         let mut pages = Vec::new();
         for _ in 0..MAX_ATLAS_PAGES {
-            let image = unsafe {
-                self.device.create_image(
-                    &vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .format(vk::Format::R8_UNORM)
-                        .extent(vk::Extent3D {
-                            width: u32::from(ATLAS_PAGE_SIZE),
-                            height: u32::from(ATLAS_PAGE_SIZE),
-                            depth: 1,
-                        })
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .initial_layout(vk::ImageLayout::UNDEFINED),
-                    None,
-                )
-            }
-            .map_err(vk_error("create glyph atlas image"))?;
-            let requirements = unsafe { self.device.get_image_memory_requirements(image) };
-            let allocation = self
-                .allocator
-                .as_mut()
-                .expect("allocator initialized")
-                .allocate(&AllocationCreateDesc {
-                    name: "glyph atlas",
-                    requirements,
-                    location: MemoryLocation::GpuOnly,
-                    linear: false,
-                    allocation_scheme: AllocationScheme::GpuAllocatorManaged,
-                })
-                .map_err(|error| format!("allocate glyph atlas: {error}"))?;
-            unsafe {
-                self.device
-                    .bind_image_memory(image, allocation.memory(), allocation.offset())
-            }
-            .map_err(vk_error("bind glyph atlas image"))?;
-            let view = unsafe {
-                self.device.create_image_view(
-                    &vk::ImageViewCreateInfo::default()
-                        .image(image)
-                        .view_type(vk::ImageViewType::TYPE_2D)
-                        .format(vk::Format::R8_UNORM)
-                        .subresource_range(vk::ImageSubresourceRange {
-                            aspect_mask: vk::ImageAspectFlags::COLOR,
-                            level_count: 1,
-                            layer_count: 1,
-                            ..Default::default()
-                        }),
-                    None,
-                )
-            }
-            .map_err(vk_error("create glyph atlas view"))?;
-            pages.push(AtlasPage {
-                image,
-                view,
-                allocation,
-                initialized: false,
-            });
+            pages.push(self.create_atlas_page(AtlasPageFormat::Gray8)?);
         }
         let sampler = unsafe {
             self.device.create_sampler(
@@ -744,6 +827,18 @@ impl VulkanRenderer {
                 binding: 0,
                 format: vk::Format::R32G32B32A32_SFLOAT,
                 offset: 32,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 5,
+                binding: 0,
+                format: vk::Format::R32_UINT,
+                offset: 48,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 6,
+                binding: 0,
+                format: vk::Format::R32_SFLOAT,
+                offset: 52,
             },
         ];
         let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
@@ -1381,7 +1476,7 @@ impl VulkanRenderer {
             .ok_or("glyph staging memory is not mapped")?;
         let mut copies = Vec::new();
         for (rect, asset) in &glyphs.pending {
-            let bytes = asset.bitmap.coverage.as_ref();
+            let bytes = asset.bitmap.pixels.as_ref();
             let end = staging_offset
                 .checked_add(bytes.len())
                 .ok_or("glyph staging offset overflow")?;
@@ -1543,6 +1638,8 @@ impl VulkanRenderer {
                     glyph.color.blue,
                     glyph.color.alpha,
                 ],
+                render_mode: glyph.render_mode as u32,
+                color_scale: glyph.color_scale,
             };
             let start = offset + index * size_of::<GpuGlyph>();
             mapped[start..start + size_of::<GpuGlyph>()].copy_from_slice(as_bytes(&gpu));

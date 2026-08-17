@@ -17,10 +17,10 @@ pub use input::{
     logical_key_from_keysym,
 };
 pub use model::{
-    ClipboardEvent, GfxCommand, GlyphInstance, GlyphPlacement, KeyInput, KeyState, LinearColor,
-    LogicalSize, ModifiersState, PixelSize, PlatformEvent, PointerInput, PointerKind,
-    RectangleInstance, RenderOutcome, RenderScene, Scale120, SceneData, SelectionTarget,
-    TextInputEvent, TextInputRectangle, WindowState,
+    ClipboardEvent, CommittedFrameKey, FrameKey, GfxCommand, GlyphInstance, GlyphPlacement,
+    GlyphRenderMode, KeyInput, KeyState, LinearColor, LogicalSize, ModifiersState, PixelSize,
+    PlatformEvent, PointerInput, PointerKind, RectangleInstance, RenderOutcome, RenderScene,
+    Scale120, SceneData, SelectionTarget, TextInputEvent, TextInputRectangle, WindowState,
 };
 pub use runtime::{GfxError, GfxInitError, GfxOptions, GfxRuntime, MAX_WINDOW_TITLE_BYTES};
 pub use vulkan::{RendererFault, RendererOperation};

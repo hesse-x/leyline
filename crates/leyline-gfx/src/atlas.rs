@@ -1,11 +1,37 @@
 use std::collections::HashMap;
 
-use leyline_text::{GlyphAsset, GlyphKey};
+use leyline_text::{GlyphAsset, GlyphFormat, GlyphKey};
 
 use crate::{GlyphInstance, GlyphPlacement};
 
-pub const ATLAS_PAGE_SIZE: u16 = 2048;
+pub const GRAY_ATLAS_PAGE_SIZE: u16 = 2048;
+pub const COLOR_ATLAS_PAGE_SIZE: u16 = 1024;
 pub const MAX_ATLAS_PAGES: usize = 4;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum AtlasPageFormat {
+    Gray8,
+    ColorSrgba8,
+}
+
+impl AtlasPageFormat {
+    #[must_use]
+    pub const fn extent(self) -> u16 {
+        match self {
+            Self::Gray8 => GRAY_ATLAS_PAGE_SIZE,
+            Self::ColorSrgba8 => COLOR_ATLAS_PAGE_SIZE,
+        }
+    }
+}
+
+impl From<GlyphFormat> for AtlasPageFormat {
+    fn from(value: GlyphFormat) -> Self {
+        match value {
+            GlyphFormat::Gray8 => Self::Gray8,
+            GlyphFormat::ColorSrgba8 => Self::ColorSrgba8,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AtlasRect {
@@ -14,13 +40,26 @@ pub struct AtlasRect {
     pub y: u16,
     pub width: u16,
     pub height: u16,
+    pub format: AtlasPageFormat,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct ShelfPage {
+    format: AtlasPageFormat,
     x: u16,
     y: u16,
     row_height: u16,
+}
+
+impl ShelfPage {
+    const fn new(format: AtlasPageFormat) -> Self {
+        Self {
+            format,
+            x: 0,
+            y: 0,
+            row_height: 0,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -53,6 +92,8 @@ impl AtlasPreparation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AtlasStats {
     pub pages: usize,
+    pub gray_pages: usize,
+    pub color_pages: usize,
     pub entries: usize,
     pub epoch: u64,
     pub repacks: u64,
@@ -62,7 +103,7 @@ impl AtlasManager {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            pages: vec![ShelfPage::default()],
+            pages: Vec::new(),
             entries: HashMap::new(),
             epoch: 0,
             repacks: 0,
@@ -73,6 +114,16 @@ impl AtlasManager {
     pub fn stats(&self) -> AtlasStats {
         AtlasStats {
             pages: self.pages.len(),
+            gray_pages: self
+                .pages
+                .iter()
+                .filter(|page| page.format == AtlasPageFormat::Gray8)
+                .count(),
+            color_pages: self
+                .pages
+                .iter()
+                .filter(|page| page.format == AtlasPageFormat::ColorSrgba8)
+                .count(),
             entries: self.entries.len(),
             epoch: self.epoch,
             repacks: self.repacks,
@@ -92,7 +143,11 @@ impl AtlasManager {
             if asset.bitmap.size_px == [0, 0] || next.entries.contains_key(&asset.key) {
                 continue;
             }
-            let rect = match next.allocate(asset.bitmap.size_px[0], asset.bitmap.size_px[1]) {
+            let rect = match next.allocate(
+                asset.bitmap.format.into(),
+                asset.bitmap.size_px[0],
+                asset.bitmap.size_px[1],
+            ) {
                 Ok(rect) => rect,
                 Err(AtlasError::Full) => return self.prepare_repack(placements, assets),
                 Err(error) => return Err(error),
@@ -123,7 +178,11 @@ impl AtlasManager {
             if asset.bitmap.size_px == [0, 0] || next.entries.contains_key(&asset.key) {
                 continue;
             }
-            let rect = next.allocate(asset.bitmap.size_px[0], asset.bitmap.size_px[1])?;
+            let rect = next.allocate(
+                asset.bitmap.format.into(),
+                asset.bitmap.size_px[0],
+                asset.bitmap.size_px[1],
+            )?;
             next.entries.insert(asset.key, rect);
             uploads.push((rect, asset.clone()));
         }
@@ -145,16 +204,24 @@ impl AtlasManager {
         result
     }
 
-    fn allocate(&mut self, width: u16, height: u16) -> Result<AtlasRect, AtlasError> {
+    fn allocate(
+        &mut self,
+        format: AtlasPageFormat,
+        width: u16,
+        height: u16,
+    ) -> Result<AtlasRect, AtlasError> {
         let padded_width = width.checked_add(2).ok_or(AtlasError::TooLarge)?;
         let padded_height = height.checked_add(2).ok_or(AtlasError::TooLarge)?;
-        if padded_width > ATLAS_PAGE_SIZE || padded_height > ATLAS_PAGE_SIZE {
+        let extent = format.extent();
+        if padded_width > extent || padded_height > extent {
             return Err(AtlasError::TooLarge);
         }
-        loop {
-            let page_index = self.pages.len() - 1;
+        for page_index in 0..self.pages.len() {
             let page = &mut self.pages[page_index];
-            if u32::from(page.x) + u32::from(padded_width) > u32::from(ATLAS_PAGE_SIZE) {
+            if page.format != format {
+                continue;
+            }
+            if u32::from(page.x) + u32::from(padded_width) > u32::from(extent) {
                 page.x = 0;
                 page.y = page
                     .y
@@ -162,34 +229,39 @@ impl AtlasManager {
                     .ok_or(AtlasError::Overflow)?;
                 page.row_height = 0;
             }
-            if u32::from(page.y) + u32::from(padded_height) <= u32::from(ATLAS_PAGE_SIZE) {
+            if u32::from(page.y) + u32::from(padded_height) <= u32::from(extent) {
                 let rect = AtlasRect {
                     page: u16::try_from(page_index).map_err(|_| AtlasError::Overflow)?,
                     x: page.x + 1,
                     y: page.y + 1,
                     width,
                     height,
+                    format,
                 };
                 page.x += padded_width;
                 page.row_height = page.row_height.max(padded_height);
                 return Ok(rect);
             }
-            if self.pages.len() >= MAX_ATLAS_PAGES {
-                return Err(AtlasError::Full);
-            }
-            self.pages.push(ShelfPage::default());
         }
+        if self.pages.len() >= MAX_ATLAS_PAGES {
+            return Err(AtlasError::Full);
+        }
+        self.pages.push(ShelfPage::new(format));
+        self.allocate(format, width, height)
     }
 }
 
 fn validate_bitmap(asset: &GlyphAsset) -> Result<(), AtlasError> {
-    if asset.bitmap.format != leyline_text::GlyphFormat::Gray8 {
-        return Err(AtlasError::UnsupportedFormat);
-    }
-    let expected = usize::from(asset.bitmap.size_px[0])
+    let pixels = usize::from(asset.bitmap.size_px[0])
         .checked_mul(usize::from(asset.bitmap.size_px[1]))
         .ok_or(AtlasError::Overflow)?;
-    if asset.bitmap.coverage.len() != expected {
+    let expected = pixels
+        .checked_mul(match asset.bitmap.format {
+            GlyphFormat::Gray8 => 1,
+            GlyphFormat::ColorSrgba8 => 4,
+        })
+        .ok_or(AtlasError::Overflow)?;
+    if asset.bitmap.pixels.len() != expected {
         return Err(AtlasError::InvalidBitmap);
     }
     Ok(())
@@ -237,7 +309,7 @@ fn build_instances(
         if width == 0 || height == 0 {
             continue;
         }
-        let atlas = f32::from(ATLAS_PAGE_SIZE);
+        let atlas = f32::from(rect.format.extent());
         instances.push(GlyphInstance {
             origin_px: [x as f32, y as f32],
             size_px: [width as f32, height as f32],
@@ -257,6 +329,11 @@ fn build_instances(
             ],
             color: placement.color,
             atlas_page: rect.page,
+            render_mode: match rect.format {
+                AtlasPageFormat::Gray8 => crate::GlyphRenderMode::Gray,
+                AtlasPageFormat::ColorSrgba8 => crate::GlyphRenderMode::Color,
+            },
+            color_scale: placement.color_scale,
         });
     }
     instances.sort_by_key(|glyph| glyph.atlas_page);
@@ -269,7 +346,7 @@ impl Default for AtlasManager {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AtlasError {
     #[error("glyph is too large for an atlas page")]
     TooLarge,
@@ -281,8 +358,6 @@ pub enum AtlasError {
     MissingAsset,
     #[error("glyph bitmap length does not match its declared dimensions")]
     InvalidBitmap,
-    #[error("glyph bitmap format is unsupported by the grayscale atlas")]
-    UnsupportedFormat,
 }
 
 #[cfg(test)]
@@ -299,15 +374,23 @@ mod tests {
                 glyph_id: id,
                 synthetic_bold: false,
                 synthetic_italic: false,
+                presentation: leyline_text::GlyphPresentation::Text,
             },
             bitmap: GlyphBitmap {
                 format: leyline_text::GlyphFormat::Gray8,
                 size_px: size,
                 bearing_px: [0, 0],
                 advance_26_6: 64,
-                coverage: Arc::from(vec![0; usize::from(size[0]) * usize::from(size[1])]),
+                pixels: Arc::from(vec![0; usize::from(size[0]) * usize::from(size[1])]),
             },
         }
+    }
+
+    fn color_asset(id: u32, size: [u16; 2]) -> GlyphAsset {
+        let mut asset = asset(id, size);
+        asset.bitmap.format = GlyphFormat::ColorSrgba8;
+        asset.bitmap.pixels = Arc::from(vec![255; usize::from(size[0]) * usize::from(size[1]) * 4]);
+        asset
     }
 
     fn placement(asset: &GlyphAsset) -> GlyphPlacement {
@@ -321,13 +404,14 @@ mod tests {
                 u32::from(asset.bitmap.size_px[1]),
             ],
             color: crate::LinearColor::from_srgba8(0xffff_ffff),
+            color_scale: 1.0,
         }
     }
     #[test]
     fn allocation_includes_transparent_gutter() {
         let mut atlas = AtlasManager::new();
-        let first = atlas.allocate(10, 10).unwrap();
-        let second = atlas.allocate(10, 10).unwrap();
+        let first = atlas.allocate(AtlasPageFormat::Gray8, 10, 10).unwrap();
+        let second = atlas.allocate(AtlasPageFormat::Gray8, 10, 10).unwrap();
         assert_eq!(first.x, 1);
         assert_eq!(second.x, 13);
     }
@@ -335,9 +419,12 @@ mod tests {
     fn page_count_is_hard_bounded() {
         let mut atlas = AtlasManager::new();
         for _ in 0..MAX_ATLAS_PAGES {
-            let _ = atlas.allocate(2046, 2046).unwrap();
+            let _ = atlas.allocate(AtlasPageFormat::Gray8, 2046, 2046).unwrap();
         }
-        assert!(matches!(atlas.allocate(2046, 2046), Err(AtlasError::Full)));
+        assert!(matches!(
+            atlas.allocate(AtlasPageFormat::Gray8, 2046, 2046),
+            Err(AtlasError::Full)
+        ));
     }
 
     #[test]
@@ -348,6 +435,48 @@ mod tests {
         assert_eq!(atlas.stats().entries, 0);
         atlas.commit(prepared);
         assert_eq!(atlas.stats().entries, 1);
+    }
+
+    #[test]
+    fn mixed_formats_use_equal_byte_pages_and_distinct_extents() {
+        let gray = asset(1, [32, 32]);
+        let color = color_asset(2, [32, 32]);
+        let prepared = AtlasManager::new()
+            .prepare(&[placement(&gray), placement(&color)], &[gray, color])
+            .unwrap();
+        assert_eq!(prepared.uploads.len(), 2);
+        assert_eq!(prepared.uploads[0].0.format, AtlasPageFormat::Gray8);
+        assert_eq!(prepared.uploads[1].0.format, AtlasPageFormat::ColorSrgba8);
+        assert_eq!(prepared.uploads[0].0.format.extent(), 2048);
+        assert_eq!(prepared.uploads[1].0.format.extent(), 1024);
+        assert_ne!(prepared.uploads[0].0.page, prepared.uploads[1].0.page);
+    }
+
+    #[test]
+    fn every_four_page_gray_color_distribution_is_bounded() {
+        for color_pages in 0..=MAX_ATLAS_PAGES {
+            let mut assets = Vec::new();
+            for page in 0..MAX_ATLAS_PAGES {
+                let id = u32::try_from(page).unwrap();
+                assets.push(if page < color_pages {
+                    color_asset(id, [1022, 1022])
+                } else {
+                    asset(id, [2046, 2046])
+                });
+            }
+            let placements = assets.iter().map(placement).collect::<Vec<_>>();
+            let prepared = AtlasManager::new().prepare(&placements, &assets).unwrap();
+            assert_eq!(prepared.next.pages.len(), MAX_ATLAS_PAGES);
+            assert_eq!(
+                prepared
+                    .next
+                    .pages
+                    .iter()
+                    .filter(|page| page.format == AtlasPageFormat::ColorSrgba8)
+                    .count(),
+                color_pages
+            );
+        }
     }
 
     #[test]

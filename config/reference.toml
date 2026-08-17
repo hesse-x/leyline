@@ -10,6 +10,11 @@ hinting = "slight"
 antialiasing = "grayscale"
 line_spacing = 1.0
 
+[unicode]
+# Bidi remains opt-in for terminal applications that already arrange their own cells.
+bidi = false
+color_glyphs = true
+
 [colors]
 foreground = "#d8dcd8"
 background = "#2e3436e6"
