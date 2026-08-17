@@ -1,9 +1,9 @@
 use std::{
-    ffi::{OsStr, OsString},
+    ffi::{CString, OsStr, OsString},
     fs::File,
     io,
     os::{
-        fd::{FromRawFd, RawFd},
+        fd::{AsRawFd, FromRawFd, RawFd},
         unix::ffi::OsStrExt,
         unix::process::CommandExt,
     },
@@ -68,11 +68,11 @@ impl PtySize {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SpawnSpec {
     pub program: OsString,
     pub args: Vec<OsString>,
-    pub cwd: PathBuf,
+    pub cwd: SpawnDirectory,
     pub environment: Vec<(OsString, OsString)>,
     pub initial_size: PtySize,
 }
@@ -85,17 +85,18 @@ impl SpawnSpec {
     pub fn command(
         program: OsString,
         args: Vec<OsString>,
+        cwd: SpawnDirectory,
         initial_size: PtySize,
     ) -> Result<Self, SpawnError> {
         validate_word("program", &program)?;
         for arg in &args {
             validate_word("argument", arg)?;
         }
-        let cwd = std::env::current_dir().map_err(SpawnError::CurrentDirectory)?;
         let mut environment: Vec<_> = std::env::vars_os().collect();
-        environment.retain(|(key, _)| key != "TERM" && key != "COLORTERM");
+        environment.retain(|(key, _)| key != "TERM" && key != "COLORTERM" && key != "PWD");
         environment.push(("TERM".into(), "xterm-256color".into()));
         environment.push(("COLORTERM".into(), "truecolor".into()));
+        environment.push(("PWD".into(), cwd.logical_path().as_os_str().to_owned()));
         Ok(Self {
             program,
             args,
@@ -109,9 +110,84 @@ impl SpawnSpec {
     ///
     /// # Errors
     /// Returns a typed account lookup or specification error.
-    pub fn default_shell(initial_size: PtySize) -> Result<Self, SpawnError> {
+    pub fn default_shell(cwd: SpawnDirectory, initial_size: PtySize) -> Result<Self, SpawnError> {
         let shell = system_shell()?;
-        Self::command(shell, vec![OsString::from("-i")], initial_size)
+        Self::command(shell, vec![OsString::from("-i")], cwd, initial_size)
+    }
+}
+
+#[derive(Debug)]
+pub struct SpawnDirectory {
+    handle: File,
+    logical_path: PathBuf,
+}
+
+impl SpawnDirectory {
+    /// Opens and freezes an absolute directory for a later child `fchdir`.
+    ///
+    /// # Errors
+    /// Returns a typed directory error for invalid or inaccessible paths.
+    pub fn open(path: &std::path::Path) -> Result<Self, SpawnDirectoryError> {
+        if !path.is_absolute() || path.as_os_str().as_bytes().contains(&0) {
+            return Err(SpawnDirectoryError::InvalidPath);
+        }
+        let path_bytes = path.as_os_str().as_bytes();
+        let c_path = CString::new(path_bytes).map_err(|_| SpawnDirectoryError::InvalidPath)?;
+        // SAFETY: `c_path` is NUL terminated and open returns a newly owned descriptor.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+            )
+        };
+        if fd == -1 {
+            return Err(SpawnDirectoryError::Open(io::Error::last_os_error()));
+        }
+        // SAFETY: successful open returned a uniquely owned descriptor.
+        let handle = unsafe { File::from_raw_fd(fd) };
+        // Check search permission against effective credentials without requiring read permission.
+        // SAFETY: the descriptor is valid and the empty C string is static and NUL terminated.
+        let access = unsafe {
+            libc::syscall(
+                libc::SYS_faccessat2,
+                handle.as_raw_fd(),
+                c"".as_ptr(),
+                libc::X_OK,
+                libc::AT_EMPTY_PATH | libc::AT_EACCESS,
+            )
+        };
+        if access == -1 {
+            return Err(SpawnDirectoryError::Search(io::Error::last_os_error()));
+        }
+        Ok(Self {
+            handle,
+            logical_path: path.to_owned(),
+        })
+    }
+
+    #[must_use]
+    pub fn logical_path(&self) -> &std::path::Path {
+        &self.logical_path
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum SpawnDirectoryError {
+    #[error("working directory must be an absolute path without NUL")]
+    InvalidPath,
+    #[error("cannot open working directory: {0}")]
+    Open(io::Error),
+    #[error("working directory is not searchable: {0}")]
+    Search(io::Error),
+}
+
+impl SpawnDirectoryError {
+    #[must_use]
+    pub fn raw_os_error(&self) -> Option<i32> {
+        match self {
+            Self::InvalidPath => None,
+            Self::Open(error) | Self::Search(error) => error.raw_os_error(),
+        }
     }
 }
 
@@ -197,12 +273,9 @@ impl PtyProcess {
     pub fn spawn(spec: SpawnSpec, sinks: PtySinks) -> Result<Self, SpawnError> {
         validate_spec(&spec)?;
         let (master, slave) = open_pty(spec.initial_size)?;
+        let cwd_fd = spec.cwd.handle.as_raw_fd();
         let mut command = Command::new(&spec.program);
-        command
-            .args(&spec.args)
-            .current_dir(&spec.cwd)
-            .env_clear()
-            .envs(spec.environment);
+        command.args(&spec.args).env_clear().envs(spec.environment);
         let stdin = slave.try_clone().map_err(SpawnError::Pty)?;
         let stdout = slave.try_clone().map_err(SpawnError::Pty)?;
         command
@@ -211,7 +284,10 @@ impl PtyProcess {
             .stderr(Stdio::from(slave));
         // SAFETY: the closure only invokes async-signal-safe libc calls and reports errno through Command's exec handshake.
         unsafe {
-            command.pre_exec(|| {
+            command.pre_exec(move || {
+                if libc::fchdir(cwd_fd) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
                 if libc::setsid() == -1 {
                     return Err(io::Error::last_os_error());
                 }
@@ -672,8 +748,6 @@ fn map_exit(status: std::process::ExitStatus) -> ChildExit {
     )
 }
 
-use std::os::fd::AsRawFd;
-
 fn open_pidfd(pid: u32) -> io::Result<File> {
     // SAFETY: pidfd_open takes scalar arguments and returns a new owned descriptor.
     let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -711,8 +785,6 @@ pub enum SpawnError {
     InvalidWord(&'static str),
     #[error("invalid environment entry")]
     InvalidEnvironment,
-    #[error("cannot determine current directory: {0}")]
-    CurrentDirectory(io::Error),
     #[error("cannot query account shell: {0}")]
     ShellLookup(io::Error),
     #[error("current user has no account record")]
@@ -757,6 +829,10 @@ mod tests {
         time::Duration,
     };
 
+    fn cwd() -> SpawnDirectory {
+        SpawnDirectory::open(std::path::Path::new("/tmp")).unwrap()
+    }
+
     fn collect(
         spec: SpawnSpec,
     ) -> (
@@ -795,8 +871,9 @@ mod tests {
             "/bin/sh".into(),
             vec![
                 "-c".into(),
-                "printf '%s:%s' \"$TERM\" \"$COLORTERM\"".into(),
+                "printf '%s:%s:%s:' \"$TERM\" \"$COLORTERM\" \"$PWD\"; pwd".into(),
             ],
+            cwd(),
             size,
         )
         .unwrap();
@@ -807,11 +884,12 @@ mod tests {
         process.join().unwrap();
         let text = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
         assert!(text.contains("xterm-256color:truecolor"), "{text:?}");
+        assert!(text.contains(":/tmp:/tmp"), "{text:?}");
     }
 
     #[test]
     fn default_shell_uses_absolute_account_shell_and_interactive_non_login_argv() {
-        let spec = SpawnSpec::default_shell(PtySize::new(80, 24, 0, 0).unwrap()).unwrap();
+        let spec = SpawnSpec::default_shell(cwd(), PtySize::new(80, 24, 0, 0).unwrap()).unwrap();
         assert!(PathBuf::from(&spec.program).is_absolute());
         assert_eq!(spec.args, [OsString::from("-i")]);
     }
@@ -826,6 +904,7 @@ mod tests {
         let spec = SpawnSpec::command(
             "/bin/sh".into(),
             vec!["-c".into(), script.into(), "helper".into(), non_utf8],
+            cwd(),
             size,
         )
         .unwrap();
@@ -841,8 +920,13 @@ mod tests {
     fn resize_delivers_sigwinch_and_new_kernel_size() {
         let size = PtySize::new(40, 12, 0, 0).unwrap();
         let script = "trap 'stty size; exit 0' WINCH; printf ready; while :; do read x; done";
-        let spec =
-            SpawnSpec::command("/bin/sh".into(), vec!["-c".into(), script.into()], size).unwrap();
+        let spec = SpawnSpec::command(
+            "/bin/sh".into(),
+            vec!["-c".into(), script.into()],
+            cwd(),
+            size,
+        )
+        .unwrap();
         let (process, output, done) = collect(spec);
         let deadline = Instant::now() + Duration::from_secs(2);
         while !output
@@ -867,8 +951,13 @@ mod tests {
         let size = PtySize::new(40, 12, 0, 0).unwrap();
         let script = "stty -echo; trap 'printf RESIZE:; stty size' WINCH; \
                       printf ready; while :; do :; done";
-        let spec =
-            SpawnSpec::command("/bin/sh".into(), vec!["-c".into(), script.into()], size).unwrap();
+        let spec = SpawnSpec::command(
+            "/bin/sh".into(),
+            vec!["-c".into(), script.into()],
+            cwd(),
+            size,
+        )
+        .unwrap();
         let (process, output, _done) = collect(spec);
         let deadline = Instant::now() + Duration::from_secs(2);
         while !output
@@ -912,8 +1001,13 @@ mod tests {
     fn shutdown_escalates_for_child_ignoring_sigterm() {
         let size = PtySize::new(40, 12, 0, 0).unwrap();
         let script = "trap '' TERM HUP; printf ready; while :; do :; done";
-        let spec =
-            SpawnSpec::command("/bin/sh".into(), vec!["-c".into(), script.into()], size).unwrap();
+        let spec = SpawnSpec::command(
+            "/bin/sh".into(),
+            vec!["-c".into(), script.into()],
+            cwd(),
+            size,
+        )
+        .unwrap();
         let (process, output, _done) = collect(spec);
         let deadline = Instant::now() + Duration::from_secs(2);
         while !output
@@ -934,8 +1028,13 @@ mod tests {
     #[test]
     fn spawn_reports_missing_program_and_working_directory() {
         let size = PtySize::new(40, 12, 0, 0).unwrap();
-        let missing =
-            SpawnSpec::command("/definitely/missing/leyline".into(), Vec::new(), size).unwrap();
+        let missing = SpawnSpec::command(
+            "/definitely/missing/leyline".into(),
+            Vec::new(),
+            cwd(),
+            size,
+        )
+        .unwrap();
         let sinks = PtySinks {
             output: Arc::new(|_| true),
             read_closed: Arc::new(|| true),
@@ -947,12 +1046,36 @@ mod tests {
             PtyProcess::spawn(missing, sinks.clone()),
             Err(SpawnError::Exec { .. })
         ));
-        let mut bad_cwd = SpawnSpec::command("/bin/true".into(), Vec::new(), size).unwrap();
-        bad_cwd.cwd = PathBuf::from("/definitely/missing/leyline-cwd");
         assert!(matches!(
-            PtyProcess::spawn(bad_cwd, sinks),
-            Err(SpawnError::Exec { .. })
+            SpawnDirectory::open(std::path::Path::new("/definitely/missing/leyline-cwd")),
+            Err(SpawnDirectoryError::Open(_))
         ));
+        drop(sinks);
+    }
+
+    #[test]
+    fn opened_directory_survives_path_replacement_before_spawn() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join("selected");
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&selected).unwrap();
+        std::fs::write(selected.join("marker"), b"original").unwrap();
+        let directory = SpawnDirectory::open(&selected).unwrap();
+        std::fs::rename(&selected, &moved).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+
+        let spec = SpawnSpec::command(
+            "/bin/sh".into(),
+            vec!["-c".into(), "test -f marker && printf '%s' frozen".into()],
+            directory,
+            PtySize::new(20, 2, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let (process, output, done) = collect(spec);
+        let _ = done.recv_timeout(Duration::from_secs(3)).unwrap();
+        let _ = done.recv_timeout(Duration::from_secs(3)).unwrap();
+        process.join().unwrap();
+        assert!(String::from_utf8_lossy(&output.lock().unwrap()).contains("frozen"));
     }
 
     #[test]
@@ -961,7 +1084,7 @@ mod tests {
         let baseline = count_fds();
         for _ in 0..32 {
             let size = PtySize::new(10, 2, 0, 0).unwrap();
-            let spec = SpawnSpec::command("/bin/true".into(), Vec::new(), size).unwrap();
+            let spec = SpawnSpec::command("/bin/true".into(), Vec::new(), cwd(), size).unwrap();
             let (process, _output, done) = collect(spec);
             let _ = done.recv_timeout(Duration::from_secs(3)).unwrap();
             let _ = done.recv_timeout(Duration::from_secs(3)).unwrap();

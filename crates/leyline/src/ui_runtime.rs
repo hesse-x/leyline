@@ -8,6 +8,7 @@ use leyline_gfx::{
     EventWake, GfxError, GfxInitError, GfxOptions, GfxRuntime, LinearColor, PlatformEvent,
     RenderOutcome, WakeError,
 };
+use leyline_pty::SpawnDirectory;
 use leyline_text::{AntialiasPreference, FontRequest, HintingPreference, TextSystem};
 
 use crate::{
@@ -95,6 +96,7 @@ impl UiRuntime {
             .session
     }
 
+    #[allow(clippy::too_many_lines)]
     fn drain_sessions(&mut self) -> Result<(), UiRuntimeError> {
         const WINDOW_EVENT_BUDGET: usize = 64;
         const WINDOW_BYTE_BUDGET: usize = 1024 * 1024;
@@ -104,6 +106,7 @@ impl UiRuntime {
         let mut bytes = 0_usize;
         let mut completed = Vec::new();
         let fallback_title = launch_title(self.app.launch());
+        let local_identity = self.app.launch_context().local_identity.clone();
         for id in self.tabs.drain_order() {
             let is_active = Some(id) == self.tabs.active_id();
             let mut incoming = Vec::new();
@@ -149,6 +152,26 @@ impl UiRuntime {
             }
             let tab = self.tabs.get_mut(id).expect("drain id exists");
             tab.session.finish_io_round()?;
+            let cwd_report = tab.session.take_cwd_report();
+            if let Some(report) = cwd_report {
+                match self.tabs.apply_cwd_report(id, report, &local_identity) {
+                    Some(Ok(())) => tracing::debug!(
+                        category = "cwd_report",
+                        session_id = id.get(),
+                        decision = "accept",
+                        "cwd report accepted"
+                    ),
+                    Some(Err(reason)) => tracing::debug!(
+                        category = "cwd_report",
+                        session_id = id.get(),
+                        decision = "reject",
+                        reason = reason.as_str(),
+                        "cwd report rejected"
+                    ),
+                    None => {}
+                }
+            }
+            let tab = self.tabs.get_mut(id).expect("drain id exists");
             if let Some(title) = tab.session.take_title() {
                 tab.title = match title {
                     crate::session::SessionTitleDelta::Set(title) => title.to_string(),
@@ -253,8 +276,14 @@ impl UiRuntime {
         )?;
         let initial_size = layout.grid;
         let text_scale = gfx.scale();
-        let session =
-            TerminalSession::start(app.launch(), app.config(), initial_size, &app_runtime)?;
+        let initial_cwd = SpawnDirectory::open(&app.launch_context().base_cwd)?;
+        let session = TerminalSession::start(
+            app.launch(),
+            initial_cwd,
+            app.config(),
+            initial_size,
+            &app_runtime,
+        )?;
         let max_count = NonZeroU8::new(app.config().tabs.max_count)
             .ok_or_else(|| UiRuntimeError::Grid("tab count cannot be zero".into()))?;
         let tabs = TabManager::bootstrap(session, app_runtime, max_count);
@@ -1065,9 +1094,52 @@ impl UiRuntime {
             );
             return Ok(());
         }
+        let source_id = self.tabs.active_id();
+        let (primary, origin) = select_new_tab_cwd(
+            &self.app.config().tabs.new_tab_cwd,
+            self.tabs.active(),
+            self.app.launch_context(),
+        );
+        let base = &self.app.launch_context().base_cwd;
+        let (cwd, final_origin) = match SpawnDirectory::open(&primary) {
+            Ok(cwd) => (cwd, origin),
+            Err(error) if primary != *base => {
+                tracing::warn!(
+                    category = "tab_cwd",
+                    session_id = source_id.map(crate::tab::SessionId::get),
+                    policy = cwd_policy_name(&self.app.config().tabs.new_tab_cwd),
+                    origin,
+                    result = "fallback",
+                    errno = error.raw_os_error(),
+                    "new tab cwd candidate unavailable"
+                );
+                match SpawnDirectory::open(base) {
+                    Ok(cwd) => (cwd, "base"),
+                    Err(base_error) => {
+                        tracing::warn!(
+                            category = "tab_create_failed",
+                            reason = "base_cwd_unavailable",
+                            errno = base_error.raw_os_error(),
+                            "could not create tab"
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    category = "tab_create_failed",
+                    reason = "base_cwd_unavailable",
+                    errno = error.raw_os_error(),
+                    "could not create tab"
+                );
+                return Ok(());
+            }
+        };
         let runtime = AppRuntimeBuilder::new(self.wake_backend.clone()).build()?;
         let session = match TerminalSession::start(
             self.app.launch(),
+            cwd,
             self.app.config(),
             self.layout.grid,
             &runtime,
@@ -1086,6 +1158,7 @@ impl UiRuntime {
             Ok(id) => tracing::info!(
                 category = "tab_created",
                 session_id = id.get(),
+                cwd_origin = final_origin,
                 "tab created"
             ),
             Err(error) => {
@@ -1876,6 +1949,34 @@ fn key_text(key: &leyline_gfx::KeyInput) -> Option<String> {
         })
 }
 
+fn select_new_tab_cwd(
+    policy: &crate::config::NewTabCwdPolicy,
+    source: Option<&crate::tab::TabEntry>,
+    launch: &crate::app::LaunchContext,
+) -> (std::path::PathBuf, &'static str) {
+    match policy {
+        crate::config::NewTabCwdPolicy::Inherit => {
+            source.and_then(|tab| tab.cwd_hint.as_ref()).map_or_else(
+                || (launch.base_cwd.clone(), "base"),
+                |hint| (hint.path.clone(), "inherited"),
+            )
+        }
+        crate::config::NewTabCwdPolicy::Fixed(path) => (path.clone(), "fixed"),
+        crate::config::NewTabCwdPolicy::Home => launch.home.as_ref().map_or_else(
+            || (launch.base_cwd.clone(), "base"),
+            |home| (home.clone(), "home"),
+        ),
+    }
+}
+
+const fn cwd_policy_name(policy: &crate::config::NewTabCwdPolicy) -> &'static str {
+    match policy {
+        crate::config::NewTabCwdPolicy::Inherit => "inherit",
+        crate::config::NewTabCwdPolicy::Fixed(_) => "fixed",
+        crate::config::NewTabCwdPolicy::Home => "home",
+    }
+}
+
 fn launch_title(launch: &crate::cli::LaunchRequest) -> String {
     match launch {
         crate::cli::LaunchRequest::DefaultShell => "Shell".into(),
@@ -1902,8 +2003,37 @@ fn window_title(ordinal: usize, count: usize, title: &str) -> String {
 mod tests {
     use super::{
         accumulate_wheel_steps, ignores_key_repeat, keep_selection_after_release, key_text,
-        terminal_modifiers,
+        select_new_tab_cwd, terminal_modifiers,
     };
+
+    #[test]
+    fn new_tab_policy_selects_fixed_home_and_base_candidates() {
+        let mut launch =
+            crate::app::LaunchContext::for_test(crate::cli::LaunchRequest::DefaultShell);
+        launch.base_cwd = "/base".into();
+        launch.home = Some("/home/user".into());
+        assert_eq!(
+            select_new_tab_cwd(
+                &crate::config::NewTabCwdPolicy::Fixed("/fixed".into()),
+                None,
+                &launch
+            ),
+            (std::path::PathBuf::from("/fixed"), "fixed")
+        );
+        assert_eq!(
+            select_new_tab_cwd(&crate::config::NewTabCwdPolicy::Home, None, &launch),
+            (std::path::PathBuf::from("/home/user"), "home")
+        );
+        launch.home = None;
+        assert_eq!(
+            select_new_tab_cwd(&crate::config::NewTabCwdPolicy::Home, None, &launch),
+            (std::path::PathBuf::from("/base"), "base")
+        );
+        assert_eq!(
+            select_new_tab_cwd(&crate::config::NewTabCwdPolicy::Inherit, None, &launch),
+            (std::path::PathBuf::from("/base"), "base")
+        );
+    }
 
     #[test]
     fn plain_click_clears_selection_but_drag_and_multi_click_keep_it() {
@@ -2123,6 +2253,8 @@ pub enum UiRuntimeError {
     #[error(transparent)]
     SessionStart(#[from] crate::session::SessionStartError),
     #[error(transparent)]
+    SpawnDirectory(#[from] leyline_pty::SpawnDirectoryError),
+    #[error(transparent)]
     Session(#[from] crate::session::SessionError),
     #[error(transparent)]
     Runtime(#[from] crate::app::runtime::RuntimeBuildError),
@@ -2143,6 +2275,7 @@ impl ClassifiedError for UiRuntimeError {
         match self {
             Self::Init(GfxInitError::Environment(_))
             | Self::SessionStart(_)
+            | Self::SpawnDirectory(_)
             | Self::Graphics(GfxError::Platform(_)) => ErrorCategory::Environment,
             Self::Init(GfxInitError::Platform(_)) | Self::Ime(_) => ErrorCategory::Platform,
             Self::Init(GfxInitError::Device(_)) | Self::Graphics(GfxError::Renderer(_)) => {

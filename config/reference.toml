@@ -35,3 +35,10 @@ bar_height = 32
 min_width = 80
 max_width = 240
 show_close_button = true
+# New tabs inherit the active tab's last valid OSC 7 directory by default.
+# Other values are "home" or "fixed"; fixed also requires new_tab_fixed_cwd.
+new_tab_cwd = "inherit"
+# new_tab_fixed_cwd = "/srv/project"
+
+[behavior]
+confirm_multiline_paste = false

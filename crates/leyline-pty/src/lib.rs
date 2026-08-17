@@ -7,5 +7,5 @@ mod spawn;
 
 pub use spawn::{
     ChildExit, JoinError, MAX_OUTSTANDING_WRITE_BYTES, PtyCommandError, PtyProcess, PtySinks,
-    PtySize, SpawnError, SpawnSpec, WriteStatus,
+    PtySize, SpawnDirectory, SpawnDirectoryError, SpawnError, SpawnSpec, WriteStatus,
 };

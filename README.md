@@ -102,7 +102,7 @@ style = "block"
 
 [behavior]
 hold_after_exit = false
-confirm_multiline_paste = true
+confirm_multiline_paste = false
 
 [tabs]
 max_count = 32
@@ -110,6 +110,8 @@ bar_height = 32
 min_width = 80
 max_width = 240
 show_close_button = true
+new_tab_cwd = "inherit" # inherit | fixed | home
+# new_tab_fixed_cwd = "/srv/project"
 
 [[keybindings]]
 key = "PageUp"
@@ -124,9 +126,20 @@ Clipboard, and `Ctrl+Shift+V` pastes the Clipboard into the same tab as long as 
 Tabs are always visible. `Ctrl+Shift+N` creates and activates a tab, `Ctrl+Shift+W` closes it,
 `Ctrl+Shift+Left/Right` cycles, and `Ctrl+Shift+1..9` activates an ordinal tab. Mouse clicks switch
 tabs; a close button or middle click closes one. New tabs repeat the startup launch request and
-inherit Leyline's startup directory. User `[[keybindings]]` entries can override the actions
+use `[tabs].new_tab_cwd`: `inherit` prefers the active tab's last valid OSC 7 directory, `fixed`
+uses `new_tab_fixed_cwd`, and `home` uses the HOME captured at startup. Every unavailable candidate
+falls back to Leyline's startup directory. User `[[keybindings]]` entries can override the actions
 `CopyClipboard`, `PasteClipboard`, `PastePrimary`, `NewTab`, `CloseTab`, `PreviousTab`, `NextTab`,
 and `ActivateTab1` through `ActivateTab9`.
+
+Leyline receives current-directory metadata but does not install shell hooks. Configure bash, zsh,
+fish, or a prompt plugin to emit `OSC 7 ; file://host/absolute-path` terminated by BEL or ST, with
+the path RFC 3986 percent-encoded. For a quick check in a directory containing no spaces, `%`, or
+control bytes, run `printf '\033]7;file://%s%s\033\\' "$(hostname)" "$PWD"` and then open a tab.
+Empty authority, `localhost`, and Leyline's startup hostname are accepted; other authorities clear
+the tab's inheritable hint and are never mapped to local paths. A silent SSH/tmux/container layer
+cannot be detected, so Leyline falls back only after it receives a rejected report or cannot open
+the reported host-side directory.
 
 [`config/reference.toml`](config/reference.toml) fixes the Ubuntu Sans Mono 13 opaque screenshot
 baseline. [`config/legacy.toml`](config/legacy.toml) restores the previous font metrics, palette,

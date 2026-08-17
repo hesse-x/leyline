@@ -115,7 +115,12 @@ fn startup(
         ));
     }
 
-    let mut app = AppBuilder::new(Arc::new(loaded.effective), cli.launch_request()).build();
+    let launch =
+        app::LaunchContext::capture(cli.launch_request()).map_err(|source| StartupError {
+            source: StartupErrorSource::Launch(source),
+            verbose: cli.verbosity != Verbosity::Warn,
+        })?;
+    let mut app = AppBuilder::new(Arc::new(loaded.effective), launch).build();
     let event_wake = io
         .graphical_session()
         .then(leyline_gfx::EventWake::new)
@@ -188,6 +193,8 @@ enum StartupErrorSource {
     #[error(transparent)]
     App(#[from] app::AppError),
     #[error(transparent)]
+    Launch(#[from] app::LaunchContextError),
+    #[error(transparent)]
     Runtime(#[from] app::runtime::RuntimeBuildError),
     #[error(transparent)]
     Graphics(#[from] ui_runtime::UiRuntimeError),
@@ -199,6 +206,7 @@ impl ClassifiedError for StartupError {
             StartupErrorSource::Config(error) => error.category(),
             StartupErrorSource::Graphics(error) => error.category(),
             StartupErrorSource::Logging(_)
+            | StartupErrorSource::Launch(_)
             | StartupErrorSource::App(_)
             | StartupErrorSource::Runtime(_) => ErrorCategory::Internal,
         }

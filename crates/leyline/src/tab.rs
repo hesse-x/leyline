@@ -1,6 +1,10 @@
 use std::num::NonZeroU8;
 
-use crate::{app::runtime::AppRuntime, session::TerminalSession};
+use crate::{
+    app::runtime::AppRuntime,
+    session::TerminalSession,
+    terminal::cwd::{CwdRejectReason, CwdReport, LocalCwdHint, LocalIdentity, validate_report},
+};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct SessionId(u64);
@@ -22,6 +26,8 @@ pub struct TabEntry {
     pub session: TerminalSession,
     pub runtime: AppRuntime,
     pub title: String,
+    pub cwd_hint: Option<LocalCwdHint>,
+    pub last_cwd_reject: Option<CwdRejectReason>,
     pub unread: bool,
 }
 
@@ -221,6 +227,8 @@ impl TabManager {
                 session,
                 runtime,
                 title: "Shell".into(),
+                cwd_hint: None,
+                last_cwd_reject: None,
                 unread: false,
             }],
             closing: Vec::new(),
@@ -252,6 +260,8 @@ impl TabManager {
             session,
             runtime,
             title,
+            cwd_hint: None,
+            last_cwd_reject: None,
             unread: false,
         });
         self.active_id = Some(id);
@@ -410,6 +420,27 @@ impl TabManager {
         self.tabs.iter_mut().find(|tab| tab.id == id)
     }
 
+    pub fn apply_cwd_report(
+        &mut self,
+        id: SessionId,
+        report: CwdReport,
+        identity: &LocalIdentity,
+    ) -> Option<Result<(), CwdRejectReason>> {
+        let tab = self.get_mut(id)?;
+        match validate_report(report, identity) {
+            Ok(hint) => {
+                tab.cwd_hint = Some(hint);
+                tab.last_cwd_reject = None;
+                Some(Ok(()))
+            }
+            Err(reason) => {
+                tab.cwd_hint = None;
+                tab.last_cwd_reject = Some(reason);
+                Some(Err(reason))
+            }
+        }
+    }
+
     fn active_index(&self) -> Option<usize> {
         let id = self.active_id?;
         self.tabs.iter().position(|tab| tab.id == id)
@@ -451,6 +482,7 @@ mod tests {
         });
         let session = TerminalSession::start(
             &launch,
+            leyline_pty::SpawnDirectory::open(std::path::Path::new("/tmp")).unwrap(),
             &crate::config::EffectiveConfig::default(),
             crate::terminal::GridSize::new(8, 4).unwrap(),
             &runtime,
@@ -492,6 +524,7 @@ mod tests {
                 min_width: 80,
                 max_width: 240,
                 show_close_button: true,
+                new_tab_cwd: crate::config::NewTabCwdPolicy::Inherit,
             },
             0,
         );
@@ -542,5 +575,59 @@ mod tests {
             }
         );
         assert_eq!(bar.max_offset, 0);
+    }
+
+    #[test]
+    fn cwd_reports_are_routed_by_stable_session_id_and_rejection_clears_hint() {
+        let (session, runtime) = entry();
+        let mut manager = TabManager::bootstrap(session, runtime, NonZeroU8::new(2).unwrap());
+        let first = manager.active_id().unwrap();
+        let (session, runtime) = entry();
+        let second = manager.push(session, runtime, "two".into()).unwrap();
+        let identity = LocalIdentity::new(Some("host".into()));
+
+        assert_eq!(
+            manager.apply_cwd_report(
+                first,
+                CwdReport::Set(b"file:///tmp/first".to_vec()),
+                &identity
+            ),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            manager.apply_cwd_report(
+                second,
+                CwdReport::Set(b"file:///tmp/second".to_vec()),
+                &identity
+            ),
+            Some(Ok(()))
+        );
+        assert_eq!(
+            manager.tabs()[0].cwd_hint.as_ref().unwrap().path,
+            std::path::Path::new("/tmp/first")
+        );
+        assert_eq!(
+            manager.tabs()[1].cwd_hint.as_ref().unwrap().path,
+            std::path::Path::new("/tmp/second")
+        );
+
+        assert_eq!(
+            manager.apply_cwd_report(
+                first,
+                CwdReport::Set(b"file://remote/tmp/remote".to_vec()),
+                &identity
+            ),
+            Some(Err(CwdRejectReason::RemoteAuthority))
+        );
+        assert!(manager.tabs()[0].cwd_hint.is_none());
+        assert!(manager.tabs()[1].cwd_hint.is_some());
+        assert_eq!(
+            manager.apply_cwd_report(
+                SessionId::from_raw(999),
+                CwdReport::Set(b"file:///tmp/stale".to_vec()),
+                &identity
+            ),
+            None
+        );
     }
 }

@@ -1,12 +1,13 @@
 pub mod event;
 pub mod runtime;
 
-use std::{rc::Rc, sync::Arc};
+use std::{path::PathBuf, rc::Rc, sync::Arc};
 
 use crate::{
     cli::LaunchRequest,
     config::EffectiveConfig,
     diagnostics::{ClassifiedError, ErrorCategory},
+    terminal::cwd::{LocalIdentity, valid_absolute_env_path},
 };
 use event::{AppEvent, ShutdownReason};
 
@@ -33,7 +34,7 @@ pub enum ShutdownTransition {
 
 pub struct App {
     config: Arc<EffectiveConfig>,
-    launch: LaunchRequest,
+    launch: LaunchContext,
     lifecycle: Lifecycle,
     // Rc makes the coordinator deliberately !Send and pins mutable ownership to its creating thread.
     _main_thread: Rc<()>,
@@ -50,6 +51,10 @@ impl App {
     }
     #[must_use]
     pub const fn launch(&self) -> &LaunchRequest {
+        &self.launch.request
+    }
+    #[must_use]
+    pub const fn launch_context(&self) -> &LaunchContext {
         &self.launch
     }
 
@@ -141,12 +146,12 @@ impl App {
 
 pub struct AppBuilder {
     config: Arc<EffectiveConfig>,
-    launch: LaunchRequest,
+    launch: LaunchContext,
 }
 
 impl AppBuilder {
     #[must_use]
-    pub const fn new(config: Arc<EffectiveConfig>, launch: LaunchRequest) -> Self {
+    pub const fn new(config: Arc<EffectiveConfig>, launch: LaunchContext) -> Self {
         Self { config, launch }
     }
     #[must_use]
@@ -158,6 +163,51 @@ impl AppBuilder {
             _main_thread: Rc::new(()),
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchContext {
+    pub request: LaunchRequest,
+    pub base_cwd: PathBuf,
+    pub home: Option<PathBuf>,
+    pub local_identity: LocalIdentity,
+}
+
+impl LaunchContext {
+    /// Captures immutable process launch metadata before the first session starts.
+    ///
+    /// # Errors
+    /// Returns an error when the process startup directory cannot be captured.
+    pub fn capture(request: LaunchRequest) -> Result<Self, LaunchContextError> {
+        let base_cwd = std::env::current_dir().map_err(LaunchContextError::CurrentDirectory)?;
+        if !base_cwd.is_absolute() {
+            return Err(LaunchContextError::RelativeCurrentDirectory);
+        }
+        Ok(Self {
+            request,
+            base_cwd,
+            home: valid_absolute_env_path(std::env::var_os("HOME")),
+            local_identity: LocalIdentity::capture(),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(request: LaunchRequest) -> Self {
+        Self {
+            request,
+            base_cwd: PathBuf::from("/tmp"),
+            home: Some(PathBuf::from("/tmp")),
+            local_identity: LocalIdentity::new(Some("localhost".into())),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum LaunchContextError {
+    #[error("cannot determine startup working directory: {0}")]
+    CurrentDirectory(std::io::Error),
+    #[error("startup working directory is not absolute")]
+    RelativeCurrentDirectory,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -182,7 +232,7 @@ mod tests {
     fn lifecycle_is_forward_only_and_shutdown_is_idempotent() {
         let mut app = AppBuilder::new(
             Arc::new(EffectiveConfig::default()),
-            LaunchRequest::DefaultShell,
+            LaunchContext::for_test(LaunchRequest::DefaultShell),
         )
         .build();
         app.start().expect("start");

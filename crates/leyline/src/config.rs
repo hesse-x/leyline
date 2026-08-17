@@ -3,6 +3,7 @@ use std::{
     ffi::OsString,
     fs::File,
     io::Read,
+    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
@@ -34,6 +35,14 @@ pub struct TabsConfig {
     pub min_width: u16,
     pub max_width: u16,
     pub show_close_button: bool,
+    pub new_tab_cwd: NewTabCwdPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum NewTabCwdPolicy {
+    Inherit,
+    Fixed(PathBuf),
+    Home,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -219,6 +228,7 @@ impl Default for EffectiveConfig {
                 min_width: 80,
                 max_width: 240,
                 show_close_button: true,
+                new_tab_cwd: NewTabCwdPolicy::Inherit,
             },
             keybindings: default_keybindings(),
         }
@@ -503,6 +513,8 @@ struct RawTabs {
     min_width: Option<i64>,
     max_width: Option<i64>,
     show_close_button: Option<bool>,
+    new_tab_cwd: Option<String>,
+    new_tab_fixed_cwd: Option<String>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -675,6 +687,8 @@ impl RawConfig {
                 "min_width",
                 "max_width",
                 "show_close_button",
+                "new_tab_cwd",
+                "new_tab_fixed_cwd",
             ],
         );
 
@@ -929,6 +943,46 @@ impl RawConfig {
         }
         if let Some(value) = self.tabs.show_close_button {
             result.tabs.show_close_button = value;
+        }
+        let cwd_policy = self.tabs.new_tab_cwd.as_deref().unwrap_or("inherit");
+        result.tabs.new_tab_cwd =
+            match cwd_policy {
+                "inherit" => NewTabCwdPolicy::Inherit,
+                "home" => NewTabCwdPolicy::Home,
+                "fixed" => {
+                    let value = self.tabs.new_tab_fixed_cwd.as_ref().ok_or_else(|| {
+                        ConfigError::Semantic {
+                            path: path.into(),
+                            field: "tabs.new_tab_fixed_cwd".into(),
+                            reason: "is required when tabs.new_tab_cwd is fixed".into(),
+                        }
+                    })?;
+                    let fixed = PathBuf::from(value);
+                    if !fixed.is_absolute() || fixed.as_os_str().as_bytes().contains(&0) {
+                        return semantic(
+                            path,
+                            "tabs.new_tab_fixed_cwd",
+                            "must be an absolute path without NUL".into(),
+                        );
+                    }
+                    NewTabCwdPolicy::Fixed(fixed)
+                }
+                value => {
+                    return semantic(
+                        path,
+                        "tabs.new_tab_cwd",
+                        format!(
+                            "{} is not one of inherit, fixed, home",
+                            escape_diagnostic(value)
+                        ),
+                    );
+                }
+            };
+        if cwd_policy != "fixed" && self.tabs.new_tab_fixed_cwd.is_some() {
+            warnings.push(ConfigWarning {
+                message: "tabs.new_tab_fixed_cwd is ignored unless tabs.new_tab_cwd is fixed"
+                    .into(),
+            });
         }
 
         if let Some(bindings) = self.keybindings {
@@ -1425,5 +1479,39 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn new_tab_cwd_policies_validate_fixed_paths_and_warn_when_ignored() {
+        let source = "[tabs]\nnew_tab_cwd='fixed'\nnew_tab_fixed_cwd='/srv/project'\n";
+        let raw: RawConfig = toml::from_str(source).unwrap();
+        let (effective, warnings) = raw
+            .into_effective(Path::new("config.toml"), source)
+            .unwrap();
+        assert_eq!(
+            effective.tabs.new_tab_cwd,
+            NewTabCwdPolicy::Fixed(PathBuf::from("/srv/project"))
+        );
+        assert!(warnings.is_empty());
+
+        for source in [
+            "[tabs]\nnew_tab_cwd='fixed'\n",
+            "[tabs]\nnew_tab_cwd='fixed'\nnew_tab_fixed_cwd='relative'\n",
+            "[tabs]\nnew_tab_cwd='other'\n",
+        ] {
+            let raw: RawConfig = toml::from_str(source).unwrap();
+            assert!(
+                raw.into_effective(Path::new("config.toml"), source)
+                    .is_err()
+            );
+        }
+
+        let source = "[tabs]\nnew_tab_cwd='home'\nnew_tab_fixed_cwd='/ignored'\n";
+        let raw: RawConfig = toml::from_str(source).unwrap();
+        let (effective, warnings) = raw
+            .into_effective(Path::new("config.toml"), source)
+            .unwrap();
+        assert_eq!(effective.tabs.new_tab_cwd, NewTabCwdPolicy::Home);
+        assert_eq!(warnings.len(), 1);
     }
 }

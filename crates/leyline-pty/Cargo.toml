@@ -10,5 +10,8 @@ crossbeam-channel.workspace = true
 libc.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+tempfile = "3.21.0"
+
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }

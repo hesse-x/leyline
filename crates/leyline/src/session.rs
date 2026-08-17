@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use leyline_pty::{PtyProcess, PtySinks, SpawnSpec};
+use leyline_pty::{PtyProcess, PtySinks, SpawnDirectory, SpawnSpec};
 
 use crate::{
     app::{
@@ -17,6 +17,7 @@ use crate::{
     terminal::{
         FrameSnapshot, GridSize, ParseAuditDelta, TerminalAction, TerminalCoreAdapter,
         TerminalError,
+        cwd::{CwdReport, CwdTracker},
     },
 };
 
@@ -72,6 +73,7 @@ const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 #[allow(clippy::struct_excessive_bools)]
 pub struct TerminalSession {
     core: TerminalCoreAdapter,
+    cwd_tracker: CwdTracker,
     process: Option<PtyProcess>,
     state: SessionState,
     exited: Option<ChildExit>,
@@ -98,6 +100,7 @@ pub enum SessionTitleDelta {
 impl TerminalSession {
     pub fn start(
         launch: &LaunchRequest,
+        cwd: SpawnDirectory,
         config: &EffectiveConfig,
         initial_size: GridSize,
         runtime: &AppRuntime,
@@ -105,9 +108,9 @@ impl TerminalSession {
         let pty_size =
             leyline_pty::PtySize::new(initial_size.columns.get(), initial_size.lines.get(), 0, 0)?;
         let spec = match launch {
-            LaunchRequest::DefaultShell => SpawnSpec::default_shell(pty_size)?,
+            LaunchRequest::DefaultShell => SpawnSpec::default_shell(cwd, pty_size)?,
             LaunchRequest::Command(command) => {
-                SpawnSpec::command(command.program.clone(), command.args.clone(), pty_size)?
+                SpawnSpec::command(command.program.clone(), command.args.clone(), cwd, pty_size)?
             }
         };
         let bulk = runtime.bulk_sink();
@@ -149,6 +152,7 @@ impl TerminalSession {
         let process = PtyProcess::spawn(spec, sinks)?;
         Ok(Self {
             core: TerminalCoreAdapter::new(initial_size, config.scrolling.history_lines as usize)?,
+            cwd_tracker: CwdTracker::default(),
             process: Some(process),
             state: SessionState::Running,
             exited: None,
@@ -172,6 +176,7 @@ impl TerminalSession {
                 if self.read_closed {
                     return Err(SessionError::OutputAfterClose);
                 }
+                self.cwd_tracker.advance(batch.as_slice());
                 let delta = self.core.advance(batch.as_slice())?;
                 self.security_audit.unknown_sequences = self
                     .security_audit
@@ -426,6 +431,9 @@ impl TerminalSession {
     pub fn take_title(&mut self) -> Option<SessionTitleDelta> {
         self.pending_title.take()
     }
+    pub fn take_cwd_report(&mut self) -> Option<CwdReport> {
+        self.cwd_tracker.take_report()
+    }
     pub fn take_bell(&mut self) -> bool {
         std::mem::take(&mut self.pending_bell)
     }
@@ -604,6 +612,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    fn cwd() -> leyline_pty::SpawnDirectory {
+        leyline_pty::SpawnDirectory::open(std::path::Path::new("/tmp")).unwrap()
+    }
+
     #[test]
     fn bulk_and_parser_replies_preserve_interactive_credit() {
         assert_eq!(
@@ -637,9 +649,14 @@ mod tests {
                 OsString::from("while :; do printf 0123456789; done"),
             ],
         });
-        let mut session =
-            TerminalSession::start(&launch, &config, GridSize::new(10, 2).unwrap(), &runtime)
-                .unwrap();
+        let mut session = TerminalSession::start(
+            &launch,
+            cwd(),
+            &config,
+            GridSize::new(10, 2).unwrap(),
+            &runtime,
+        )
+        .unwrap();
         std::thread::sleep(Duration::from_millis(50));
         let started = Instant::now();
         runtime.fast_cancel();
@@ -658,9 +675,14 @@ mod tests {
             program: OsString::from("/bin/sh"),
             args: vec![OsString::from("-c"), OsString::from("exec sleep 30")],
         });
-        let mut session =
-            TerminalSession::start(&launch, &config, GridSize::new(10, 2).unwrap(), &runtime)
-                .unwrap();
+        let mut session = TerminalSession::start(
+            &launch,
+            cwd(),
+            &config,
+            GridSize::new(10, 2).unwrap(),
+            &runtime,
+        )
+        .unwrap();
 
         session.begin_shutdown();
         let first_poll = Instant::now();
@@ -698,9 +720,14 @@ mod tests {
             program: OsString::from("/bin/sh"),
             args: vec![OsString::from("-c"), OsString::from("exec sleep 30")],
         });
-        let mut session =
-            TerminalSession::start(&launch, &config, GridSize::new(10, 2).unwrap(), &runtime)
-                .unwrap();
+        let mut session = TerminalSession::start(
+            &launch,
+            cwd(),
+            &config,
+            GridSize::new(10, 2).unwrap(),
+            &runtime,
+        )
+        .unwrap();
 
         session.commit_text("x").unwrap();
 
@@ -719,9 +746,14 @@ mod tests {
             program: OsString::from("/bin/cat"),
             args: Vec::new(),
         });
-        let mut session =
-            TerminalSession::start(&launch, &config, GridSize::new(10, 2).unwrap(), &runtime)
-                .unwrap();
+        let mut session = TerminalSession::start(
+            &launch,
+            cwd(),
+            &config,
+            GridSize::new(10, 2).unwrap(),
+            &runtime,
+        )
+        .unwrap();
 
         session.commit_text("x").unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -752,9 +784,14 @@ mod tests {
             program: OsString::from("/bin/printf"),
             args: vec![OsString::from("final-output")],
         });
-        let mut session =
-            TerminalSession::start(&launch, &config, GridSize::new(20, 2).unwrap(), &runtime)
-                .unwrap();
+        let mut session = TerminalSession::start(
+            &launch,
+            cwd(),
+            &config,
+            GridSize::new(20, 2).unwrap(),
+            &runtime,
+        )
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         while session.state() != SessionState::Held {
             let mut events = Vec::new();
