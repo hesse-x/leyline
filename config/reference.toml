@@ -1,4 +1,7 @@
 # Ubuntu 24.04 visual-reference profile. The generic built-in family remains "monospace".
+[terminal]
+identity = "leyline"
+
 [font]
 family = "Ubuntu Sans Mono"
 size = 13.0

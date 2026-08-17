@@ -67,6 +67,7 @@ require_command infocmp
 require_command rg
 require_command sha256sum
 require_command script
+require_command tic
 require_command timeout
 
 temp_parent=$(cd -- "${TMPDIR:-/tmp}" && pwd -P)
@@ -75,6 +76,7 @@ case_root=$(mktemp -d "$temp_parent/leyline-tmux.XXXXXXXX")
 readonly case_root
 readonly config="$case_root/tmux.conf"
 readonly outer_socket="$case_root/outer.sock"
+readonly terminfo_db="$case_root/terminfo"
 declare -a owned_sockets=("$outer_socket")
 
 cleanup() {
@@ -107,9 +109,12 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 umask 077
+mkdir -p "$terminfo_db"
+tic -x -o "$terminfo_db" "$SCRIPT_DIR/../../terminfo/leyline.terminfo"
 printf '%s\n' 'set -g default-terminal tmux-256color' >"$config"
 
-readonly terminfo_hash=$(infocmp -x xterm-256color | sha256sum | awk '{print $1}')
+readonly terminfo_hash=$(TERMINFO="$terminfo_db" TERMINFO_DIRS="$terminfo_db:" \
+    infocmp -x leyline-256color | sha256sum | awk '{print $1}')
 case "$TOPOLOGY" in
     local) topology_id=L1 ;;
     nested) topology_id=L2 ;;
@@ -148,7 +153,7 @@ record topology_id "$topology_id"
 record socket_id "$(basename "$outer_socket")"
 record tmux_version "$(tmux -V)"
 record ssh_version "$(ssh -V 2>&1 || printf not-captured)"
-record outer_term xterm-256color
+record outer_term leyline-256color
 record outer_colorterm truecolor
 record terminfo_hash_kind infocmp-x-output
 record terminfo_hash "$terminfo_hash"
@@ -163,7 +168,7 @@ start_server() {
     local socket=$1
     local session=$2
     local command=$3
-    TERM=xterm-256color COLORTERM=truecolor \
+    TERM=leyline-256color TERMINFO="$terminfo_db" TERMINFO_DIRS="$terminfo_db:" COLORTERM=truecolor \
         tmux -S "$socket" -f "$config" new-session -d -x 80 -y 24 -s "$session" "$command"
 }
 
@@ -225,8 +230,8 @@ run_local() {
 
     local attach_command
     local attach_round
-    printf -v attach_command 'TERM=xterm-256color COLORTERM=truecolor tmux -S %q attach-session -t survivor' \
-        "$outer_socket"
+    printf -v attach_command 'TERM=leyline-256color TERMINFO=%q TERMINFO_DIRS=%q COLORTERM=truecolor tmux -S %q attach-session -t survivor' \
+        "$terminfo_db" "$terminfo_db:" "$outer_socket"
     for attach_round in 1 2; do
         { sleep 0.2; printf '\002d'; } \
             | timeout --foreground --kill-after=1s 3s script -qefc "$attach_command" /dev/null \

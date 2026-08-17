@@ -1,0 +1,34 @@
+schema = 1
+term = "leyline-256color"
+epoch = 1
+
+# The source is deliberately standalone. The release validator compares this
+# allowlist with both the source and normalized tic output.
+[[capability_group]]
+direction = "application-output"
+implementation = ["parser", "state", "snapshot", "renderer"]
+tests = ["direct-rgb", "tmux-rgb", "ssh-rgb", "nested-rgb"]
+names = [
+  "RGB", "am", "bce", "mir", "msgr", "npc", "xenl", "AX", "colors", "cols", "it",
+  "lines", "pairs", "acsc", "bel", "blink", "bold", "cbt", "civis", "clear", "cnorm",
+  "cr", "csr", "cub", "cub1", "cud", "cud1", "cuf", "cuf1", "cup", "cuu", "cuu1",
+  "dch", "dch1", "dim", "dl", "dl1", "ech", "ed", "el", "el1", "home", "hpa", "ht",
+  "ich", "il", "il1", "ind", "indn", "invis", "nel", "op", "rc", "rev", "ri", "rin",
+  "ritm", "rmacs", "rmam", "rmcup", "rmir", "rmso", "rmul", "sc", "setab", "setaf",
+  "sgr", "sgr0", "sitm", "smacs", "smam", "smcup", "smir", "smso", "smul", "tbc",
+  "u6", "u7", "vpa", "BD", "BE", "E3", "PE", "PS", "XM", "fd", "fe"
+]
+
+[[capability_group]]
+direction = "terminal-input"
+implementation = ["input-encoder"]
+tests = ["key-fixtures", "mouse-fixtures", "paste-fixtures"]
+names = [
+  "km", "kbs", "kcbt", "kcub1", "kcud1", "kcuf1", "kcuu1", "kdch1", "kend", "kent",
+  "kf1", "kf2", "kf3", "kf4", "kf5", "kf6", "kf7", "kf8", "kf9", "kf10", "kf11",
+  "kf12", "khome", "kich1", "kmous", "knp", "kpp"
+]
+
+[[rejected]]
+names = ["Ms", "Cs", "Cr", "Ss", "Se", "initc", "oc", "mc0", "mc4", "mc5", "smkx", "rmkx"]
+reason = "unsafe or missing end-to-end implementation evidence in epoch 1"

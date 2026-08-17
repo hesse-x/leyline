@@ -94,7 +94,7 @@ impl SpawnSpec {
         }
         let mut environment: Vec<_> = std::env::vars_os().collect();
         environment.retain(|(key, _)| key != "TERM" && key != "COLORTERM" && key != "PWD");
-        environment.push(("TERM".into(), "xterm-256color".into()));
+        environment.push(("TERM".into(), "leyline-256color".into()));
         environment.push(("COLORTERM".into(), "truecolor".into()));
         environment.push(("PWD".into(), cwd.logical_path().as_os_str().to_owned()));
         Ok(Self {
@@ -104,6 +104,17 @@ impl SpawnSpec {
             environment,
             initial_size,
         })
+    }
+
+    /// Replaces the frozen terminal identity without allowing inherited TERM values through.
+    ///
+    /// # Errors
+    /// Returns [`SpawnError::InvalidWord`] when the identity contains NUL.
+    pub fn set_terminal_identity(&mut self, term: &OsStr) -> Result<(), SpawnError> {
+        validate_word("terminal identity", term)?;
+        self.environment.retain(|(key, _)| key != "TERM");
+        self.environment.push(("TERM".into(), term.to_owned()));
+        Ok(())
     }
 
     /// Resolves the effective user's account shell as an interactive non-login command.
@@ -883,7 +894,7 @@ mod tests {
         assert_ne!(first, second);
         process.join().unwrap();
         let text = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
-        assert!(text.contains("xterm-256color:truecolor"), "{text:?}");
+        assert!(text.contains("leyline-256color:truecolor"), "{text:?}");
         assert!(text.contains(":/tmp:/tmp"), "{text:?}");
     }
 

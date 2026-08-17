@@ -878,6 +878,15 @@ impl UiRuntime {
         ) {
             return Ok(());
         }
+        if !self.ime.is_active() && !matches!(&event, TextInputEvent::Enter | TextInputEvent::Leave)
+        {
+            // Compositors may leave already-queued text-input events behind a focus/leave event.
+            tracing::debug!(
+                category = "stale_text_input",
+                "ignored event for inactive IME"
+            );
+            return Ok(());
+        }
         match event {
             TextInputEvent::Enter => {
                 self.ime.activate();

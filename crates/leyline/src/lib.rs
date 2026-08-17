@@ -16,6 +16,7 @@ pub mod selection;
 pub mod session;
 pub mod tab;
 pub mod terminal;
+pub mod terminfo;
 pub mod ui_runtime;
 
 use std::{ffi::OsString, sync::Arc};
@@ -25,7 +26,7 @@ use app::{
     event::ShutdownReason,
     runtime::{AppRuntimeBuilder, CountingWake},
 };
-use cli::{ParseOutcome, Verbosity};
+use cli::{DoctorOperation, Operation, ParseOutcome, TerminfoOperation, Verbosity};
 use config::{ConfigEnvironment, ConfigSource, FileConfigSource};
 use diagnostics::{ClassifiedError, ErrorCategory, render_error};
 
@@ -77,10 +78,46 @@ pub fn run(
         }
         ParseOutcome::Run(cli) => cli,
     };
+    if cli.operation != Operation::Launch {
+        return run_management(&cli, io);
+    }
     match startup(&cli, environment, io) {
         Ok(()) => RunOutcome { exit_code: 0 },
         Err(error) => {
             io.stderr(&render_error(&error, error.verbose));
+            RunOutcome {
+                exit_code: error.category().exit_code(),
+            }
+        }
+    }
+}
+
+fn run_management(cli: &cli::Cli, io: &mut impl ProcessIo) -> RunOutcome {
+    let result = match &cli.operation {
+        Operation::Launch => unreachable!("launch is handled by startup"),
+        Operation::Terminfo(TerminfoOperation::Print) => {
+            io.stdout(terminfo::SOURCE);
+            return RunOutcome { exit_code: 0 };
+        }
+        Operation::Terminfo(TerminfoOperation::Check { database }) => {
+            terminfo::check(database.as_deref())
+        }
+        Operation::Terminfo(TerminfoOperation::Install { database }) => {
+            terminfo::install(database.as_deref())
+        }
+        Operation::Terminfo(TerminfoOperation::Uninstall { database }) => {
+            terminfo::uninstall(database.as_deref())
+        }
+        Operation::Doctor(DoctorOperation::Terminfo) => terminfo::doctor(),
+        Operation::Doctor(DoctorOperation::Ssh { host, json }) => terminfo::doctor_ssh(host, *json),
+    };
+    match result {
+        Ok(report) => {
+            io.stdout(&report);
+            RunOutcome { exit_code: 0 }
+        }
+        Err(error) => {
+            io.stderr(&render_error(&error, cli.verbosity != Verbosity::Warn));
             RunOutcome {
                 exit_code: error.category().exit_code(),
             }
@@ -98,8 +135,15 @@ fn startup(
         source: StartupErrorSource::Config(source),
         verbose: cli.verbosity != Verbosity::Warn,
     })?;
-    let loaded = source.load(&location).map_err(|source| StartupError {
+    let mut loaded = source.load(&location).map_err(|source| StartupError {
         source: StartupErrorSource::Config(source),
+        verbose: cli.verbosity != Verbosity::Warn,
+    })?;
+    if let Some(identity) = cli.terminal_identity {
+        loaded.effective.terminal.identity = identity;
+    }
+    terminfo::preflight(loaded.effective.terminal.identity).map_err(|source| StartupError {
+        source: StartupErrorSource::Terminfo(source),
         verbose: cli.verbosity != Verbosity::Warn,
     })?;
     io.install_panic_hook();
@@ -108,6 +152,13 @@ fn startup(
             source: StartupErrorSource::Logging(source),
             verbose: cli.verbosity != Verbosity::Warn,
         })?;
+    if loaded.effective.terminal.identity == terminfo::TerminalIdentity::Xterm256Color {
+        tracing::info!(
+            category = "terminal_identity",
+            identity = "xterm-256color",
+            "using best-effort compatibility identity"
+        );
+    }
     for warning in loaded.warnings {
         io.stderr(&format!(
             "leyline: configuration warning: {}\n",
@@ -198,6 +249,8 @@ enum StartupErrorSource {
     Runtime(#[from] app::runtime::RuntimeBuildError),
     #[error(transparent)]
     Graphics(#[from] ui_runtime::UiRuntimeError),
+    #[error(transparent)]
+    Terminfo(#[from] terminfo::TerminfoError),
 }
 
 impl ClassifiedError for StartupError {
@@ -209,6 +262,7 @@ impl ClassifiedError for StartupError {
             | StartupErrorSource::Launch(_)
             | StartupErrorSource::App(_)
             | StartupErrorSource::Runtime(_) => ErrorCategory::Internal,
+            StartupErrorSource::Terminfo(error) => error.category(),
         }
     }
 }

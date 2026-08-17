@@ -87,7 +87,7 @@ fn logging_setup_failure_is_an_internal_error() {
         ..Io::default()
     };
     let result = leyline::run(
-        [OsString::from("leyline")],
+        ["leyline", "--term", "xterm-256color"].map(OsString::from),
         Env {
             xdg: Some(temp.path().as_os_str().into()),
             home: None,
@@ -104,7 +104,7 @@ fn missing_config_uses_defaults_and_exits_successfully() {
     let temp = tempfile::tempdir().expect("tempdir");
     let mut io = Io::default();
     let result = leyline::run(
-        [OsString::from("leyline")],
+        ["leyline", "--term", "xterm-256color"].map(OsString::from),
         Env {
             xdg: Some(temp.path().as_os_str().into()),
             home: None,

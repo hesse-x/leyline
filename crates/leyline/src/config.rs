@@ -15,6 +15,7 @@ pub const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct EffectiveConfig {
+    pub terminal: TerminalConfig,
     pub font: FontConfig,
     pub colors: ColorsConfig,
     pub window: WindowConfig,
@@ -24,6 +25,11 @@ pub struct EffectiveConfig {
     pub behavior: BehaviorConfig,
     pub tabs: TabsConfig,
     pub keybindings: Vec<KeyBinding>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalConfig {
+    pub identity: crate::terminfo::TerminalIdentity,
 }
 
 pub const MAX_TABS: u8 = 32;
@@ -183,6 +189,9 @@ pub enum Action {
 impl Default for EffectiveConfig {
     fn default() -> Self {
         Self {
+            terminal: TerminalConfig {
+                identity: crate::terminfo::TerminalIdentity::Leyline,
+            },
             font: FontConfig {
                 family: "monospace".into(),
                 size: 13.0,
@@ -492,6 +501,7 @@ impl ClassifiedError for ConfigError {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawConfig {
+    terminal: RawTerminal,
     font: RawFont,
     colors: RawColors,
     window: RawWindow,
@@ -501,6 +511,14 @@ struct RawConfig {
     behavior: RawBehavior,
     tabs: RawTabs,
     keybindings: Option<Vec<RawKeyBinding>>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawTerminal {
+    identity: Option<String>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -608,6 +626,13 @@ impl RawConfig {
         collect_unknown(
             &mut warnings,
             source,
+            "terminal",
+            &self.terminal.unknown,
+            &["identity"],
+        );
+        collect_unknown(
+            &mut warnings,
+            source,
             "font",
             &self.font.unknown,
             &[
@@ -619,6 +644,18 @@ impl RawConfig {
                 "line_spacing",
             ],
         );
+
+        if let Some(value) = self.terminal.identity {
+            result.terminal.identity = crate::terminfo::TerminalIdentity::parse(&value)
+                .ok_or_else(|| ConfigError::Semantic {
+                    path: path.into(),
+                    field: "terminal.identity".into(),
+                    reason: format!(
+                        "{} is not one of leyline, xterm-256color",
+                        escape_diagnostic(&value)
+                    ),
+                })?;
+        }
         collect_unknown(
             &mut warnings,
             source,
@@ -1018,6 +1055,7 @@ impl RawConfig {
 }
 
 const TOP_FIELDS: &[&str] = &[
+    "terminal",
     "font",
     "colors",
     "window",

@@ -10,7 +10,7 @@ FreeType, HarfBuzz, and a bounded Vulkan glyph atlas.
 ```sh
 sudo apt install build-essential pkg-config libfontconfig1 \
   libwayland-dev libxkbcommon-dev libdecor-0-dev libvulkan-dev \
-  vulkan-validationlayers-dev
+  vulkan-validationlayers-dev ncurses-bin
 ```
 
 FreeType and HarfBuzz are built from the source bundled by their `-sys` crates. Fontconfig is loaded
@@ -24,19 +24,37 @@ route is preferable.
 
 ```sh
 cargo build --release --locked
+cargo run --locked --bin leyline -- terminfo install --user
 cargo run --locked --bin leyline
 cargo run --locked --bin leyline -- -e program arg1 arg2
 ```
 
 Without `-e`, Leyline resolves the effective user's account shell and starts it interactively as a
 non-login shell. `-e` preserves program arguments exactly and does not invoke a shell. PTY children
-inherit the startup environment and working directory with `TERM=xterm-256color` and
-`COLORTERM=truecolor`. Use `-v`, `-vv`, or `-vvv` for progressively more detailed stderr logging.
+inherit the startup environment and working directory with `TERM=leyline-256color` and
+`COLORTERM=truecolor`. Startup fails before creating a window or PTY if the entry is missing. Use
+`leyline --term xterm-256color` as an explicit best-effort compatibility mode, and use `-v`, `-vv`,
+or `-vvv` for progressively more detailed stderr logging.
 
-The accepted future TERM/terminfo design is documented in
-`doc/term-terminfo-tmux-truecolor.md`. It will replace the current identity only when the standalone
-terminfo, CLI, packaging, remote diagnostics, and unified validation gate land together; the design
-document does not change the behavior of the current binary.
+The canonical standalone source is `terminfo/leyline.terminfo`; it declares `RGB`, allowing modern
+tmux to detect true color without a Leyline-specific override. Useful management and diagnostic
+commands are:
+
+```sh
+leyline terminfo print
+leyline terminfo check
+leyline terminfo install --user
+leyline terminfo uninstall --user
+leyline doctor terminfo
+leyline doctor ssh HOST
+```
+
+SSH forwards TERM but not the database. Install the printed source explicitly on a remote host with
+`leyline terminfo print | ssh HOST 'tic -x -o ~/.terminfo /dev/stdin'`, run the read-only doctor first,
+or select compatibility mode before entering an environment where the entry cannot be installed.
+Leyline never modifies remote hosts or tmux configuration automatically. In tmux, keep pane identity
+owned by tmux (normally `set -g default-terminal tmux-256color`). See
+`doc/term-terminfo-tmux-truecolor.md` for the complete identity and per-hop contract.
 
 The stage 0 hardware and integration probes remain available:
 
@@ -64,6 +82,9 @@ Leyline reads `$XDG_CONFIG_HOME/leyline/config.toml`, falling back to
 with a field-specific diagnostic. Example:
 
 ```toml
+[terminal]
+identity = "leyline" # or explicit best-effort "xterm-256color"
+
 [font]
 family = "monospace"
 size = 13.0

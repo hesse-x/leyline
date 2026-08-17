@@ -11,6 +11,7 @@ pub enum ErrorCategory {
     Text,
     Renderer,
     Internal,
+    Remote,
 }
 
 impl ErrorCategory {
@@ -19,6 +20,7 @@ impl ErrorCategory {
         match self {
             Self::Platform | Self::Renderer => 3,
             Self::Internal => 4,
+            Self::Remote => 5,
             Self::Cli
             | Self::Configuration
             | Self::Environment
@@ -40,6 +42,7 @@ impl ErrorCategory {
             Self::Text => "text",
             Self::Renderer => "renderer",
             Self::Internal => "internal",
+            Self::Remote => "ssh",
         }
     }
 }

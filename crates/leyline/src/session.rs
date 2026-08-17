@@ -115,12 +115,13 @@ impl TerminalSession {
     ) -> Result<Self, SessionStartError> {
         let pty_size =
             leyline_pty::PtySize::new(initial_size.columns.get(), initial_size.lines.get(), 0, 0)?;
-        let spec = match launch {
+        let mut spec = match launch {
             LaunchRequest::DefaultShell => SpawnSpec::default_shell(cwd, pty_size)?,
             LaunchRequest::Command(command) => {
                 SpawnSpec::command(command.program.clone(), command.args.clone(), cwd, pty_size)?
             }
         };
+        spec.set_terminal_identity(std::ffi::OsStr::new(config.terminal.identity.term()))?;
         let bulk = runtime.bulk_sink();
         let reliable_exit = runtime.reliable_control_sink();
         let reliable_failure = runtime.reliable_control_sink();

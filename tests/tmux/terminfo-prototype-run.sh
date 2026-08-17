@@ -2,6 +2,7 @@
 set -euo pipefail
 
 readonly SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+readonly REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd -P)
 readonly BYTE_PROBE="$SCRIPT_DIR/byte-probe.sh"
 readonly CUSTOM_TERM=leyline-256color
 readonly TIMEOUT_SECONDS=5
@@ -19,7 +20,7 @@ temp_parent=$(cd -- "${TMPDIR:-/tmp}" && pwd -P)
 readonly temp_parent
 case_root=$(mktemp -d "$temp_parent/leyline-tmux-terminfo.XXXXXXXX")
 readonly case_root
-readonly terminfo_source="$case_root/leyline.terminfo"
+readonly terminfo_source="$REPO_ROOT/terminfo/leyline.terminfo"
 readonly terminfo_db="$case_root/terminfo"
 readonly empty_db="$case_root/empty-terminfo"
 declare -a owned_sockets=()
@@ -55,10 +56,9 @@ trap 'exit 143' TERM
 
 umask 077
 mkdir -p "$terminfo_db" "$empty_db"
-printf '%s\n' \
-    'leyline-256color|Leyline terminal prototype,' \
-    '    RGB,' \
-    '    use=xterm-256color,' >"$terminfo_source"
+if rg -q '^[[:space:]]*use=' "$terminfo_source"; then
+    fail 'canonical terminfo must be standalone'
+fi
 tic -x -o "$terminfo_db" "$terminfo_source"
 compiled=$(TERMINFO="$terminfo_db" infocmp -x "$CUSTOM_TERM")
 rg -q 'RGB' <<<"$compiled" || fail 'custom terminfo did not declare RGB'
