@@ -178,56 +178,6 @@ impl FromStr for Rgb {
     }
 }
 
-/// Parse colors in XParseColor format.
-fn xparse_color(color: &[u8]) -> Option<Rgb> {
-    if !color.is_empty() && color[0] == b'#' {
-        parse_legacy_color(&color[1..])
-    } else if color.len() >= 4 && &color[..4] == b"rgb:" {
-        parse_rgb_color(&color[4..])
-    } else {
-        None
-    }
-}
-
-/// Parse colors in `rgb:r(rrr)/g(ggg)/b(bbb)` format.
-fn parse_rgb_color(color: &[u8]) -> Option<Rgb> {
-    let colors = str::from_utf8(color).ok()?.split('/').collect::<Vec<_>>();
-
-    if colors.len() != 3 {
-        return None;
-    }
-
-    // Scale values instead of filling with `0`s.
-    let scale = |input: &str| {
-        if input.len() > 4 {
-            None
-        } else {
-            let max = u32::pow(16, input.len() as u32) - 1;
-            let value = u32::from_str_radix(input, 16).ok()?;
-            Some((255 * value / max) as u8)
-        }
-    };
-
-    Some(Rgb { r: scale(colors[0])?, g: scale(colors[1])?, b: scale(colors[2])? })
-}
-
-/// Parse colors in `#r(rrr)g(ggg)b(bbb)` format.
-fn parse_legacy_color(color: &[u8]) -> Option<Rgb> {
-    let item_len = color.len() / 3;
-
-    // Truncate/Fill to two byte precision.
-    let color_from_slice = |slice: &[u8]| {
-        let col = usize::from_str_radix(str::from_utf8(slice).ok()?, 16).ok()? << 4;
-        Some((col >> (4 * slice.len().saturating_sub(1))) as u8)
-    };
-
-    Some(Rgb {
-        r: color_from_slice(&color[0..item_len])?,
-        g: color_from_slice(&color[item_len..item_len * 2])?,
-        b: color_from_slice(&color[item_len * 2..])?,
-    })
-}
-
 fn parse_number(input: &[u8]) -> Option<u8> {
     if input.is_empty() {
         return None;
@@ -241,6 +191,51 @@ fn parse_number(input: &[u8]) -> Option<u8> {
     Some(num)
 }
 
+#[cfg(test)]
+fn xparse_color(color: &[u8]) -> Option<Rgb> {
+    if color.first() == Some(&b'#') {
+        parse_legacy_color(&color[1..])
+    } else if let Some(color) = color.strip_prefix(b"rgb:") {
+        parse_rgb_color(color)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+fn parse_rgb_color(color: &[u8]) -> Option<Rgb> {
+    let colors = str::from_utf8(color).ok()?.split('/').collect::<Vec<_>>();
+    if colors.len() != 3 {
+        return None;
+    }
+    let scale = |input: &str| {
+        if input.is_empty() || input.len() > 4 {
+            return None;
+        }
+        let max = u32::pow(16, input.len() as u32) - 1;
+        let value = u32::from_str_radix(input, 16).ok()?;
+        Some((255 * value / max) as u8)
+    };
+    Some(Rgb { r: scale(colors[0])?, g: scale(colors[1])?, b: scale(colors[2])? })
+}
+
+#[cfg(test)]
+fn parse_legacy_color(color: &[u8]) -> Option<Rgb> {
+    if color.is_empty() || color.len() % 3 != 0 {
+        return None;
+    }
+    let item_len = color.len() / 3;
+    let color_from_slice = |slice: &[u8]| {
+        let col = usize::from_str_radix(str::from_utf8(slice).ok()?, 16).ok()? << 4;
+        Some((col >> (4 * slice.len().saturating_sub(1))) as u8)
+    };
+    Some(Rgb {
+        r: color_from_slice(&color[..item_len])?,
+        g: color_from_slice(&color[item_len..item_len * 2])?,
+        b: color_from_slice(&color[item_len * 2..])?,
+    })
+}
+
 /// Internal state for VTE processor.
 #[derive(Debug, Default)]
 struct ProcessorState<T: Timeout> {
@@ -250,6 +245,14 @@ struct ProcessorState<T: Timeout> {
     /// State for synchronized terminal updates.
     sync_state: SyncState<T>,
     audit: crate::ParseAuditDelta,
+    sync_commits: SyncCommitDelta,
+}
+
+/// Synchronized-update commits completed while processing input.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SyncCommitDelta {
+    pub explicit: u32,
+    pub capacity: u32,
 }
 
 #[derive(Debug)]
@@ -263,7 +266,7 @@ struct SyncState<T: Timeout> {
 
 impl<T: Timeout> Default for SyncState<T> {
     fn default() -> Self {
-        Self { buffer: Vec::with_capacity(SYNC_BUFFER_SIZE), timeout: Default::default() }
+        Self { buffer: Vec::new(), timeout: Default::default() }
     }
 }
 
@@ -304,6 +307,11 @@ impl<T: Timeout> Processor<T> {
         }
     }
 
+    /// Return and reset synchronized-update commit counters.
+    pub fn take_sync_commit_delta(&mut self) -> SyncCommitDelta {
+        mem::take(&mut self.state.sync_commits)
+    }
+
     /// Synchronized update timeout.
     pub fn sync_timeout(&self) -> &T {
         &self.state.sync_state.timeout
@@ -333,6 +341,15 @@ impl<T: Timeout> Processor<T> {
         H: Handler,
     {
         self.stop_sync_internal(handler, None);
+    }
+
+    /// Discard a synchronized update without parsing its buffered contents.
+    pub fn discard_sync(&mut self) {
+        self.state.sync_state.timeout.clear_timeout();
+        self.state.sync_state.buffer.clear();
+        if self.state.sync_state.buffer.capacity() > 64 * 1024 {
+            self.state.sync_state.buffer.shrink_to(64 * 1024);
+        }
     }
 
     /// End a synchronized update.
@@ -369,6 +386,9 @@ impl<T: Timeout> Processor<T> {
                 handler.unset_private_mode(NamedPrivateMode::SyncUpdate.into());
                 self.state.sync_state.timeout.clear_timeout();
                 self.state.sync_state.buffer.clear();
+                if self.state.sync_state.buffer.capacity() > 64 * 1024 {
+                    self.state.sync_state.buffer.shrink_to(64 * 1024);
+                }
             },
         }
     }
@@ -389,6 +409,8 @@ impl<T: Timeout> Processor<T> {
     {
         // Advance sync parser or stop sync if we'd exceed the maximum buffer size.
         if self.state.sync_state.buffer.len() + bytes.len() >= SYNC_BUFFER_SIZE - 1 {
+            self.state.sync_commits.capacity =
+                self.state.sync_commits.capacity.saturating_add(1);
             // Terminate the synchronized update.
             self.stop_sync_internal(handler, None);
 
@@ -427,6 +449,8 @@ impl<T: Timeout> Processor<T> {
                 self.state.sync_state.timeout.set_timeout(SYNC_UPDATE_TIMEOUT);
                 bsu_offset = Some(offset);
             } else if escape == ESU_CSI {
+                self.state.sync_commits.explicit =
+                    self.state.sync_commits.explicit.saturating_add(1);
                 self.stop_sync_internal(handler, bsu_offset);
                 break;
             }
@@ -1383,29 +1407,8 @@ where
 
             // Set color index.
             b"4" => {
-                if params.len() <= 1 || params.len() % 2 == 0 {
-                    unhandled(&mut self.state.audit, params);
-                    return;
-                }
-
-                for chunk in params[1..].chunks(2) {
-                    let index = match parse_number(chunk[0]) {
-                        Some(index) => index,
-                        None => {
-                            unhandled(&mut self.state.audit, params);
-                            continue;
-                        },
-                    };
-
-                    if let Some(c) = xparse_color(chunk[1]) {
-                        self.handler.set_color(index as usize, c);
-                    } else if chunk[1] == b"?" {
-                        let prefix = alloc::format!("4;{index}");
-                        self.handler.dynamic_color_sequence(prefix, index as usize, terminator);
-                    } else {
-                        unhandled(&mut self.state.audit, params);
-                    }
-                }
+                self.state.audit.rejected_actions =
+                    self.state.audit.rejected_actions.saturating_add(1);
             },
 
             // Hyperlink.
@@ -1435,7 +1438,7 @@ where
                     .and_then(|kv| str::from_utf8(kv).ok().map(|e| e.to_owned()));
 
                 if uri.len() > MAX_LEYLINE_HYPERLINK_BYTES
-                    || id.as_ref().is_some_and(|id| id.len() > MAX_LEYLINE_HYPERLINK_BYTES)
+                    || id.as_ref().map_or(false, |id| id.len() > MAX_LEYLINE_HYPERLINK_BYTES)
                 {
                     self.state.audit.rejected_actions =
                         self.state.audit.rejected_actions.saturating_add(1);
@@ -1447,36 +1450,14 @@ where
 
             // Get/set Foreground, Background, Cursor colors.
             b"10" | b"11" | b"12" => {
-                if params.len() >= 2 {
-                    if let Some(mut dynamic_code) = parse_number(params[0]) {
-                        for param in &params[1..] {
-                            // 10 is the first dynamic color, also the foreground.
-                            let offset = dynamic_code as usize - 10;
-                            let index = NamedColor::Foreground as usize + offset;
-
-                            // End of setting dynamic colors.
-                            if index > NamedColor::Cursor as usize {
-                                unhandled(&mut self.state.audit, params);
-                                break;
-                            }
-
-                            if let Some(color) = xparse_color(param) {
-                                self.handler.set_color(index, color);
-                            } else if param == b"?" {
-                                self.handler.dynamic_color_sequence(
-                                    dynamic_code.to_string(),
-                                    index,
-                                    terminator,
-                                );
-                            } else {
-                                unhandled(&mut self.state.audit, params);
-                            }
-                            dynamic_code += 1;
-                        }
-                        return;
-                    }
+                if matches!(params[0], b"10" | b"11") && params.len() == 2 && params[1] == b"?" {
+                    let dynamic_code = parse_number(params[0]).expect("matched numeric OSC code");
+                    let index = NamedColor::Foreground as usize + dynamic_code as usize - 10;
+                    self.handler.dynamic_color_sequence(dynamic_code.to_string(), index, terminator);
+                    return;
                 }
-                unhandled(&mut self.state.audit, params);
+                self.state.audit.rejected_actions =
+                    self.state.audit.rejected_actions.saturating_add(1);
             },
 
             // Set mouse cursor shape.
@@ -1513,31 +1494,27 @@ where
 
             // Reset color index.
             b"104" => {
-                // Reset all color indexes when no parameters are given.
-                if params.len() == 1 || params[1].is_empty() {
-                    for i in 0..256 {
-                        self.handler.reset_color(i);
-                    }
-                    return;
-                }
-
-                // Reset color indexes given as parameters.
-                for param in &params[1..] {
-                    match parse_number(param) {
-                        Some(index) => self.handler.reset_color(index as usize),
-                        None => unhandled(&mut self.state.audit, params),
-                    }
-                }
+                self.state.audit.rejected_actions =
+                    self.state.audit.rejected_actions.saturating_add(1);
             },
 
             // Reset foreground color.
-            b"110" => self.handler.reset_color(NamedColor::Foreground as usize),
+            b"110" => {
+                self.state.audit.rejected_actions =
+                    self.state.audit.rejected_actions.saturating_add(1);
+            },
 
             // Reset background color.
-            b"111" => self.handler.reset_color(NamedColor::Background as usize),
+            b"111" => {
+                self.state.audit.rejected_actions =
+                    self.state.audit.rejected_actions.saturating_add(1);
+            },
 
             // Reset text cursor color.
-            b"112" => self.handler.reset_color(NamedColor::Cursor as usize),
+            b"112" => {
+                self.state.audit.rejected_actions =
+                    self.state.audit.rejected_actions.saturating_add(1);
+            },
 
             _ => unhandled(&mut self.state.audit, params),
         }
@@ -1715,7 +1692,10 @@ where
                     unhandled!()
                 }
             },
-            ('n', []) => handler.device_status(next_param_or(0) as usize),
+            ('n', []) => match next_param_or(0) as usize {
+                status @ (5 | 6) => handler.device_status(status),
+                _ => unhandled!(),
+            },
             ('P', []) => handler.delete_chars(next_param_or(1) as usize),
             ('p', [b'$']) => {
                 let mode = next_param_or(0);
@@ -1727,7 +1707,14 @@ where
             },
             ('q', [b' ']) => {
                 // DECSCUSR (CSI Ps SP q) -- Set Cursor Style.
-                let cursor_style_id = next_param_or(0);
+                let mut cursor_params = params.iter();
+                let cursor_style_id = match (cursor_params.next(), cursor_params.next()) {
+                    (Some(&[parameter]), None) => parameter,
+                    _ => {
+                        unhandled!();
+                        return;
+                    },
+                };
                 let shape = match cursor_style_id {
                     0 => None,
                     1 | 2 => Some(CursorShape::Block),
@@ -2061,6 +2048,7 @@ mod tests {
         identity_reported: bool,
         color: Option<Rgb>,
         reset_colors: Vec<usize>,
+        cursor_style: Option<CursorStyle>,
     }
 
     impl Handler for MockHandler {
@@ -2092,6 +2080,10 @@ mod tests {
         fn reset_color(&mut self, index: usize) {
             self.reset_colors.push(index)
         }
+
+        fn set_cursor_style(&mut self, style: Option<CursorStyle>) {
+            self.cursor_style = style;
+        }
     }
 
     impl Default for MockHandler {
@@ -2103,6 +2095,7 @@ mod tests {
                 identity_reported: false,
                 color: None,
                 reset_colors: Vec::new(),
+                cursor_style: None,
             }
         }
     }
@@ -2283,7 +2276,31 @@ mod tests {
     }
 
     #[test]
-    fn parse_osc4_set_color() {
+    fn decscusr_rejects_extra_subparameters_and_parameters() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, b"\x1b[2 q");
+        assert_eq!(
+            handler.cursor_style,
+            Some(CursorStyle {
+                shape: CursorShape::Block,
+                blinking: false,
+            })
+        );
+        parser.advance(&mut handler, b"\x1b[5:1 q\x1b[6;1 q\x1b[99 q");
+        assert_eq!(
+            handler.cursor_style,
+            Some(CursorStyle {
+                shape: CursorShape::Block,
+                blinking: false,
+            })
+        );
+        assert_eq!(parser.take_audit_delta().unknown_sequences, 3);
+    }
+
+    #[test]
+    fn osc4_set_color_is_rejected_without_mutation() {
         let bytes: &[u8] = b"\x1b]4;0;#fff\x1b\\";
 
         let mut parser = Processor::<TestSyncHandler>::new();
@@ -2291,11 +2308,12 @@ mod tests {
 
         parser.advance(&mut handler, bytes);
 
-        assert_eq!(handler.color, Some(Rgb { r: 0xF0, g: 0xF0, b: 0xF0 }));
+        assert_eq!(handler.color, None);
+        assert_eq!(parser.take_audit_delta().rejected_actions, 1);
     }
 
     #[test]
-    fn parse_osc104_reset_color() {
+    fn osc104_reset_color_is_rejected_without_mutation() {
         let bytes: &[u8] = b"\x1b]104;1;\x1b\\";
 
         let mut parser = Processor::<TestSyncHandler>::new();
@@ -2303,11 +2321,12 @@ mod tests {
 
         parser.advance(&mut handler, bytes);
 
-        assert_eq!(handler.reset_colors, vec![1]);
+        assert!(handler.reset_colors.is_empty());
+        assert_eq!(parser.take_audit_delta().rejected_actions, 1);
     }
 
     #[test]
-    fn parse_osc104_reset_all_colors() {
+    fn osc104_reset_all_colors_is_rejected_without_mutation() {
         let bytes: &[u8] = b"\x1b]104;\x1b\\";
 
         let mut parser = Processor::<TestSyncHandler>::new();
@@ -2315,12 +2334,12 @@ mod tests {
 
         parser.advance(&mut handler, bytes);
 
-        let expected: Vec<usize> = (0..256).collect();
-        assert_eq!(handler.reset_colors, expected);
+        assert!(handler.reset_colors.is_empty());
+        assert_eq!(parser.take_audit_delta().rejected_actions, 1);
     }
 
     #[test]
-    fn parse_osc104_reset_all_colors_no_semicolon() {
+    fn osc104_reset_all_colors_without_semicolon_is_rejected() {
         let bytes: &[u8] = b"\x1b]104\x1b\\";
 
         let mut parser = Processor::<TestSyncHandler>::new();
@@ -2328,8 +2347,8 @@ mod tests {
 
         parser.advance(&mut handler, bytes);
 
-        let expected: Vec<usize> = (0..256).collect();
-        assert_eq!(handler.reset_colors, expected);
+        assert!(handler.reset_colors.is_empty());
+        assert_eq!(parser.take_audit_delta().rejected_actions, 1);
     }
 
     #[test]
@@ -2407,6 +2426,34 @@ mod tests {
             assert_eq!(parser.state.sync_state.timeout.is_sync, 0);
             assert!(handler.attr.take().is_some());
         }
+    }
+
+    #[test]
+    fn sync_commit_counters_and_discard_are_bounded() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, b"\x1b[?2026h\x1b[4m");
+        assert!(parser.sync_bytes_count() > 0);
+        parser.discard_sync();
+        assert_eq!(parser.sync_bytes_count(), 0);
+        assert_eq!(parser.state.sync_state.timeout.is_sync, 0);
+        assert!(handler.attr.is_none());
+        assert!(parser.state.sync_state.buffer.capacity() <= 64 * 1024);
+
+        parser.advance(&mut handler, b"\x1b[?2026h\x1b[1m\x1b[?2026l");
+        assert_eq!(
+            parser.take_sync_commit_delta(),
+            SyncCommitDelta {
+                explicit: 1,
+                capacity: 0,
+            }
+        );
+
+        parser.advance(&mut handler, b"\x1b[?2026h");
+        parser.advance(&mut handler, &vec![b'x'; SYNC_BUFFER_SIZE]);
+        assert_eq!(parser.take_sync_commit_delta().capacity, 1);
+        assert!(parser.state.sync_state.buffer.capacity() <= 64 * 1024);
     }
 
     #[test]

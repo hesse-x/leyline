@@ -5,7 +5,9 @@ mod input;
 mod snapshot;
 
 pub use core::{
-    ParseAuditDelta, TerminalAction, TerminalCoreAdapter, TerminalDelta, TerminalError,
+    DefaultColorSlot, ParseAuditDelta, PendingSync, QueryTerminator, SyncFlushReason,
+    TerminalAction, TerminalCoreAdapter, TerminalCoreConfig, TerminalDelta, TerminalError,
+    TerminalQuery,
 };
 pub use debug_grid::format_debug_grid;
 pub use input::{
@@ -14,7 +16,7 @@ pub use input::{
     paste_transaction,
 };
 pub use snapshot::{
-    CellFlags, CellWidth, CursorSnapshot, FrameSnapshot, GridSize, MouseEncoding, MouseProtocol,
-    ProjectedSelection, SelectionKind, SelectionPoint, SelectionSide, SnapshotCell,
-    SnapshotHyperlink, TerminalColor, TerminalModes,
+    CellFlags, CellWidth, CursorBlink, CursorShape, CursorSnapshot, FrameSnapshot, GridSize,
+    MouseEncoding, MouseProtocol, ProjectedSelection, SelectionKind, SelectionPoint, SelectionSide,
+    SnapshotCell, SnapshotHyperlink, TerminalColor, TerminalModes, UnderlineStyle,
 };

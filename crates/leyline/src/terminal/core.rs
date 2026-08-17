@@ -1,19 +1,19 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc, time::Instant};
 
 use alacritty_terminal::{
     Term,
-    event::{Event, EventListener},
+    event::{Event, EventListener, WindowSize},
     grid::Dimensions,
     index::{Column, Line, Point, Side},
     selection::{Selection, SelectionType},
     term::{Config, TermMode, cell::Flags, test::TermSize},
-    vte::ansi::{self, Color},
+    vte::ansi::{self, Color, NamedColor, Rgb},
 };
 
 use super::snapshot::{
-    CellFlags, CellWidth, CursorSnapshot, FrameSnapshot, GridSize, MouseEncoding, MouseProtocol,
-    ProjectedSelection, SelectionKind, SelectionPoint, SelectionSide, SnapshotCell,
-    SnapshotHyperlink, TerminalColor, TerminalModes,
+    CellFlags, CellWidth, CursorBlink, CursorShape, CursorSnapshot, FrameSnapshot, GridSize,
+    MouseEncoding, MouseProtocol, ProjectedSelection, SelectionKind, SelectionPoint, SelectionSide,
+    SnapshotCell, SnapshotHyperlink, TerminalColor, TerminalModes, UnderlineStyle,
 };
 use crate::{
     app::event::ByteBatch,
@@ -29,8 +29,58 @@ pub enum TerminalAction {
     ResetTitle,
     Bell,
     WriteToPty(Vec<u8>),
+    Query(TerminalQuery),
     ClipboardRequestRejected,
     UnsupportedSequence,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DefaultColorSlot {
+    Foreground,
+    Background,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QueryTerminator {
+    Bell,
+    StringTerminator,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminalQuery {
+    DefaultColor {
+        slot: DefaultColorSlot,
+        terminator: QueryTerminator,
+    },
+    TextAreaPixels,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalCoreConfig {
+    pub history_lines: usize,
+    pub default_cursor_shape: CursorShape,
+}
+
+impl From<usize> for TerminalCoreConfig {
+    fn from(history_lines: usize) -> Self {
+        Self {
+            history_lines,
+            default_cursor_shape: CursorShape::Block,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingSync {
+    pub epoch: u64,
+    pub bytes: usize,
+    pub deadline: Instant,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SyncFlushReason {
+    Timeout,
+    SessionEnd,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -46,6 +96,11 @@ pub struct ParseAuditDelta {
     pub rejected_actions: u32,
     pub truncated_sequences: u32,
     pub reply_bytes: usize,
+    pub sync_forced_commits: u32,
+    pub sync_timeouts: u32,
+    pub query_replies: u32,
+    pub query_rejected: u32,
+    pub display_state_fallbacks: u32,
 }
 
 #[derive(Clone, Default)]
@@ -66,16 +121,25 @@ pub struct TerminalCoreAdapter {
     title: Option<Arc<str>>,
     cached: RefCell<Option<FrameSnapshot>>,
     selection_revision: u64,
+    sync_epoch: u64,
     _main_thread: Rc<()>,
 }
 
 #[allow(clippy::missing_errors_doc)]
 impl TerminalCoreAdapter {
-    pub fn new(size: GridSize, history_lines: usize) -> Result<Self, TerminalError> {
+    pub fn new(
+        size: GridSize,
+        config: impl Into<TerminalCoreConfig>,
+    ) -> Result<Self, TerminalError> {
+        let config = config.into();
         let listener = Listener::default();
         let events = Rc::clone(&listener.0);
         let config = Config {
-            scrolling_history: history_lines.min(100_000),
+            scrolling_history: config.history_lines.min(100_000),
+            default_cursor_style: ansi::CursorStyle {
+                shape: map_cursor_shape_to_ansi(config.default_cursor_shape),
+                blinking: false,
+            },
             osc52: alacritty_terminal::term::Osc52::Disabled,
             ..Config::default()
         };
@@ -94,6 +158,7 @@ impl TerminalCoreAdapter {
             title: None,
             cached: RefCell::new(None),
             selection_revision: 0,
+            sync_epoch: 0,
             _main_thread: Rc::new(()),
         })
     }
@@ -105,8 +170,26 @@ impl TerminalCoreAdapter {
         if bytes.len() > ByteBatch::MAX_LEN {
             return Err(TerminalError::BatchTooLarge(bytes.len()));
         }
+        let was_pending = self.parser.sync_timeout().sync_timeout().is_some();
         self.parser.advance(&mut self.term, bytes);
+        let commits = self.parser.take_sync_commit_delta();
+        let is_pending = self.parser.sync_timeout().sync_timeout().is_some();
+        if is_pending && (!was_pending || commits.explicit != 0 || commits.capacity != 0) {
+            self.sync_epoch = self
+                .sync_epoch
+                .checked_add(1)
+                .ok_or(TerminalError::GenerationOverflow)?;
+        }
         let parser_audit = self.parser.take_audit_delta();
+        let dirty = !is_pending || commits.explicit != 0 || commits.capacity != 0;
+        if !dirty {
+            let event_audit = self.collect_events();
+            return Ok(TerminalDelta {
+                dirty: false,
+                actions: self.actions.len(),
+                audit: merge_audit(event_audit, parser_audit, commits.capacity),
+            });
+        }
         self.generation = self
             .generation
             .checked_add(1)
@@ -114,7 +197,7 @@ impl TerminalCoreAdapter {
         self.cached.get_mut().take();
         let event_audit = self.collect_events();
         Ok(TerminalDelta {
-            dirty: true,
+            dirty,
             actions: self.actions.len(),
             audit: ParseAuditDelta {
                 unknown_sequences: event_audit
@@ -125,8 +208,62 @@ impl TerminalCoreAdapter {
                     .saturating_add(parser_audit.rejected_actions),
                 truncated_sequences: parser_audit.truncated_sequences,
                 reply_bytes: event_audit.reply_bytes,
+                sync_forced_commits: commits.capacity,
+                sync_timeouts: 0,
+                query_replies: event_audit.query_replies,
+                query_rejected: event_audit.query_rejected,
+                display_state_fallbacks: 0,
             },
         })
+    }
+
+    #[must_use]
+    pub fn pending_sync(&self) -> Option<PendingSync> {
+        Some(PendingSync {
+            epoch: self.sync_epoch,
+            bytes: self.parser.sync_bytes_count(),
+            deadline: self.parser.sync_timeout().sync_timeout()?,
+        })
+    }
+
+    pub fn flush_synchronized_update(
+        &mut self,
+        epoch: u64,
+        reason: SyncFlushReason,
+    ) -> Result<TerminalDelta, TerminalError> {
+        if self
+            .pending_sync()
+            .is_none_or(|pending| pending.epoch != epoch)
+        {
+            return Ok(TerminalDelta::default());
+        }
+        self.parser.stop_sync(&mut self.term);
+        self.parser.take_sync_commit_delta();
+        let parser_audit = self.parser.take_audit_delta();
+        self.generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(TerminalError::GenerationOverflow)?;
+        self.cached.get_mut().take();
+        let event_audit = self.collect_events();
+        let mut audit = merge_audit(event_audit, parser_audit, 0);
+        audit.sync_timeouts = u32::from(matches!(reason, SyncFlushReason::Timeout));
+        Ok(TerminalDelta {
+            dirty: true,
+            actions: self.actions.len(),
+            audit,
+        })
+    }
+
+    pub fn discard_synchronized_update(&mut self, epoch: u64) -> bool {
+        if self
+            .pending_sync()
+            .is_none_or(|pending| pending.epoch != epoch)
+        {
+            return false;
+        }
+        self.parser.discard_sync();
+        true
     }
 
     pub fn resize(&mut self, size: GridSize) -> Result<TerminalDelta, TerminalError> {
@@ -148,6 +285,12 @@ impl TerminalCoreAdapter {
         })
     }
 
+    #[must_use]
+    pub const fn size(&self) -> GridSize {
+        self.size
+    }
+
+    #[allow(clippy::too_many_lines)]
     pub fn snapshot(&self) -> Result<FrameSnapshot, TerminalError> {
         if let Some(snapshot) = self.cached.borrow().as_ref() {
             return Ok(snapshot.clone());
@@ -203,11 +346,11 @@ impl TerminalCoreAdapter {
                 foreground: map_color(cell.fg),
                 background: map_color(cell.bg),
                 underline_color: cell.underline_color().map(map_color),
+                underline_style: map_underline_style(cell.flags),
                 flags: CellFlags {
                     bold: cell.flags.contains(Flags::BOLD),
                     dim: cell.flags.contains(Flags::DIM),
                     italic: cell.flags.contains(Flags::ITALIC),
-                    underline: cell.flags.intersects(Flags::ALL_UNDERLINES),
                     inverse: cell.flags.contains(Flags::INVERSE),
                     hidden: cell.flags.contains(Flags::HIDDEN),
                     strikeout: cell.flags.contains(Flags::STRIKEOUT),
@@ -232,6 +375,7 @@ impl TerminalCoreAdapter {
         }
         let mode = *self.term.mode();
         let cursor = content.cursor;
+        let cursor_style = self.term.cursor_style();
         let snapshot = FrameSnapshot {
             generation: self.generation,
             grid: self.size,
@@ -240,6 +384,12 @@ impl TerminalCoreAdapter {
                 column: u16::try_from(cursor.point.column.0).unwrap_or(u16::MAX),
                 line: u16::try_from(cursor.point.line.0.max(0)).unwrap_or(u16::MAX),
                 visible: mode.contains(TermMode::SHOW_CURSOR) && content.display_offset == 0,
+                shape: map_cursor_shape(cursor_style.shape),
+                blink: if cursor_style.blinking {
+                    CursorBlink::Blinking
+                } else {
+                    CursorBlink::Steady
+                },
             },
             modes: map_modes(mode),
             display_offset: content.display_offset,
@@ -398,7 +548,10 @@ impl TerminalCoreAdapter {
                     self.actions.push(TerminalAction::ResetTitle);
                 }
                 Event::Bell => self.actions.push(TerminalAction::Bell),
-                Event::PtyWrite(text) if text.len() <= MAX_PTY_REPLY_BYTES => {
+                Event::PtyWrite(text)
+                    if text.len() <= MAX_PTY_REPLY_BYTES
+                        && audit.reply_bytes.saturating_add(text.len()) <= MAX_PTY_REPLY_BYTES =>
+                {
                     audit.reply_bytes = audit.reply_bytes.saturating_add(text.len());
                     self.actions
                         .push(TerminalAction::WriteToPty(text.into_bytes()));
@@ -410,9 +563,20 @@ impl TerminalCoreAdapter {
                     audit.rejected_actions = audit.rejected_actions.saturating_add(1);
                     self.actions.push(TerminalAction::ClipboardRequestRejected);
                 }
-                Event::ColorRequest(..) | Event::TextAreaSizeRequest(..) => {
-                    audit.unknown_sequences = audit.unknown_sequences.saturating_add(1);
-                    self.actions.push(TerminalAction::UnsupportedSequence);
+                Event::ColorRequest(index, formatter) => {
+                    if let Some(query) = map_color_query(index, &formatter) {
+                        self.actions.push(TerminalAction::Query(query));
+                    } else {
+                        audit.query_rejected = audit.query_rejected.saturating_add(1);
+                    }
+                }
+                Event::TextAreaSizeRequest(formatter) => {
+                    if validate_text_area_formatter(&formatter) {
+                        self.actions
+                            .push(TerminalAction::Query(TerminalQuery::TextAreaPixels));
+                    } else {
+                        audit.query_rejected = audit.query_rejected.saturating_add(1);
+                    }
                 }
                 _ => {}
             }
@@ -469,6 +633,97 @@ fn map_color(color: Color) -> TerminalColor {
         Color::Spec(rgb) => TerminalColor::Rgb(rgb.r, rgb.g, rgb.b),
     }
 }
+
+fn map_cursor_shape_to_ansi(shape: CursorShape) -> ansi::CursorShape {
+    match shape {
+        CursorShape::Block => ansi::CursorShape::Block,
+        CursorShape::Beam => ansi::CursorShape::Beam,
+        CursorShape::Underline => ansi::CursorShape::Underline,
+    }
+}
+
+fn map_cursor_shape(shape: ansi::CursorShape) -> CursorShape {
+    match shape {
+        ansi::CursorShape::Beam => CursorShape::Beam,
+        ansi::CursorShape::Underline => CursorShape::Underline,
+        ansi::CursorShape::Block | ansi::CursorShape::HollowBlock | ansi::CursorShape::Hidden => {
+            CursorShape::Block
+        }
+    }
+}
+
+fn map_underline_style(flags: Flags) -> UnderlineStyle {
+    if flags.contains(Flags::DOUBLE_UNDERLINE) {
+        UnderlineStyle::Double
+    } else if flags.contains(Flags::UNDERCURL) {
+        UnderlineStyle::Curly
+    } else if flags.contains(Flags::DOTTED_UNDERLINE) {
+        UnderlineStyle::Dotted
+    } else if flags.contains(Flags::DASHED_UNDERLINE) {
+        UnderlineStyle::Dashed
+    } else if flags.contains(Flags::UNDERLINE) {
+        UnderlineStyle::Single
+    } else {
+        UnderlineStyle::None
+    }
+}
+
+fn map_color_query(
+    index: usize,
+    formatter: &Arc<dyn Fn(Rgb) -> String + Sync + Send + 'static>,
+) -> Option<TerminalQuery> {
+    let slot = match index {
+        value if value == NamedColor::Foreground as usize => DefaultColorSlot::Foreground,
+        value if value == NamedColor::Background as usize => DefaultColorSlot::Background,
+        _ => return None,
+    };
+    let code = match slot {
+        DefaultColorSlot::Foreground => 10,
+        DefaultColorSlot::Background => 11,
+    };
+    let probe_reply = formatter(Rgb { r: 1, g: 2, b: 3 });
+    let terminator = if probe_reply == format!("\x1b]{code};rgb:0101/0202/0303\x07") {
+        QueryTerminator::Bell
+    } else if probe_reply == format!("\x1b]{code};rgb:0101/0202/0303\x1b\\") {
+        QueryTerminator::StringTerminator
+    } else {
+        return None;
+    };
+    Some(TerminalQuery::DefaultColor { slot, terminator })
+}
+
+fn validate_text_area_formatter(
+    formatter: &Arc<dyn Fn(WindowSize) -> String + Sync + Send + 'static>,
+) -> bool {
+    formatter(WindowSize {
+        num_lines: 2,
+        num_cols: 3,
+        cell_width: 5,
+        cell_height: 7,
+    }) == "\x1b[4;14;15t"
+}
+
+fn merge_audit(
+    event: ParseAuditDelta,
+    parser: alacritty_terminal::vte::ParseAuditDelta,
+    forced_commits: u32,
+) -> ParseAuditDelta {
+    ParseAuditDelta {
+        unknown_sequences: event
+            .unknown_sequences
+            .saturating_add(parser.unknown_sequences),
+        rejected_actions: event
+            .rejected_actions
+            .saturating_add(parser.rejected_actions),
+        truncated_sequences: parser.truncated_sequences,
+        reply_bytes: event.reply_bytes,
+        sync_forced_commits: forced_commits,
+        sync_timeouts: event.sync_timeouts,
+        query_replies: event.query_replies,
+        query_rejected: event.query_rejected,
+        display_state_fallbacks: event.display_state_fallbacks,
+    }
+}
 fn default_cell() -> SnapshotCell {
     SnapshotCell {
         ch: ' ',
@@ -476,6 +731,7 @@ fn default_cell() -> SnapshotCell {
         foreground: TerminalColor::Named(256),
         background: TerminalColor::Named(257),
         underline_color: None,
+        underline_style: UnderlineStyle::None,
         flags: CellFlags::default(),
         width: CellWidth::Narrow,
         hyperlink: None,
@@ -525,7 +781,9 @@ mod tests {
     #[test]
     fn standard_device_queries_emit_bounded_xterm_replies() {
         let mut core = TerminalCoreAdapter::new(GridSize::new(20, 4).unwrap(), 100).unwrap();
-        let delta = core.advance(b"\x1b[c\x1b[5n\x1b[2;3H\x1b[6n").unwrap();
+        let delta = core
+            .advance(b"\x1b[c\x1b[>c\x1b[5n\x1b[2;3H\x1b[6n\x1b[?1$p\x1b[4$p\x1b[?9999$p\x1b[99n")
+            .unwrap();
         let mut actions = Vec::new();
         core.drain_actions(&mut actions);
         let replies: Vec<Vec<u8>> = actions
@@ -539,15 +797,149 @@ mod tests {
             replies,
             [
                 b"\x1b[?6c".to_vec(),
+                b"\x1b[>0;2501;1c".to_vec(),
                 b"\x1b[0n".to_vec(),
-                b"\x1b[2;3R".to_vec()
+                b"\x1b[2;3R".to_vec(),
+                b"\x1b[?1;2$y".to_vec(),
+                b"\x1b[4;2$y".to_vec(),
+                b"\x1b[?9999;0$y".to_vec(),
             ]
         );
+        assert_eq!(delta.audit.unknown_sequences, 1);
         assert_eq!(
             delta.audit.reply_bytes,
             replies.iter().map(Vec::len).sum::<usize>()
         );
         assert!(delta.audit.reply_bytes <= MAX_PTY_REPLY_BYTES);
+    }
+
+    #[test]
+    fn decscusr_and_underline_styles_survive_in_the_snapshot() {
+        let config = TerminalCoreConfig {
+            history_lines: 0,
+            default_cursor_shape: CursorShape::Beam,
+        };
+        let mut core = TerminalCoreAdapter::new(GridSize::new(12, 2).unwrap(), config).unwrap();
+
+        for (parameter, shape, blink) in [
+            (1, CursorShape::Block, CursorBlink::Blinking),
+            (2, CursorShape::Block, CursorBlink::Steady),
+            (3, CursorShape::Underline, CursorBlink::Blinking),
+            (4, CursorShape::Underline, CursorBlink::Steady),
+            (5, CursorShape::Beam, CursorBlink::Blinking),
+            (6, CursorShape::Beam, CursorBlink::Steady),
+        ] {
+            core.advance(format!("\x1b[{parameter} q").as_bytes())
+                .unwrap();
+            let cursor = core.snapshot().unwrap().cursor;
+            assert_eq!((cursor.shape, cursor.blink), (shape, blink));
+        }
+        core.advance(b"\x1b[0 q").unwrap();
+        assert_eq!(core.snapshot().unwrap().cursor.shape, CursorShape::Beam);
+
+        core.advance(b"\r\x1b[4m1\x1b[4:2m2\x1b[4:3m3\x1b[4:4m4\x1b[4:5m5\x1b[24m0")
+            .unwrap();
+        let snapshot = core.snapshot().unwrap();
+        assert_eq!(
+            snapshot.cells[..6]
+                .iter()
+                .map(|cell| cell.underline_style)
+                .collect::<Vec<_>>(),
+            [
+                UnderlineStyle::Single,
+                UnderlineStyle::Double,
+                UnderlineStyle::Curly,
+                UnderlineStyle::Dotted,
+                UnderlineStyle::Dashed,
+                UnderlineStyle::None,
+            ]
+        );
+    }
+
+    #[test]
+    fn synchronized_updates_publish_only_when_committed() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 2).unwrap(), 0).unwrap();
+        core.advance(b"old").unwrap();
+        let before = core.snapshot().unwrap();
+        assert!(!core.advance(b"\x1b[?2026hnew").unwrap().dirty);
+        assert!(core.pending_sync().is_some());
+        assert_eq!(core.snapshot().unwrap(), before);
+        assert!(!core.advance(b"er").unwrap().dirty);
+        assert!(core.advance(b"\x1b[?2026l").unwrap().dirty);
+        assert!(core.pending_sync().is_none());
+        assert_ne!(core.snapshot().unwrap().cells, before.cells);
+
+        core.advance(b"\x1b[?2026hfirst").unwrap();
+        let first_epoch = core.pending_sync().unwrap().epoch;
+        core.advance(b"\x1b[?2026l\x1b[?2026hsecond").unwrap();
+        assert!(core.pending_sync().unwrap().epoch > first_epoch);
+
+        core.advance(b"\x1b[?2026htimeout").unwrap();
+        let pending = core.pending_sync().unwrap();
+        assert!(
+            core.flush_synchronized_update(pending.epoch, SyncFlushReason::Timeout)
+                .unwrap()
+                .dirty
+        );
+        assert!(
+            core.flush_synchronized_update(pending.epoch, SyncFlushReason::Timeout)
+                .unwrap()
+                .audit
+                .sync_timeouts
+                == 0
+        );
+        assert!(pending.epoch >= 1);
+    }
+
+    #[test]
+    fn approved_queries_are_typed_and_color_mutations_remain_blocked() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(20, 4).unwrap(), 0).unwrap();
+        let delta = core
+            .advance(b"\x1b]10;?\x1b\\\x1b]11;?\x07\x1b[14t\x1b[18t\x1b]10;#ffffff\x07\x1b]112\x07")
+            .unwrap();
+        let mut actions = Vec::new();
+        core.drain_actions(&mut actions);
+        assert_eq!(
+            actions,
+            [
+                TerminalAction::Query(TerminalQuery::DefaultColor {
+                    slot: DefaultColorSlot::Foreground,
+                    terminator: QueryTerminator::StringTerminator,
+                }),
+                TerminalAction::Query(TerminalQuery::DefaultColor {
+                    slot: DefaultColorSlot::Background,
+                    terminator: QueryTerminator::Bell,
+                }),
+                TerminalAction::Query(TerminalQuery::TextAreaPixels),
+                TerminalAction::WriteToPty(b"\x1b[8;4;20t".to_vec()),
+            ]
+        );
+        assert_eq!(delta.audit.rejected_actions, 2);
+    }
+
+    #[test]
+    fn display_protocol_state_is_isolated_between_terminal_cores() {
+        let mut first = TerminalCoreAdapter::new(GridSize::new(8, 2).unwrap(), 0).unwrap();
+        let mut second = TerminalCoreAdapter::new(GridSize::new(8, 2).unwrap(), 0).unwrap();
+        first
+            .advance(b"\x1b[5 q\x1b[4:3mA\x1b[?2026hpending")
+            .unwrap();
+        second.advance(b"B").unwrap();
+
+        let first_snapshot = first.snapshot().unwrap();
+        let second_snapshot = second.snapshot().unwrap();
+        assert_eq!(first_snapshot.cursor.shape, CursorShape::Beam);
+        assert_eq!(
+            first_snapshot.cells[0].underline_style,
+            UnderlineStyle::Curly
+        );
+        assert!(first.pending_sync().is_some());
+        assert_eq!(second_snapshot.cursor.shape, CursorShape::Block);
+        assert_eq!(
+            second_snapshot.cells[0].underline_style,
+            UnderlineStyle::None
+        );
+        assert!(second.pending_sync().is_none());
     }
 
     #[test]

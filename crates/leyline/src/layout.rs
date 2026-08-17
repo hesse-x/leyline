@@ -23,7 +23,22 @@ pub struct ContentInsets {
     pub bottom: u16,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TerminalGeometry {
+    pub generation: u64,
+    pub grid: GridSize,
+    pub cell_px: [NonZeroU16; 2],
+}
+
 impl GridLayout {
+    #[must_use]
+    pub const fn terminal_geometry(&self, generation: u64) -> TerminalGeometry {
+        TerminalGeometry {
+            generation,
+            grid: self.grid,
+            cell_px: self.cell_px,
+        }
+    }
     #[must_use]
     pub fn cell_at_pixel(&self, pixel: [u32; 2]) -> Option<[u16; 2]> {
         let relative_x = pixel[0].checked_sub(self.content_origin_px[0])?;

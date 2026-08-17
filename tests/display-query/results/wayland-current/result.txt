@@ -1,0 +1,5 @@
+schema_version=1
+direct_protocol=pass
+tmux_protocol=pass
+tmux_version=tmux 3.4
+result=passed

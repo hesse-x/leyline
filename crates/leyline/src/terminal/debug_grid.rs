@@ -10,13 +10,15 @@ pub fn format_debug_grid(snapshot: &FrameSnapshot) -> String {
     let mut output = String::with_capacity(snapshot.cells.len().saturating_add(256));
     let _ = writeln!(
         output,
-        "generation={} grid={}x{} cursor={},{} visible={} offset={}/{} alt={} paste={} focus={} mouse={:?}/{:?}",
+        "generation={} grid={}x{} cursor={},{} visible={} shape={:?} blink={:?} offset={}/{} alt={} paste={} focus={} mouse={:?}/{:?}",
         snapshot.generation,
         snapshot.grid.columns,
         snapshot.grid.lines,
         snapshot.cursor.column,
         snapshot.cursor.line,
         snapshot.cursor.visible,
+        snapshot.cursor.shape,
+        snapshot.cursor.blink,
         snapshot.display_offset,
         snapshot.history_size,
         snapshot.modes.alternate_screen,
@@ -67,11 +69,12 @@ pub fn format_debug_grid(snapshot: &FrameSnapshot) -> String {
         let flags = cell.flags;
         let _ = writeln!(
             output,
-            " flags={}{}{}{}{}{}{} combining={} hyperlink={}",
+            " style={:?} flags={}{}{}{}{}{}{} combining={} hyperlink={}",
+            cell.underline_style,
             flag(flags.bold, 'b'),
             flag(flags.dim, 'd'),
             flag(flags.italic, 'i'),
-            flag(flags.underline, 'u'),
+            flag(cell.underline_style != super::UnderlineStyle::None, 'u'),
             flag(flags.inverse, 'v'),
             flag(flags.hidden, 'h'),
             flag(flags.strikeout, 's'),
@@ -96,6 +99,7 @@ fn is_default_cell(cell: &SnapshotCell) -> bool {
         && cell.foreground == TerminalColor::Named(256)
         && cell.background == TerminalColor::Named(257)
         && cell.underline_color.is_none()
+        && cell.underline_style == super::UnderlineStyle::None
         && cell.flags == super::CellFlags::default()
         && cell.width == CellWidth::Narrow
         && cell.hyperlink.is_none()
@@ -146,7 +150,7 @@ mod tests {
         let text = format_debug_grid(&core.snapshot().unwrap());
         assert!(text.contains("paste=true focus=true mouse=Normal/Sgr"));
         assert!(text.contains(
-            "cell=0,0 ch=U+0041 width=Narrow fg=indexed:196 bg=indexed:17 ul=none flags=b-iu--s"
+            "cell=0,0 ch=U+0041 width=Narrow fg=indexed:196 bg=indexed:17 ul=none style=Single flags=b-iu--s"
         ));
         assert!(text.contains("cell=1,0 ch=U+0065 width=Narrow"));
         assert!(text.contains("combining=1"));

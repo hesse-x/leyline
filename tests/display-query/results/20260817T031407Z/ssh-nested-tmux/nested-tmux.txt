@@ -1,0 +1,9 @@
+schema_version=1
+term=tmux-256color
+colorterm=truecolor
+tty=yes
+profile=tmux
+grid=78x19
+primary_da=1b5b3f313b323b3463
+display_fixture=emitted
+result=passed

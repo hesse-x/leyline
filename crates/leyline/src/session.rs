@@ -15,8 +15,8 @@ use crate::{
     config::EffectiveConfig,
     security::{AuditLogDecision, MetadataRateLimiter},
     terminal::{
-        FrameSnapshot, GridSize, ParseAuditDelta, TerminalAction, TerminalCoreAdapter,
-        TerminalError,
+        CursorShape, FrameSnapshot, GridSize, ParseAuditDelta, TerminalAction, TerminalCoreAdapter,
+        TerminalCoreConfig, TerminalError, TerminalQuery,
         cwd::{CwdReport, CwdTracker},
     },
 };
@@ -55,6 +55,12 @@ pub enum QueueClass {
     ParserReply,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionReplyRequest {
+    Bytes(Vec<u8>),
+    Query(TerminalQuery),
+}
+
 const fn queue_class_limit(class: QueueClass) -> usize {
     match class {
         QueueClass::Interactive => leyline_pty::MAX_OUTSTANDING_WRITE_BYTES,
@@ -83,6 +89,8 @@ pub struct TerminalSession {
     latest_snapshot: Option<FrameSnapshot>,
     pending_title: Option<SessionTitleDelta>,
     pending_bell: bool,
+    pending_replies: VecDeque<SessionReplyRequest>,
+    reply_budget_remaining: usize,
     pending_input: VecDeque<InputTransaction>,
     pending_input_bytes: usize,
     shutdown_deadline: Option<Instant>,
@@ -151,7 +159,17 @@ impl TerminalSession {
         };
         let process = PtyProcess::spawn(spec, sinks)?;
         Ok(Self {
-            core: TerminalCoreAdapter::new(initial_size, config.scrolling.history_lines as usize)?,
+            core: TerminalCoreAdapter::new(
+                initial_size,
+                TerminalCoreConfig {
+                    history_lines: config.scrolling.history_lines as usize,
+                    default_cursor_shape: match config.cursor.style {
+                        crate::config::CursorStyle::Block => CursorShape::Block,
+                        crate::config::CursorStyle::Beam => CursorShape::Beam,
+                        crate::config::CursorStyle::Underline => CursorShape::Underline,
+                    },
+                },
+            )?,
             cwd_tracker: CwdTracker::default(),
             process: Some(process),
             state: SessionState::Running,
@@ -162,6 +180,8 @@ impl TerminalSession {
             latest_snapshot: None,
             pending_title: None,
             pending_bell: false,
+            pending_replies: VecDeque::new(),
+            reply_budget_remaining: crate::security::MAX_PTY_REPLY_BYTES,
             pending_input: VecDeque::new(),
             pending_input_bytes: 0,
             shutdown_deadline: None,
@@ -178,30 +198,15 @@ impl TerminalSession {
                 }
                 self.cwd_tracker.advance(batch.as_slice());
                 let delta = self.core.advance(batch.as_slice())?;
-                self.security_audit.unknown_sequences = self
-                    .security_audit
-                    .unknown_sequences
-                    .saturating_add(delta.audit.unknown_sequences);
-                self.security_audit.rejected_actions = self
-                    .security_audit
-                    .rejected_actions
-                    .saturating_add(delta.audit.rejected_actions);
-                self.security_audit.truncated_sequences = self
-                    .security_audit
-                    .truncated_sequences
-                    .saturating_add(delta.audit.truncated_sequences);
-                self.security_audit.reply_bytes = self
-                    .security_audit
-                    .reply_bytes
-                    .saturating_add(delta.audit.reply_bytes);
+                self.accumulate_audit(delta.audit);
                 if delta.audit.unknown_sequences != 0
                     || delta.audit.rejected_actions != 0
                     || delta.audit.truncated_sequences != 0
                 {
                     self.log_security_audit(delta.audit);
                 }
-                self.dirty = true;
-                self.flush_actions()?;
+                self.dirty |= delta.dirty;
+                self.flush_actions();
             }
             PtyEvent::Exited(exit) => {
                 if self.exited.replace(exit).is_some() {
@@ -251,6 +256,74 @@ impl TerminalSession {
     pub fn finish_io_round(&mut self) -> Result<(), SessionError> {
         self.flush_input(64 * 1024)?;
         Ok(())
+    }
+
+    pub fn take_reply_requests(&mut self) -> Vec<SessionReplyRequest> {
+        self.pending_replies.drain(..).collect()
+    }
+
+    pub fn answer_reply(&mut self, reply: Vec<u8>, is_query: bool) -> Result<bool, SessionError> {
+        const MAX_QUERY_REPLY_BYTES: usize = 128;
+        if (is_query && reply.len() > MAX_QUERY_REPLY_BYTES)
+            || reply.len() > self.reply_budget_remaining
+        {
+            self.note_reply_rejected(is_query);
+            return Ok(false);
+        }
+        let length = reply.len();
+        match self.queue_transaction(QueueClass::ParserReply, reply) {
+            Ok(()) => {
+                self.reply_budget_remaining -= length;
+                if is_query {
+                    self.security_audit.reply_bytes =
+                        self.security_audit.reply_bytes.saturating_add(length);
+                    self.security_audit.query_replies =
+                        self.security_audit.query_replies.saturating_add(1);
+                }
+                Ok(true)
+            }
+            Err(SessionError::InputCapacityExceeded) => {
+                self.note_reply_rejected(is_query);
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn reset_reply_budget(&mut self) {
+        self.reply_budget_remaining = crate::security::MAX_PTY_REPLY_BYTES;
+    }
+
+    #[must_use]
+    pub fn pending_sync(&self) -> Option<crate::terminal::PendingSync> {
+        self.core.pending_sync()
+    }
+
+    #[must_use]
+    pub const fn grid(&self) -> GridSize {
+        self.core.size()
+    }
+
+    pub fn reject_query_reply(&mut self) {
+        self.note_reply_rejected(true);
+    }
+
+    pub fn flush_synchronized_update(
+        &mut self,
+        epoch: u64,
+        reason: crate::terminal::SyncFlushReason,
+    ) -> Result<(), SessionError> {
+        let delta = self.core.flush_synchronized_update(epoch, reason)?;
+        self.dirty |= delta.dirty;
+        self.accumulate_audit(delta.audit);
+        self.flush_actions();
+        Ok(())
+    }
+
+    pub fn discard_synchronized_update(&mut self) {
+        if let Some(pending) = self.core.pending_sync() {
+            self.core.discard_synchronized_update(pending.epoch);
+        }
     }
 
     pub fn snapshot_if_dirty(&mut self) -> Result<Option<FrameSnapshot>, SessionError> {
@@ -428,6 +501,55 @@ impl TerminalSession {
             );
         }
     }
+
+    fn accumulate_audit(&mut self, delta: ParseAuditDelta) {
+        self.security_audit.unknown_sequences = self
+            .security_audit
+            .unknown_sequences
+            .saturating_add(delta.unknown_sequences);
+        self.security_audit.rejected_actions = self
+            .security_audit
+            .rejected_actions
+            .saturating_add(delta.rejected_actions);
+        self.security_audit.truncated_sequences = self
+            .security_audit
+            .truncated_sequences
+            .saturating_add(delta.truncated_sequences);
+        self.security_audit.reply_bytes = self
+            .security_audit
+            .reply_bytes
+            .saturating_add(delta.reply_bytes);
+        self.security_audit.sync_forced_commits = self
+            .security_audit
+            .sync_forced_commits
+            .saturating_add(delta.sync_forced_commits);
+        self.security_audit.sync_timeouts = self
+            .security_audit
+            .sync_timeouts
+            .saturating_add(delta.sync_timeouts);
+        self.security_audit.query_replies = self
+            .security_audit
+            .query_replies
+            .saturating_add(delta.query_replies);
+        self.security_audit.query_rejected = self
+            .security_audit
+            .query_rejected
+            .saturating_add(delta.query_rejected);
+        self.security_audit.display_state_fallbacks = self
+            .security_audit
+            .display_state_fallbacks
+            .saturating_add(delta.display_state_fallbacks);
+    }
+
+    fn note_reply_rejected(&mut self, is_query: bool) {
+        if is_query {
+            self.security_audit.query_rejected =
+                self.security_audit.query_rejected.saturating_add(1);
+        } else {
+            self.security_audit.rejected_actions =
+                self.security_audit.rejected_actions.saturating_add(1);
+        }
+    }
     pub fn take_title(&mut self) -> Option<SessionTitleDelta> {
         self.pending_title.take()
     }
@@ -449,6 +571,8 @@ impl TerminalSession {
         self.state = SessionState::Closing;
         self.pending_input.clear();
         self.pending_input_bytes = 0;
+        self.pending_replies.clear();
+        self.discard_synchronized_update();
         self.shutdown_deadline = Some(Instant::now() + SHUTDOWN_DEADLINE);
         if let Some(process) = &self.process {
             let _ = process.request_shutdown();
@@ -487,23 +611,25 @@ impl TerminalSession {
         Ok(ShutdownPoll::Pending)
     }
 
-    fn flush_actions(&mut self) -> Result<(), SessionError> {
+    fn flush_actions(&mut self) {
         let mut actions = Vec::new();
         self.core.drain_actions(&mut actions);
         for action in actions {
             match action {
-                TerminalAction::WriteToPty(bytes) => {
-                    self.queue_transaction(QueueClass::ParserReply, bytes)?;
-                }
+                TerminalAction::WriteToPty(bytes) => self
+                    .pending_replies
+                    .push_back(SessionReplyRequest::Bytes(bytes)),
                 TerminalAction::SetTitle(title) => {
                     self.pending_title = Some(SessionTitleDelta::Set(title));
                 }
                 TerminalAction::ResetTitle => self.pending_title = Some(SessionTitleDelta::Reset),
                 TerminalAction::Bell => self.pending_bell = true,
+                TerminalAction::Query(query) => self
+                    .pending_replies
+                    .push_back(SessionReplyRequest::Query(query)),
                 TerminalAction::ClipboardRequestRejected | TerminalAction::UnsupportedSequence => {}
             }
         }
-        Ok(())
     }
 
     pub fn queue_input(&mut self, bytes: Vec<u8>) -> Result<(), SessionError> {
@@ -595,9 +721,17 @@ impl TerminalSession {
             process.join().map_err(SessionError::Join)?;
         }
         if self.hold_after_exit {
+            if let Some(pending) = self.core.pending_sync() {
+                self.flush_synchronized_update(
+                    pending.epoch,
+                    crate::terminal::SyncFlushReason::SessionEnd,
+                )?;
+            }
             self.state = SessionState::Held;
             Ok(SessionAction::Held)
         } else {
+            self.pending_replies.clear();
+            self.discard_synchronized_update();
             Ok(SessionAction::Completed)
         }
     }

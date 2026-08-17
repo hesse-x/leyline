@@ -20,8 +20,8 @@ use crate::{
     diagnostics::{ClassifiedError, ErrorCategory},
     frame_composer::{FrameOverlays, compose},
     interaction::{ClickTracker, ImeState, LinkCandidate, ScrollbarController, ScrollbarGeometry},
-    layout::{ContentInsets, GridLayout},
-    session::{SessionAction, ShutdownPoll, TerminalSession},
+    layout::{ContentInsets, GridLayout, TerminalGeometry},
+    session::{SessionAction, SessionReplyRequest, ShutdownPoll, TerminalSession},
     tab::TabManager,
 };
 
@@ -36,6 +36,7 @@ pub struct UiRuntime {
     text: TextSystem,
     tab_text: TextSystem,
     layout: GridLayout,
+    layout_generation: u64,
     text_scale: leyline_gfx::Scale120,
     resize_settle_deadline: Option<Instant>,
     font_size: f64,
@@ -43,6 +44,8 @@ pub struct UiRuntime {
     modifiers: leyline_gfx::ModifiersState,
     terminal_control_gesture: bool,
     keyboard_focused: bool,
+    cursor_blink_visible: bool,
+    cursor_blink_deadline: Option<Instant>,
     selecting: bool,
     selection_point: Option<crate::terminal::SelectionPoint>,
     selection_kind: Option<crate::terminal::SelectionKind>,
@@ -107,6 +110,9 @@ impl UiRuntime {
         let mut completed = Vec::new();
         let fallback_title = launch_title(self.app.launch());
         let local_identity = self.app.launch_context().local_identity.clone();
+        let geometry = self.layout.terminal_geometry(self.layout_generation);
+        let foreground = self.app.config().colors.foreground.0;
+        let background = self.app.config().colors.background.0;
         for id in self.tabs.drain_order() {
             let is_active = Some(id) == self.tabs.active_id();
             let mut incoming = Vec::new();
@@ -151,6 +157,25 @@ impl UiRuntime {
                 }
             }
             let tab = self.tabs.get_mut(id).expect("drain id exists");
+            for request in tab.session.take_reply_requests() {
+                match request {
+                    SessionReplyRequest::Bytes(reply) => {
+                        tab.session.answer_reply(reply, false)?;
+                    }
+                    SessionReplyRequest::Query(query) => {
+                        if tab.session.grid() != geometry.grid {
+                            tab.session.reject_query_reply();
+                        } else if let Some(reply) =
+                            format_terminal_query(query, geometry, foreground, background)
+                        {
+                            tab.session.answer_reply(reply, true)?;
+                        } else {
+                            tab.session.reject_query_reply();
+                        }
+                    }
+                }
+            }
+            tab.session.reset_reply_budget();
             tab.session.finish_io_round()?;
             let cwd_report = tab.session.take_cwd_report();
             if let Some(report) = cwd_report {
@@ -300,6 +325,7 @@ impl UiRuntime {
             text,
             tab_text,
             layout,
+            layout_generation: 1,
             text_scale,
             resize_settle_deadline: None,
             font_size: reset_font_size,
@@ -307,6 +333,8 @@ impl UiRuntime {
             modifiers: leyline_gfx::ModifiersState::default(),
             terminal_control_gesture: false,
             keyboard_focused: false,
+            cursor_blink_visible: true,
+            cursor_blink_deadline: None,
             selecting: false,
             selection_point: None,
             selection_kind: None,
@@ -344,6 +372,7 @@ impl UiRuntime {
         result
     }
 
+    #[allow(clippy::too_many_lines)]
     fn run_loop(&mut self) -> Result<(), UiRuntimeError> {
         loop {
             let mut events = Vec::new();
@@ -384,6 +413,7 @@ impl UiRuntime {
                 }
             }
             self.apply_settled_resize()?;
+            self.flush_expired_sync(Instant::now())?;
             self.drain_sessions()?;
             if self.tabs.is_empty() {
                 self.finish_last_tab_shutdown()?;
@@ -397,6 +427,7 @@ impl UiRuntime {
             if let Some(snapshot) = self.active_session_mut().end_drain_round()? {
                 self.compose_snapshot(&snapshot)?;
             }
+            self.advance_cursor_blink(Instant::now())?;
             self.refresh_active_title()?;
             if self.poll_shutdown()? {
                 break;
@@ -424,6 +455,12 @@ impl UiRuntime {
                 .chain(self.tabs.next_closing_deadline())
                 .min()
                 .map(|deadline| deadline.min(Instant::now() + SHUTDOWN_POLL_INTERVAL));
+            let sync_deadline = self
+                .tabs
+                .tabs()
+                .iter()
+                .filter_map(|tab| tab.session.pending_sync().map(|pending| pending.deadline))
+                .min();
             let timeout = earliest_timeout(
                 earliest_timeout(
                     earliest_timeout(render_timeout, self.drag_scroll.map(|drag| drag.deadline)),
@@ -432,6 +469,8 @@ impl UiRuntime {
                 shutdown_poll,
             );
             let timeout = earliest_timeout(timeout, self.scrollbar.next_deadline());
+            let timeout = earliest_timeout(timeout, sync_deadline);
+            let timeout = earliest_timeout(timeout, self.cursor_blink_deadline);
             if self
                 .tabs
                 .tabs()
@@ -598,7 +637,9 @@ impl UiRuntime {
                 },
                 &layout,
                 &self.app.config().colors,
-                self.app.config().cursor.style,
+                crate::frame_composer::CursorPresentationPolicy {
+                    blink_phase_visible: self.cursor_blink_visible,
+                },
             )?)
         } else {
             None
@@ -617,6 +658,10 @@ impl UiRuntime {
         self.text_scale = scale;
         self.font_size = font_size;
         self.layout = layout;
+        self.layout_generation = self
+            .layout_generation
+            .checked_add(1)
+            .ok_or_else(|| UiRuntimeError::Grid("layout generation overflow".into()))?;
         self.tab_bar = tab_bar;
         self.refresh_text_input_rectangle()?;
         if let Some(scene) = scene {
@@ -649,6 +694,10 @@ impl UiRuntime {
             }
         }
         self.layout = layout;
+        self.layout_generation = self
+            .layout_generation
+            .checked_add(1)
+            .ok_or_else(|| UiRuntimeError::Grid("layout generation overflow".into()))?;
         self.refresh_text_input_rectangle()?;
         if grid_changed {
             Ok(())
@@ -666,6 +715,51 @@ impl UiRuntime {
         }
         self.resize_settle_deadline = None;
         self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), self.font_size)
+    }
+
+    fn flush_expired_sync(&mut self, now: Instant) -> Result<(), UiRuntimeError> {
+        for tab in self.tabs.tabs_mut() {
+            if let Some(pending) = tab.session.pending_sync()
+                && now >= pending.deadline
+            {
+                tab.session.flush_synchronized_update(
+                    pending.epoch,
+                    crate::terminal::SyncFlushReason::Timeout,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn advance_cursor_blink(&mut self, now: Instant) -> Result<(), UiRuntimeError> {
+        let blinking = self.keyboard_focused
+            && self
+                .active_session()
+                .latest_snapshot()
+                .is_some_and(|snapshot| {
+                    snapshot.cursor.visible
+                        && snapshot.cursor.blink == crate::terminal::CursorBlink::Blinking
+                });
+        if !blinking {
+            let changed = !self.cursor_blink_visible;
+            self.cursor_blink_visible = true;
+            self.cursor_blink_deadline = None;
+            if changed {
+                self.compose_latest()?;
+            }
+            return Ok(());
+        }
+        let Some(deadline) = self.cursor_blink_deadline else {
+            self.cursor_blink_visible = true;
+            self.cursor_blink_deadline = Some(now + Duration::from_millis(500));
+            return Ok(());
+        };
+        if now >= deadline {
+            self.cursor_blink_visible = !self.cursor_blink_visible;
+            self.cursor_blink_deadline = Some(now + Duration::from_millis(500));
+            self.compose_latest()?;
+        }
+        Ok(())
     }
 
     fn handle_app_event(
@@ -925,7 +1019,9 @@ impl UiRuntime {
             },
             &self.layout,
             &self.app.config().colors,
-            self.app.config().cursor.style,
+            crate::frame_composer::CursorPresentationPolicy {
+                blink_phase_visible: self.cursor_blink_visible,
+            },
         )?;
         self.gfx.apply(leyline_gfx::GfxCommand::SetScene(scene))?;
         Ok(())
@@ -2002,8 +2098,8 @@ fn window_title(ordinal: usize, count: usize, title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        accumulate_wheel_steps, ignores_key_repeat, keep_selection_after_release, key_text,
-        select_new_tab_cwd, terminal_modifiers,
+        accumulate_wheel_steps, format_terminal_query, ignores_key_repeat,
+        keep_selection_after_release, key_text, select_new_tab_cwd, terminal_modifiers,
     };
 
     #[test]
@@ -2172,6 +2268,49 @@ mod tests {
         assert!(modifiers.control);
         assert!(modifiers.alt);
     }
+
+    #[test]
+    fn terminal_queries_use_config_colors_and_cell_grid_pixels() {
+        use crate::terminal::{DefaultColorSlot, QueryTerminator, TerminalQuery};
+        let geometry = crate::layout::TerminalGeometry {
+            generation: 7,
+            grid: crate::terminal::GridSize::new(80, 24).unwrap(),
+            cell_px: [
+                std::num::NonZeroU16::new(9).unwrap(),
+                std::num::NonZeroU16::new(18).unwrap(),
+            ],
+        };
+        assert_eq!(
+            format_terminal_query(
+                TerminalQuery::DefaultColor {
+                    slot: DefaultColorSlot::Foreground,
+                    terminator: QueryTerminator::StringTerminator,
+                },
+                geometry,
+                0x1234_56aa,
+                0x0102_03ff,
+            )
+            .unwrap(),
+            b"\x1b]10;rgb:1212/3434/5656\x1b\\"
+        );
+        assert_eq!(
+            format_terminal_query(
+                TerminalQuery::DefaultColor {
+                    slot: DefaultColorSlot::Background,
+                    terminator: QueryTerminator::Bell,
+                },
+                geometry,
+                0,
+                0xaabb_cc01,
+            )
+            .unwrap(),
+            b"\x1b]11;rgb:aaaa/bbbb/cccc\x07"
+        );
+        assert_eq!(
+            format_terminal_query(TerminalQuery::TextAreaPixels, geometry, 0, 0).unwrap(),
+            b"\x1b[4;432;720t"
+        );
+    }
 }
 
 fn earliest_timeout(render: Option<Duration>, deadline: Option<Instant>) -> Option<Duration> {
@@ -2182,6 +2321,40 @@ fn earliest_timeout(render: Option<Duration>, deadline: Option<Instant>) -> Opti
         (None, Some(timer)) => Some(timer),
         (None, None) => None,
     }
+}
+
+fn format_terminal_query(
+    query: crate::terminal::TerminalQuery,
+    geometry: TerminalGeometry,
+    foreground: u32,
+    background: u32,
+) -> Option<Vec<u8>> {
+    use crate::terminal::{DefaultColorSlot, QueryTerminator, TerminalQuery};
+
+    let reply = match query {
+        TerminalQuery::DefaultColor { slot, terminator } => {
+            let (code, rgba) = match slot {
+                DefaultColorSlot::Foreground => (10, foreground),
+                DefaultColorSlot::Background => (11, background),
+            };
+            let [red, green, blue, _alpha] = rgba.to_be_bytes();
+            let suffix = match terminator {
+                QueryTerminator::Bell => "\x07",
+                QueryTerminator::StringTerminator => "\x1b\\",
+            };
+            format!(
+                "\x1b]{code};rgb:{red:02x}{red:02x}/{green:02x}{green:02x}/{blue:02x}{blue:02x}{suffix}"
+            )
+        }
+        TerminalQuery::TextAreaPixels => {
+            let width = u32::from(geometry.grid.columns.get())
+                .checked_mul(u32::from(geometry.cell_px[0].get()))?;
+            let height = u32::from(geometry.grid.lines.get())
+                .checked_mul(u32::from(geometry.cell_px[1].get()))?;
+            format!("\x1b[4;{height};{width}t")
+        }
+    };
+    reply.is_ascii().then(|| reply.into_bytes())
 }
 
 impl WakeBackend for EventWake {

@@ -1,0 +1,8 @@
+case_id=DQ-SSH-NESTED-TMUX-20260817T031219Z-345829
+captured_at=2026-08-17T03:12:19Z
+target=hesse@127.0.0.1
+address=127.0.0.1
+topology=nested-tmux
+binary_sha256=c2652d96421d7921299382c5af1eeacf1240686970339af636844522fe2f3dec
+result_sha256=57fcfb231ba2738f1dfd38b7a056021041b1d49819132b1bbc892831d61c6b9e
+loopback_ssh_display_query_result=passed

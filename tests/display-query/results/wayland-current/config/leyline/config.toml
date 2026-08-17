@@ -1,0 +1,5 @@
+[colors]
+foreground = "#123456"
+background = "#0a1b2ccc"
+[behavior]
+hold_after_exit = false

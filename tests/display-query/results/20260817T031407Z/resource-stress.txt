@@ -1,0 +1,9 @@
+schema_version=1
+scope=repeatable_sync_limit_regression
+requested_seconds=2
+elapsed_seconds=2
+iterations=16
+sync_buffer_limit_bytes=2097152
+retained_capacity_limit_bytes=65536
+resource_stress_result=passed
+measurement_note=This gate exercises asserted internal limits; use the 30-minute manual checklist for live-process RSS and FD plateaus.

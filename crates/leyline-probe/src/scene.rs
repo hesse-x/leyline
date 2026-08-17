@@ -1,15 +1,15 @@
 use std::{fs, path::Path};
 
 use leyline::terminal::{
-    ButtonState, CellWidth, GridSize, Modifiers, MouseButton, MouseEncoding, MouseProtocol,
-    TerminalColor, TerminalCoreAdapter, encode_focus, encode_mouse, format_debug_grid,
-    paste_transaction,
+    ButtonState, CellWidth, CursorBlink, CursorShape, GridSize, Modifiers, MouseButton,
+    MouseEncoding, MouseProtocol, TerminalColor, TerminalCoreAdapter, UnderlineStyle, encode_focus,
+    encode_mouse, format_debug_grid, paste_transaction,
 };
 
 use crate::report::{ProbeError, ProbeResult, Reporter};
 
 const MAX_FIXTURE_BYTES: usize = 1024 * 1024;
-const BUILTIN_FIXTURE: &[u8] = b"\x1b[2J\x1b[Hpane-1 | pane-2\r\n\x1b[1;38;5;196;48;5;17mstatus\x1b[0m e\xcc\x81 \xe4\xb8\xad\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b]0;tmux scene\x07\x1b]52;c;Zm9v\x07";
+const BUILTIN_FIXTURE: &[u8] = b"\x1b[2J\x1b[Hpane-1 | pane-2\r\n\x1b[1;38;5;196;48;5;17mstatus\x1b[0m e\xcc\x81 \xe4\xb8\xad\r\n\x1b[4m1\x1b[4:2m2\x1b[4:3m3\x1b[4:4m4\x1b[4:5m5\x1b[24m0\x1b[5 q\x1b[?1000h\x1b[?1006h\x1b[?1004h\x1b[?2004h\x1b]0;tmux scene\x07\x1b]52;c;Zm9v\x07";
 
 pub fn run(reporter: &mut Reporter, fixture: Option<&Path>) -> ProbeResult<()> {
     let bytes = read_fixture(fixture)?;
@@ -28,6 +28,7 @@ pub fn run(reporter: &mut Reporter, fixture: Option<&Path>) -> ProbeResult<()> {
         .map_err(|error| ProbeError::internal("scene.snapshot", error.to_string()))?;
 
     validate_cells(&snapshot)?;
+    validate_display_protocol(&snapshot)?;
     validate_interactions(snapshot.modes)?;
     if snapshot.title.as_deref() != Some("tmux scene") {
         return Err(ProbeError::internal(
@@ -46,7 +47,7 @@ pub fn run(reporter: &mut Reporter, fixture: Option<&Path>) -> ProbeResult<()> {
         "scene",
         "snapshot",
         format!(
-            "{} bytes; pane/status text, 256-color attributes, Unicode widths, and P0 interactions preserved",
+            "{} bytes; pane/status text, cursor, underline, colors, Unicode widths, and P0 interactions preserved",
             bytes.len()
         ),
     );
@@ -55,6 +56,42 @@ pub fn run(reporter: &mut Reporter, fixture: Option<&Path>) -> ProbeResult<()> {
         "security-boundary",
         "OSC 52 rejected without including its payload in the diagnostic",
     );
+    Ok(())
+}
+
+fn validate_display_protocol(snapshot: &leyline::terminal::FrameSnapshot) -> ProbeResult<()> {
+    if snapshot.cursor.shape != CursorShape::Beam || snapshot.cursor.blink != CursorBlink::Blinking
+    {
+        return Err(ProbeError::internal(
+            "scene.cursor",
+            format!(
+                "DECSCUSR cursor state was not preserved: {:?}",
+                snapshot.cursor
+            ),
+        ));
+    }
+    let styles = snapshot
+        .cells
+        .iter()
+        .filter_map(|cell| match cell.ch {
+            '1' | '2' | '3' | '4' | '5' | '0' => Some((cell.ch, cell.underline_style)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let expected = [
+        ('1', UnderlineStyle::Single),
+        ('2', UnderlineStyle::Double),
+        ('3', UnderlineStyle::Curly),
+        ('4', UnderlineStyle::Dotted),
+        ('5', UnderlineStyle::Dashed),
+        ('0', UnderlineStyle::None),
+    ];
+    if !expected.iter().all(|expected| styles.contains(expected)) {
+        return Err(ProbeError::internal(
+            "scene.underline",
+            format!("underline styles differ: {styles:?}"),
+        ));
+    }
     Ok(())
 }
 

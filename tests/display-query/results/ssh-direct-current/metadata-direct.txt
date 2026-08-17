@@ -1,0 +1,8 @@
+case_id=DQ-SSH-DIRECT-20260817T031210Z-345256
+captured_at=2026-08-17T03:12:10Z
+target=hesse@127.0.0.1
+address=127.0.0.1
+topology=direct
+binary_sha256=c2652d96421d7921299382c5af1eeacf1240686970339af636844522fe2f3dec
+result_sha256=c94289028247895be1901c1107e4e79e858246167b03ee83615359f649ff7d68
+loopback_ssh_display_query_result=passed

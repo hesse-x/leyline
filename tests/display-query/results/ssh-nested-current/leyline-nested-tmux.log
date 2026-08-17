@@ -1,0 +1,14 @@
+2026-08-17T03:12:19.573900Z DEBUG leyline::app: category="application" module="app" lifecycle="running"
+2026-08-17T03:12:19.640897Z DEBUG leyline_gfx::decor: libdecor configured content category="platform" width=800 height=500 window_state=0 activation_only=false
+2026-08-17T03:12:19.664123Z  INFO leyline_gfx::vulkan: Vulkan swapchain ready category="renderer" width=800 height=500 images=5 present=1
+2026-08-17T03:12:19.672738Z  INFO leyline::ui_runtime: resolved terminal text profile category="text_profile" requested_family=monospace requested_size_pt=13.0 resolved_family=DejaVu Sans Mono resolved_path=/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf face_index=0 scale_120=120 hinting=Slight antialias=Gray cell_width=10 cell_height=22 baseline=17 line_spacing=1.0 atlas_format="R8_UNORM" atlas_filter="nearest"
+2026-08-17T03:12:19.677866Z DEBUG leyline_gfx::wayland: Wayland clipboard data device initialized
+2026-08-17T03:12:19.677900Z DEBUG leyline_gfx::wayland: Wayland primary-selection device initialized
+2026-08-17T03:12:19.679273Z DEBUG leyline_gfx::wayland: Wayland keyboard capability initialized
+2026-08-17T03:12:19.735643Z DEBUG leyline_gfx::wayland: Wayland keyboard keymap initialized
+2026-08-17T03:12:19.738543Z DEBUG leyline_gfx::decor: libdecor configured content category="platform" width=800 height=500 suggested_width=800 suggested_height=500 window_state=1 activation_only=true
+2026-08-17T03:12:19.742278Z DEBUG leyline_gfx::wayland: Wayland keyboard focus entered terminal surface
+2026-08-17T03:12:19.840936Z DEBUG leyline::session: terminal sequence audit event category="rejected_input" operation="terminal_sequence" unknown=1 rejected=0 truncated=0 previously_suppressed=0
+2026-08-17T03:12:19.857930Z  INFO leyline::ui_runtime: tab closing category="tab_close_requested" session_id=1
+2026-08-17T03:12:19.857963Z DEBUG leyline::session: terminal security audit summary category="rejected_input" operation="terminal_sequence_summary" unknown=1 rejected=0 truncated=0 reply_bytes=67
+2026-08-17T03:12:19.857996Z DEBUG leyline::tab: tab shutdown complete category="tab_shutdown_complete" session_id=1

@@ -14,10 +14,27 @@ use crate::{
     config::{ColorsConfig, CursorStyle},
     interaction::{PreeditOverlay, ScrollbarPresentation},
     layout::GridLayout,
-    terminal::{CellWidth, FrameSnapshot, SnapshotCell, TerminalColor},
+    terminal::{
+        CellWidth, CursorBlink, CursorShape, FrameSnapshot, SnapshotCell, TerminalColor,
+        UnderlineStyle,
+    },
 };
 
 pub const MAX_UNIQUE_GLYPHS: usize = MAX_GLYPH_BITMAPS;
+pub const MAX_DECORATION_PRIMITIVES: usize = 262_144;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CursorPresentationPolicy {
+    pub blink_phase_visible: bool,
+}
+
+impl From<CursorStyle> for CursorPresentationPolicy {
+    fn from(_: CursorStyle) -> Self {
+        Self {
+            blink_phase_visible: true,
+        }
+    }
+}
 
 const TAB_BAR_BACKGROUND: u32 = 0x2b2b_2bff;
 const TAB_ACTIVE_BACKGROUND: u32 = 0x3333_33ff;
@@ -71,7 +88,7 @@ pub fn compose(
     overlays: FrameOverlays<'_>,
     layout: &GridLayout,
     colors: &ColorsConfig,
-    cursor_style: CursorStyle,
+    cursor_policy: impl Into<CursorPresentationPolicy>,
 ) -> Result<SceneData, ComposeError> {
     text.begin_scene();
     tab_text.begin_scene();
@@ -82,7 +99,7 @@ pub fn compose(
         overlays,
         layout,
         colors,
-        cursor_style,
+        cursor_policy.into(),
     );
     text.end_scene();
     tab_text.end_scene();
@@ -102,7 +119,7 @@ fn compose_active_scene(
     overlays: FrameOverlays<'_>,
     layout: &GridLayout,
     colors: &ColorsConfig,
-    cursor_style: CursorStyle,
+    cursor_policy: CursorPresentationPolicy,
 ) -> Result<SceneData, ComposeError> {
     if snapshot.grid != layout.grid
         || snapshot.cells.len() != snapshot.grid.columns() * snapshot.grid.lines()
@@ -137,6 +154,14 @@ fn compose_active_scene(
     let mut rectangles = Vec::new();
     let mut glyphs = Vec::new();
     let metrics = layout.cell_metrics;
+    let cursor_style = match snapshot.cursor.shape {
+        CursorShape::Block => CursorStyle::Block,
+        CursorShape::Beam => CursorStyle::Beam,
+        CursorShape::Underline => CursorStyle::Underline,
+    };
+    let cursor_visible = snapshot.cursor.visible
+        && (snapshot.cursor.blink == CursorBlink::Steady || cursor_policy.blink_phase_visible);
+    let mut decoration_primitives = 0_usize;
     if let Some(confirmation) = overlays.paste_confirmation {
         compose_paste_confirmation(
             confirmation,
@@ -198,7 +223,7 @@ fn compose_active_scene(
                 foreground,
                 background,
                 cursor_style,
-                snapshot.cursor.visible
+                cursor_visible
                     && usize::from(snapshot.cursor.column) == column
                     && usize::from(snapshot.cursor.line) == line,
             );
@@ -249,25 +274,27 @@ fn compose_active_scene(
                     pen_x = pen_x.saturating_add(glyph.advance_26_6[0]);
                 }
             }
-            let underlined = draws_underline(cell);
+            let underline_style = effective_underline_style(cell);
+            let underlined = underline_style != UnderlineStyle::None;
             if underlined || cell.flags.strikeout {
                 let origin = cell_origin(layout, column, line);
                 let span = if cell.width == CellWidth::Wide { 2 } else { 1 };
                 if underlined {
-                    let underline = if cell.flags.underline {
+                    let underline = if cell.underline_style == UnderlineStyle::None {
+                        foreground
+                    } else {
                         cell.underline_color
                             .map_or(foreground, |color| resolve_color(color, foreground, colors))
-                    } else {
-                        foreground
                     };
-                    rectangles.push(line_rectangle(
+                    push_underline_primitives(
+                        &mut rectangles,
+                        &mut decoration_primitives,
+                        underline_style,
                         origin,
                         layout,
                         span,
-                        metrics.underline_y_px,
-                        metrics.underline_thickness_px.get(),
                         underline,
-                    ));
+                    );
                 }
                 if cell.flags.strikeout {
                     rectangles.push(line_rectangle(
@@ -291,7 +318,7 @@ fn compose_active_scene(
             ));
         }
     }
-    if snapshot.cursor.visible
+    if cursor_visible
         && usize::from(snapshot.cursor.column) < snapshot.grid.columns()
         && usize::from(snapshot.cursor.line) < snapshot.grid.lines()
     {
@@ -897,8 +924,117 @@ fn point_in_range(point: [u16; 2], range: CellRange) -> bool {
     point >= start.min(end) && point <= start.max(end)
 }
 
-fn draws_underline(cell: &SnapshotCell) -> bool {
-    cell.width != CellWidth::Spacer && (cell.flags.underline || cell.hyperlink.is_some())
+fn effective_underline_style(cell: &SnapshotCell) -> UnderlineStyle {
+    if cell.width == CellWidth::Spacer {
+        UnderlineStyle::None
+    } else if cell.underline_style != UnderlineStyle::None {
+        cell.underline_style
+    } else if cell.hyperlink.is_some() {
+        UnderlineStyle::Single
+    } else {
+        UnderlineStyle::None
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn push_underline_primitives(
+    rectangles: &mut Vec<RectangleInstance>,
+    count: &mut usize,
+    mut style: UnderlineStyle,
+    origin: [u32; 2],
+    layout: &GridLayout,
+    span: u32,
+    color: u32,
+) {
+    let metrics = layout.cell_metrics;
+    let width = u32::from(layout.cell_px[0].get()).saturating_mul(span);
+    let height = u32::from(layout.cell_px[1].get());
+    let thickness = u32::from(metrics.underline_thickness_px.get()).max(1);
+    let y = u32::try_from(metrics.underline_y_px.max(0))
+        .unwrap_or(0)
+        .min(height - 1);
+    if *count >= MAX_DECORATION_PRIMITIVES {
+        style = UnderlineStyle::Single;
+    }
+    let mut push = |x: u32, y: u32, width: u32, height: u32| {
+        if *count < MAX_DECORATION_PRIMITIVES && width != 0 && height != 0 {
+            rectangles.push(RectangleInstance {
+                origin_px: [x as f32, y as f32],
+                size_px: [width as f32, height as f32],
+                color: LinearColor::from_srgba8(color),
+            });
+            *count += 1;
+        }
+    };
+    match style {
+        UnderlineStyle::None => {}
+        UnderlineStyle::Double if y >= thickness.saturating_mul(2) => {
+            push(origin[0], origin[1] + y - thickness * 2, width, thickness);
+            push(origin[0], origin[1] + y, width, thickness.min(height - y));
+        }
+        UnderlineStyle::Curly if width >= 4 && height >= 3 => {
+            let amplitude = thickness.max(1).min((height - 1) / 2).max(1);
+            for x in 0..width {
+                let phase = (origin[0] + x) % (amplitude * 4);
+                let offset = if phase < amplitude {
+                    i64::from(phase)
+                } else if phase < amplitude * 3 {
+                    i64::from(amplitude * 2) - i64::from(phase)
+                } else {
+                    i64::from(phase) - i64::from(amplitude * 4)
+                };
+                let wave_y = i64::from(y) + offset;
+                let wave_y = u32::try_from(wave_y.clamp(0, i64::from(height - 1))).unwrap_or(0);
+                push(
+                    origin[0] + x,
+                    origin[1] + wave_y,
+                    1,
+                    thickness.min(height - wave_y),
+                );
+            }
+        }
+        UnderlineStyle::Single | UnderlineStyle::Double | UnderlineStyle::Curly => {
+            push(origin[0], origin[1] + y, width, thickness.min(height - y));
+        }
+        UnderlineStyle::Dotted => {
+            let dot = thickness.max(1);
+            let step = dot.saturating_mul(2);
+            let mut x = 0;
+            while x < width {
+                push(
+                    origin[0] + x,
+                    origin[1] + y,
+                    dot.min(width - x),
+                    dot.min(height - y),
+                );
+                x = x.saturating_add(step);
+            }
+        }
+        UnderlineStyle::Dashed => {
+            let dash = thickness.saturating_mul(3).max(1);
+            let gap = thickness.saturating_mul(2).max(1);
+            let period = dash + gap;
+            let phase = origin[0] % period;
+            let mut x = period - phase;
+            if phase < dash {
+                push(
+                    origin[0],
+                    origin[1] + y,
+                    (dash - phase).min(width),
+                    thickness.min(height - y),
+                );
+            }
+            while x < width {
+                push(
+                    origin[0] + x,
+                    origin[1] + y,
+                    dash.min(width - x),
+                    thickness.min(height - y),
+                );
+                x = x.saturating_add(period);
+            }
+        }
+    }
 }
 
 fn resolve_cell_colors(
@@ -1036,9 +1172,12 @@ pub enum ComposeError {
 
 #[cfg(test)]
 mod tests {
-    use super::{cursor_glyph_color, dim, draws_underline, resolve_color, validate_glyph_budget};
+    use super::{
+        cursor_glyph_color, dim, effective_underline_style, push_underline_primitives,
+        resolve_color, validate_glyph_budget,
+    };
     use crate::config::CursorStyle;
-    use crate::terminal::{CellFlags, CellWidth, SnapshotCell, TerminalColor};
+    use crate::terminal::{CellFlags, CellWidth, SnapshotCell, TerminalColor, UnderlineStyle};
     use leyline_text::{MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS, MAX_PREPARED_GLYPHS};
 
     #[test]
@@ -1111,16 +1250,68 @@ mod tests {
             foreground: TerminalColor::Named(256),
             background: TerminalColor::Named(257),
             underline_color: None,
+            underline_style: UnderlineStyle::None,
             flags: CellFlags::default(),
             width: CellWidth::Narrow,
             hyperlink: None,
         };
-        assert!(!draws_underline(&cell));
+        assert_eq!(effective_underline_style(&cell), UnderlineStyle::None);
 
         cell.hyperlink = Some(0);
-        assert!(draws_underline(&cell));
+        assert_eq!(effective_underline_style(&cell), UnderlineStyle::Single);
 
         cell.width = CellWidth::Spacer;
-        assert!(!draws_underline(&cell));
+        assert_eq!(effective_underline_style(&cell), UnderlineStyle::None);
+    }
+
+    #[test]
+    fn underline_styles_produce_bounded_physical_primitives() {
+        let metrics = leyline_text::CellMetrics {
+            width_px: std::num::NonZeroU16::new(9).unwrap(),
+            height_px: std::num::NonZeroU16::new(18).unwrap(),
+            baseline_px: 14,
+            underline_y_px: 15,
+            underline_thickness_px: std::num::NonZeroU16::new(1).unwrap(),
+            strike_y_px: 9,
+            strike_thickness_px: std::num::NonZeroU16::new(1).unwrap(),
+        };
+        let layout = crate::layout::GridLayout::calculate(
+            leyline_gfx::LogicalSize {
+                width: 90,
+                height: 36,
+            },
+            leyline_gfx::Scale120::ONE,
+            [0, 0],
+            metrics,
+            1,
+        )
+        .unwrap();
+        for (style, minimum) in [
+            (UnderlineStyle::Single, 1),
+            (UnderlineStyle::Double, 2),
+            (UnderlineStyle::Curly, 4),
+            (UnderlineStyle::Dotted, 2),
+            (UnderlineStyle::Dashed, 1),
+        ] {
+            let mut rectangles = Vec::new();
+            let mut count = 0;
+            push_underline_primitives(
+                &mut rectangles,
+                &mut count,
+                style,
+                [9, 0],
+                &layout,
+                2,
+                0xffff_ffff,
+            );
+            assert!(rectangles.len() >= minimum, "{style:?}");
+            assert_eq!(rectangles.len(), count);
+            assert!(rectangles.iter().all(|rectangle| {
+                rectangle.origin_px[0] >= 9.0
+                    && rectangle.origin_px[1] >= 0.0
+                    && rectangle.origin_px[0] + rectangle.size_px[0] <= 27.0
+                    && rectangle.origin_px[1] + rectangle.size_px[1] <= 18.0
+            }));
+        }
     }
 }

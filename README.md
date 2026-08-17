@@ -33,6 +33,11 @@ non-login shell. `-e` preserves program arguments exactly and does not invoke a 
 inherit the startup environment and working directory with `TERM=xterm-256color` and
 `COLORTERM=truecolor`. Use `-v`, `-vv`, or `-vvv` for progressively more detailed stderr logging.
 
+The accepted future TERM/terminfo design is documented in
+`doc/term-terminfo-tmux-truecolor.md`. It will replace the current identity only when the standalone
+terminfo, CLI, packaging, remote diagnostics, and unified validation gate land together; the design
+document does not change the behavior of the current binary.
+
 The stage 0 hardware and integration probes remain available:
 
 ```sh

@@ -60,6 +60,7 @@ pub struct SnapshotCell {
     pub foreground: TerminalColor,
     pub background: TerminalColor,
     pub underline_color: Option<TerminalColor>,
+    pub underline_style: UnderlineStyle,
     pub flags: CellFlags,
     pub width: CellWidth,
     pub hyperlink: Option<u16>,
@@ -78,7 +79,6 @@ pub struct CellFlags {
     pub bold: bool,
     pub dim: bool,
     pub italic: bool,
-    pub underline: bool,
     pub inverse: bool,
     pub hidden: bool,
     pub strikeout: bool,
@@ -97,6 +97,34 @@ pub struct CursorSnapshot {
     pub column: u16,
     pub line: u16,
     pub visible: bool,
+    pub shape: CursorShape,
+    pub blink: CursorBlink,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CursorShape {
+    #[default]
+    Block,
+    Beam,
+    Underline,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CursorBlink {
+    #[default]
+    Steady,
+    Blinking,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UnderlineStyle {
+    #[default]
+    None,
+    Single,
+    Double,
+    Curly,
+    Dotted,
+    Dashed,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
