@@ -1,4 +1,4 @@
-use std::num::NonZeroU8;
+use std::num::{NonZeroU8, NonZeroU64};
 
 use crate::{
     app::runtime::AppRuntime,
@@ -21,6 +21,16 @@ impl SessionId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct BellGeneration(NonZeroU64);
+
+impl BellGeneration {
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 pub struct TabEntry {
     pub id: SessionId,
     pub session: TerminalSession,
@@ -29,6 +39,9 @@ pub struct TabEntry {
     pub cwd_hint: Option<LocalCwdHint>,
     pub last_cwd_reject: Option<CwdRejectReason>,
     pub unread: bool,
+    pub attention: bool,
+    pub bell_muted: bool,
+    active_bell_generation: Option<BellGeneration>,
 }
 
 pub struct ClosingTab {
@@ -40,6 +53,7 @@ pub struct TabManager {
     closing: Vec<ClosingTab>,
     active_id: Option<SessionId>,
     next_id: u64,
+    next_bell_generation: NonZeroU64,
     drain_cursor: Option<SessionId>,
     max_count: NonZeroU8,
 }
@@ -63,6 +77,7 @@ impl PixelRect {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct TabBarItem {
     pub id: SessionId,
     pub title: String,
@@ -70,6 +85,8 @@ pub struct TabBarItem {
     pub close_rect: Option<PixelRect>,
     pub active: bool,
     pub unread: bool,
+    pub attention: bool,
+    pub bell_muted: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -170,6 +187,8 @@ impl TabBarPresentation {
                     close_rect,
                     active: Some(tab.id) == manager.active_id,
                     unread: tab.unread,
+                    attention: tab.attention,
+                    bell_muted: tab.bell_muted,
                 })
             })
             .collect();
@@ -230,10 +249,14 @@ impl TabManager {
                 cwd_hint: None,
                 last_cwd_reject: None,
                 unread: false,
+                attention: false,
+                bell_muted: false,
+                active_bell_generation: None,
             }],
             closing: Vec::new(),
             active_id: Some(id),
             next_id: 2,
+            next_bell_generation: NonZeroU64::MIN,
             drain_cursor: None,
             max_count,
         }
@@ -263,6 +286,9 @@ impl TabManager {
             cwd_hint: None,
             last_cwd_reject: None,
             unread: false,
+            attention: false,
+            bell_muted: false,
+            active_bell_generation: None,
         });
         self.active_id = Some(id);
         self.assert_invariants();
@@ -353,9 +379,6 @@ impl TabManager {
             return Ok(Activation::Unchanged);
         }
         self.active_id = Some(target);
-        if let Some(tab) = self.active_mut() {
-            tab.unread = false;
-        }
         self.assert_invariants();
         Ok(Activation::Changed { from, to: target })
     }
@@ -420,6 +443,67 @@ impl TabManager {
         self.tabs.iter_mut().find(|tab| tab.id == id)
     }
 
+    pub fn mark_unread(&mut self, id: SessionId) -> bool {
+        let Some(tab) = self.get_mut(id) else {
+            return false;
+        };
+        let changed = !tab.unread;
+        tab.unread = true;
+        changed
+    }
+
+    pub fn record_background_bell(
+        &mut self,
+        id: SessionId,
+        show_attention: bool,
+    ) -> Result<BellGeneration, TabError> {
+        let index = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == id)
+            .ok_or(TabError::UnknownSession(id))?;
+        if let Some(generation) = self.tabs[index].active_bell_generation {
+            if show_attention {
+                self.tabs[index].attention = true;
+            }
+            return Ok(generation);
+        }
+        let generation = BellGeneration(self.next_bell_generation);
+        let next = self
+            .next_bell_generation
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .ok_or(TabError::BellGenerationExhausted)?;
+        self.next_bell_generation = next;
+        let tab = &mut self.tabs[index];
+        tab.active_bell_generation = Some(generation);
+        tab.attention = show_attention;
+        Ok(generation)
+    }
+
+    pub fn acknowledge(&mut self, id: SessionId) -> Option<BellGeneration> {
+        let tab = self.get_mut(id)?;
+        tab.unread = false;
+        tab.attention = false;
+        tab.active_bell_generation.take()
+    }
+
+    pub fn toggle_bell_mute(
+        &mut self,
+        id: SessionId,
+    ) -> Result<(bool, Option<BellGeneration>), TabError> {
+        let tab = self.get_mut(id).ok_or(TabError::UnknownSession(id))?;
+        tab.bell_muted = !tab.bell_muted;
+        let invalidated = if tab.bell_muted {
+            tab.attention = false;
+            tab.active_bell_generation.take()
+        } else {
+            None
+        };
+        Ok((tab.bell_muted, invalidated))
+    }
+
     pub fn apply_cwd_report(
         &mut self,
         id: SessionId,
@@ -461,6 +545,8 @@ pub enum TabError {
     LimitReached { limit: usize },
     #[error("session id space exhausted")]
     SessionIdExhausted,
+    #[error("bell generation space exhausted")]
+    BellGenerationExhausted,
     #[error("unknown session {0:?}")]
     UnknownSession(SessionId),
 }
@@ -629,5 +715,37 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn attention_generation_is_reused_and_mute_preserves_unread() {
+        let (session, runtime) = entry();
+        let mut manager = TabManager::bootstrap(session, runtime, NonZeroU8::new(2).unwrap());
+        let id = manager.active_id().unwrap();
+        assert!(manager.mark_unread(id));
+        let first = manager.record_background_bell(id, true).unwrap();
+        let repeated = manager.record_background_bell(id, true).unwrap();
+        assert_eq!(first, repeated);
+        assert!(manager.tabs()[0].attention);
+        let (muted, invalidated) = manager.toggle_bell_mute(id).unwrap();
+        assert!(muted);
+        assert_eq!(invalidated, Some(first));
+        assert!(manager.tabs()[0].unread);
+        assert!(!manager.tabs()[0].attention);
+        let (muted, invalidated) = manager.toggle_bell_mute(id).unwrap();
+        assert!(!muted);
+        assert_eq!(invalidated, None);
+        assert!(manager.tabs()[0].unread);
+    }
+
+    #[test]
+    fn hidden_attention_episode_is_still_acknowledged() {
+        let (session, runtime) = entry();
+        let mut manager = TabManager::bootstrap(session, runtime, NonZeroU8::new(1).unwrap());
+        let id = manager.active_id().unwrap();
+        let generation = manager.record_background_bell(id, false).unwrap();
+        assert!(!manager.tabs()[0].attention);
+        assert_eq!(manager.acknowledge(id), Some(generation));
+        assert_eq!(manager.acknowledge(id), None);
     }
 }

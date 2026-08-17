@@ -76,6 +76,7 @@ pub struct FrameOverlays<'a> {
     pub paste_confirmation: Option<&'a PasteConfirmationOverlay>,
     pub scrollbar: Option<&'a ScrollbarPresentation>,
     pub tab_bar: Option<&'a crate::tab::TabBarPresentation>,
+    pub visual_bell: Option<&'a crate::bell::VisualBellPresentation>,
 }
 
 /// Converts one validated terminal snapshot into a bounded graphics scene.
@@ -404,6 +405,40 @@ fn compose_active_scene(
             color: LinearColor::from_srgba8(colors.cursor.0),
         });
     }
+    if overlays.visual_bell.is_some_and(|bell| bell.active) {
+        let origin = layout.content_origin_px;
+        let width = u32::from(layout.grid.columns.get()) * u32::from(layout.cell_px[0].get());
+        let height = u32::from(layout.grid.lines.get()) * u32::from(layout.cell_px[1].get());
+        let color = overlays.visual_bell.expect("checked above").color;
+        rectangles.push(RectangleInstance {
+            origin_px: [origin[0] as f32, origin[1] as f32],
+            size_px: [width as f32, height as f32],
+            color: LinearColor::from_srgba8(color),
+        });
+        let border = 2_u32.min(width).min(height);
+        for (x, y, w, h) in [
+            (origin[0], origin[1], width, border),
+            (
+                origin[0],
+                origin[1].saturating_add(height.saturating_sub(border)),
+                width,
+                border,
+            ),
+            (origin[0], origin[1], border, height),
+            (
+                origin[0].saturating_add(width.saturating_sub(border)),
+                origin[1],
+                border,
+                height,
+            ),
+        ] {
+            rectangles.push(RectangleInstance {
+                origin_px: [x as f32, y as f32],
+                size_px: [w as f32, h as f32],
+                color: LinearColor::from_srgba8(TAB_ACCENT),
+            });
+        }
+    }
     if let Some(tab_bar) = overlays.tab_bar {
         if let Some(bar) = tab_bar.bar {
             rectangles.push(RectangleInstance {
@@ -444,7 +479,18 @@ fn compose_active_scene(
                     size_px: [item.rect.width as f32, accent_height as f32],
                     color: LinearColor::from_srgba8(TAB_ACCENT),
                 });
-            } else if item.unread && item.rect.width >= 20 {
+            }
+            if item.attention && item.rect.width >= 20 {
+                let center = item.rect.y.saturating_add(item.rect.height / 2);
+                rectangles.push(RectangleInstance {
+                    origin_px: [
+                        item.rect.x.saturating_add(7) as f32,
+                        center.saturating_sub(4) as f32,
+                    ],
+                    size_px: [5.0, 8.0],
+                    color: LinearColor::from_srgba8(TAB_ACCENT),
+                });
+            } else if !item.active && item.unread && item.rect.width >= 20 {
                 rectangles.push(RectangleInstance {
                     origin_px: [
                         item.rect.x.saturating_add(8) as f32,
@@ -452,6 +498,22 @@ fn compose_active_scene(
                     ],
                     size_px: [3.0, 3.0],
                     color: LinearColor::from_srgba8(TAB_ACCENT),
+                });
+            }
+            if item.bell_muted && item.rect.width >= 28 {
+                let x = item.close_rect.map_or_else(
+                    || {
+                        item.rect
+                            .x
+                            .saturating_add(item.rect.width.saturating_sub(8))
+                    },
+                    |close| close.x.saturating_sub(6),
+                );
+                let y = item.rect.y.saturating_add(6);
+                rectangles.push(RectangleInstance {
+                    origin_px: [x as f32, y as f32],
+                    size_px: [2.0, item.rect.height.saturating_sub(12) as f32],
+                    color: LinearColor::from_srgba8(TAB_INACTIVE_TEXT),
                 });
             }
             if let Some(shaped) = tab_shaped_cache.get(&(item.title.clone(), FontStyle::Regular)) {
@@ -495,7 +557,7 @@ fn compose_active_scene(
                             clip_px: [title_left, item.rect.y, available_width, item.rect.height],
                             color: LinearColor::from_srgba8(if item.active {
                                 TAB_ACTIVE_TEXT
-                            } else if item.unread {
+                            } else if item.attention || item.unread {
                                 TAB_UNREAD_TEXT
                             } else {
                                 TAB_INACTIVE_TEXT

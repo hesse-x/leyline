@@ -3,8 +3,10 @@ use std::{
     ffi::OsString,
     fs::File,
     io::Read,
+    num::NonZeroU8,
     os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use serde::Deserialize;
@@ -25,6 +27,7 @@ pub struct EffectiveConfig {
     pub behavior: BehaviorConfig,
     pub unicode: UnicodeConfig,
     pub tabs: TabsConfig,
+    pub bell: BellConfig,
     pub keybindings: Vec<KeyBinding>,
 }
 
@@ -43,6 +46,36 @@ pub struct TabsConfig {
     pub max_width: u16,
     pub show_close_button: bool,
     pub new_tab_cwd: NewTabCwdPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct BellConfig {
+    pub enabled: bool,
+    pub visual: bool,
+    pub visual_duration: Duration,
+    pub audible: bool,
+    pub audible_when_unfocused: bool,
+    pub attention: bool,
+    pub desktop_notifications: bool,
+    pub notification_cooldown: Duration,
+    pub notification_burst_per_minute: NonZeroU8,
+}
+
+impl Default for BellConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            visual: true,
+            visual_duration: Duration::from_millis(120),
+            audible: false,
+            audible_when_unfocused: true,
+            attention: true,
+            desktop_notifications: true,
+            notification_cooldown: Duration::from_secs(10),
+            notification_burst_per_minute: NonZeroU8::new(6).expect("non-zero constant"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -191,6 +224,7 @@ pub enum Action {
     PreviousTab,
     NextTab,
     ActivateTab(u8),
+    ToggleBellMute,
 }
 
 impl Default for EffectiveConfig {
@@ -250,6 +284,7 @@ impl Default for EffectiveConfig {
                 show_close_button: true,
                 new_tab_cwd: NewTabCwdPolicy::Inherit,
             },
+            bell: BellConfig::default(),
             keybindings: default_keybindings(),
         }
     }
@@ -522,7 +557,24 @@ struct RawConfig {
     behavior: RawBehavior,
     unicode: RawUnicode,
     tabs: RawTabs,
+    bell: RawBell,
     keybindings: Option<Vec<RawKeyBinding>>,
+    #[serde(flatten)]
+    unknown: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawBell {
+    enabled: Option<bool>,
+    visual: Option<bool>,
+    visual_duration_ms: Option<i64>,
+    audible: Option<bool>,
+    audible_when_unfocused: Option<bool>,
+    attention: Option<bool>,
+    desktop_notifications: Option<bool>,
+    notification_cooldown_seconds: Option<i64>,
+    notification_burst_per_minute: Option<i64>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -662,6 +714,23 @@ impl RawConfig {
                 "hinting",
                 "antialiasing",
                 "line_spacing",
+            ],
+        );
+        collect_unknown(
+            &mut warnings,
+            source,
+            "bell",
+            &self.bell.unknown,
+            &[
+                "enabled",
+                "visual",
+                "visual_duration_ms",
+                "audible",
+                "audible_when_unfocused",
+                "attention",
+                "desktop_notifications",
+                "notification_cooldown_seconds",
+                "notification_burst_per_minute",
             ],
         );
 
@@ -972,6 +1041,59 @@ impl RawConfig {
         if let Some(value) = self.behavior.confirm_multiline_paste {
             result.behavior.confirm_multiline_paste = value;
         }
+        if let Some(value) = self.bell.enabled {
+            result.bell.enabled = value;
+        }
+        if let Some(value) = self.bell.visual {
+            result.bell.visual = value;
+        }
+        if let Some(value) = self.bell.audible {
+            result.bell.audible = value;
+        }
+        if let Some(value) = self.bell.audible_when_unfocused {
+            result.bell.audible_when_unfocused = value;
+        }
+        if let Some(value) = self.bell.attention {
+            result.bell.attention = value;
+        }
+        if let Some(value) = self.bell.desktop_notifications {
+            result.bell.desktop_notifications = value;
+        }
+        if let Some(value) = self.bell.visual_duration_ms {
+            if !(40..=1000).contains(&value) {
+                return semantic(
+                    path,
+                    "bell.visual_duration_ms",
+                    format!("{value} is outside 40..=1000"),
+                );
+            }
+            result.bell.visual_duration = Duration::from_millis(
+                u64::try_from(value).expect("validated non-negative duration"),
+            );
+        }
+        if let Some(value) = self.bell.notification_cooldown_seconds {
+            if !(1..=3600).contains(&value) {
+                return semantic(
+                    path,
+                    "bell.notification_cooldown_seconds",
+                    format!("{value} is outside 1..=3600"),
+                );
+            }
+            result.bell.notification_cooldown =
+                Duration::from_secs(u64::try_from(value).expect("validated non-negative duration"));
+        }
+        if let Some(value) = self.bell.notification_burst_per_minute {
+            if !(1..=30).contains(&value) {
+                return semantic(
+                    path,
+                    "bell.notification_burst_per_minute",
+                    format!("{value} is outside 1..=30"),
+                );
+            }
+            result.bell.notification_burst_per_minute =
+                NonZeroU8::new(u8::try_from(value).expect("validated u8 range"))
+                    .expect("validated non-zero");
+        }
         set_bounded(
             path,
             "tabs.max_count",
@@ -1098,6 +1220,7 @@ const TOP_FIELDS: &[&str] = &[
     "behavior",
     "unicode",
     "tabs",
+    "bell",
     "keybindings",
 ];
 
@@ -1274,6 +1397,7 @@ fn parse_binding(path: &Path, index: usize, raw: RawKeyBinding) -> Result<KeyBin
         "CloseTab" => Action::CloseTab,
         "PreviousTab" => Action::PreviousTab,
         "NextTab" => Action::NextTab,
+        "ToggleBellMute" => Action::ToggleBellMute,
         "ActivateTab1" => Action::ActivateTab(1),
         "ActivateTab2" => Action::ActivateTab(2),
         "ActivateTab3" => Action::ActivateTab(3),
@@ -1585,5 +1709,41 @@ mod tests {
             .unwrap();
         assert_eq!(effective.tabs.new_tab_cwd, NewTabCwdPolicy::Home);
         assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn bell_configuration_is_bounded_and_mute_action_is_bindable() {
+        assert!(EffectiveConfig::default().bell.desktop_notifications);
+        let source = "[bell]\nvisual_duration_ms=1000\nnotification_cooldown_seconds=3600\nnotification_burst_per_minute=30\ndesktop_notifications=true\n[[keybindings]]\nkey='F2'\nmods=[]\naction='ToggleBellMute'\n";
+        let raw: RawConfig = toml::from_str(source).unwrap();
+        let (effective, warnings) = raw
+            .into_effective(Path::new("config.toml"), source)
+            .unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(effective.bell.visual_duration, Duration::from_secs(1));
+        assert_eq!(
+            effective.bell.notification_cooldown,
+            Duration::from_hours(1)
+        );
+        assert_eq!(effective.bell.notification_burst_per_minute.get(), 30);
+        assert!(effective.bell.desktop_notifications);
+        assert!(
+            effective
+                .keybindings
+                .iter()
+                .any(|binding| binding.action == Action::ToggleBellMute)
+        );
+
+        for source in [
+            "[bell]\nvisual_duration_ms=39\n",
+            "[bell]\nnotification_cooldown_seconds=0\n",
+            "[bell]\nnotification_burst_per_minute=31\n",
+        ] {
+            let raw: RawConfig = toml::from_str(source).unwrap();
+            assert!(
+                raw.into_effective(Path::new("config.toml"), source)
+                    .is_err()
+            );
+        }
     }
 }

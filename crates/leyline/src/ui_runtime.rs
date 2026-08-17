@@ -74,6 +74,9 @@ pub struct UiRuntime {
     visual_build: Option<PendingVisualBuild>,
     pending_visual_map: Option<(leyline_gfx::FrameKey, Arc<VisualGridMap>)>,
     published_visual_map: Option<Arc<VisualGridMap>>,
+    visual_bell: crate::bell::VisualBellState,
+    notifications: crate::notification::NotificationWorker,
+    sound: crate::sound::SoundWorker,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,6 +123,7 @@ impl UiRuntime {
         let mut events = 0_usize;
         let mut bytes = 0_usize;
         let mut completed = Vec::new();
+        let mut bell_presentation_changed = false;
         let fallback_title = launch_title(self.app.launch());
         let local_identity = self.app.launch_context().local_identity.clone();
         let geometry = self.layout.terminal_geometry(self.layout_generation);
@@ -145,6 +149,11 @@ impl UiRuntime {
                 let crate::app::event::AppEvent::Pty(pty) = event else {
                     continue;
                 };
+                let output_activity = matches!(
+                    &pty,
+                    crate::app::event::PtyEvent::Output(batch)
+                        if !batch.as_slice().iter().all(|byte| *byte == b'\x07')
+                );
                 let action = match self
                     .tabs
                     .get_mut(id)
@@ -161,8 +170,8 @@ impl UiRuntime {
                         continue;
                     }
                 };
-                if id != self.tabs.active_id().expect("active tab") {
-                    self.tabs.get_mut(id).expect("drain id exists").unread = true;
+                if output_activity && id != self.tabs.active_id().expect("active tab") {
+                    bell_presentation_changed |= self.tabs.mark_unread(id);
                 }
                 if matches!(action, SessionAction::Completed) {
                     completed.push(id);
@@ -215,8 +224,59 @@ impl UiRuntime {
                     crate::session::SessionTitleDelta::Reset => fallback_title.clone(),
                 };
             }
-            if tab.session.take_bell() && !is_active {
-                tab.unread = true;
+            let bell = tab.session.take_bell();
+            if bell {
+                let allowed = !completed.contains(&id) && tab.session.bell_effects_allowed();
+                let muted = tab.bell_muted;
+                let effects = crate::bell::decide(
+                    crate::bell::BellContext {
+                        session_id: id,
+                        active: is_active,
+                        window_focused: self.keyboard_focused,
+                        muted,
+                        session_effects_allowed: allowed,
+                    },
+                    &self.app.config().bell,
+                );
+                let generation = if effects.record_attention_episode {
+                    let was_attention = tab.attention;
+                    let generation = self
+                        .tabs
+                        .record_background_bell(id, effects.show_attention_marker)?;
+                    bell_presentation_changed |= effects.show_attention_marker && !was_attention;
+                    Some(generation)
+                } else {
+                    None
+                };
+                if effects.schedule_visual {
+                    self.visual_bell.schedule(
+                        id,
+                        Instant::now(),
+                        self.app.config().bell.visual_duration,
+                    );
+                    bell_presentation_changed = true;
+                }
+                if effects.enqueue_notification {
+                    let ordinal = self
+                        .tabs
+                        .tabs()
+                        .iter()
+                        .position(|tab| tab.id == id)
+                        .and_then(|index| u8::try_from(index + 1).ok())
+                        .unwrap_or(1);
+                    if let Some(generation) = generation {
+                        let _ = self.notifications.show(
+                            id,
+                            generation,
+                            ordinal,
+                            Instant::now(),
+                            &self.app.config().bell,
+                        );
+                    }
+                }
+                if effects.enqueue_sound {
+                    let _ = self.sound.play(id);
+                }
             }
             if events >= WINDOW_EVENT_BUDGET
                 || bytes >= WINDOW_BYTE_BUDGET
@@ -236,6 +296,9 @@ impl UiRuntime {
             self.close_active_tab(ShutdownReason::ChildExited)?;
         }
         self.tabs.poll_closing(Instant::now())?;
+        if bell_presentation_changed && !self.tabs.is_empty() {
+            self.compose_latest()?;
+        }
         Ok(())
     }
 
@@ -378,6 +441,9 @@ impl UiRuntime {
             visual_build: None,
             pending_visual_map: None,
             published_visual_map: None,
+            visual_bell: crate::bell::VisualBellState::default(),
+            notifications: crate::notification::NotificationWorker::new(),
+            sound: crate::sound::SoundWorker::new(),
         })
     }
 
@@ -418,6 +484,13 @@ impl UiRuntime {
                     }
                     PlatformEvent::KeyboardFocus { focused, .. } => {
                         self.keyboard_focused = focused;
+                        self.visual_bell.cancel();
+                        if focused
+                            && let Some(id) = self.tabs.active_id()
+                            && let Some(generation) = self.tabs.acknowledge(id)
+                        {
+                            self.notifications.acknowledge(id, generation);
+                        }
                         self.active_session_mut().focus_changed(focused)?;
                         if !focused {
                             self.terminal_control_gesture = false;
@@ -429,6 +502,7 @@ impl UiRuntime {
                             self.ime.deactivate();
                             self.ime_rectangle = None;
                         }
+                        self.compose_latest()?;
                     }
                     PlatformEvent::Key(key) => self.handle_key(&key)?,
                     PlatformEvent::ModifiersChanged(modifiers) => self.modifiers_changed(modifiers),
@@ -442,6 +516,7 @@ impl UiRuntime {
             self.apply_settled_resize()?;
             self.flush_expired_sync(Instant::now())?;
             self.drain_sessions()?;
+            self.notifications.retry_controls();
             if self.tabs.is_empty() {
                 self.finish_last_tab_shutdown()?;
                 break;
@@ -449,6 +524,9 @@ impl UiRuntime {
             self.drain_clipboard_results()?;
             self.process_drag_scroll()?;
             if self.scrollbar.expire(Instant::now()) {
+                self.compose_latest()?;
+            }
+            if self.visual_bell.expire(Instant::now()) {
                 self.compose_latest()?;
             }
             if let Some(snapshot) = self.active_session_mut().end_drain_round()? {
@@ -523,6 +601,7 @@ impl UiRuntime {
             let timeout = earliest_timeout(timeout, self.scrollbar.next_deadline());
             let timeout = earliest_timeout(timeout, sync_deadline);
             let timeout = earliest_timeout(timeout, self.cursor_blink_deadline);
+            let timeout = earliest_timeout(timeout, self.visual_bell.deadline());
             let timeout = if self.visual_build.is_some() {
                 Some(Duration::ZERO)
             } else {
@@ -1118,6 +1197,14 @@ impl UiRuntime {
                 paste_confirmation: paste_confirmation.as_ref(),
                 scrollbar: scrollbar.as_ref(),
                 tab_bar: Some(&self.tab_bar),
+                visual_bell: Some(&crate::bell::VisualBellPresentation {
+                    active: self
+                        .tabs
+                        .active_id()
+                        .is_some_and(|id| self.visual_bell.active_for(id, Instant::now())),
+                    color: 0xff5a_3628,
+                    intensity: 1.0,
+                }),
             },
             &self.layout,
             &self.app.config().colors,
@@ -1290,6 +1377,23 @@ impl UiRuntime {
             Action::PreviousTab => self.switch_relative(-1)?,
             Action::NextTab => self.switch_relative(1)?,
             Action::ActivateTab(ordinal) => self.switch_ordinal(ordinal)?,
+            Action::ToggleBellMute => {
+                let id = self.tabs.active_id().expect("active tab");
+                let (muted, invalidated) = self.tabs.toggle_bell_mute(id)?;
+                if muted {
+                    self.visual_bell.cancel();
+                }
+                if let Some(generation) = invalidated {
+                    self.notifications.acknowledge(id, generation);
+                }
+                tracing::info!(
+                    category = "bell_effect",
+                    session_id = id.get(),
+                    muted,
+                    "tab bell mute changed"
+                );
+                self.compose_latest()?;
+            }
         }
         Ok(())
     }
@@ -1390,6 +1494,8 @@ impl UiRuntime {
         self.active_session_mut().finish_io_round()?;
         let closed = self.tabs.close_active();
         if let Some(id) = closed {
+            self.notifications.forget(id);
+            self.sound.forget(id);
             tracing::info!(
                 category = "tab_close_requested",
                 session_id = id.get(),
@@ -1460,6 +1566,7 @@ impl UiRuntime {
         self.visual_build = None;
         self.pending_visual_map = None;
         self.published_visual_map = None;
+        self.visual_bell.cancel();
         if let Some(serial) = self.gfx.disable_text_input()? {
             self.ime.record_commit_serial(serial);
         }
@@ -1473,6 +1580,11 @@ impl UiRuntime {
 
     fn restore_active_interaction(&mut self) -> Result<(), UiRuntimeError> {
         if self.keyboard_focused {
+            if let Some(id) = self.tabs.active_id()
+                && let Some(generation) = self.tabs.acknowledge(id)
+            {
+                self.notifications.acknowledge(id, generation);
+            }
             self.active_session_mut().focus_changed(true)?;
             self.ime.activate();
             self.enable_text_input()?;
@@ -2671,6 +2783,8 @@ pub enum UiRuntimeError {
     #[error(transparent)]
     Session(#[from] crate::session::SessionError),
     #[error(transparent)]
+    Tab(#[from] crate::tab::TabError),
+    #[error(transparent)]
     Runtime(#[from] crate::app::runtime::RuntimeBuildError),
     #[error("cannot calculate terminal grid: {0}")]
     Grid(String),
@@ -2701,6 +2815,7 @@ impl ClassifiedError for UiRuntimeError {
             | Self::App(_)
             | Self::Wake(_)
             | Self::Session(_)
+            | Self::Tab(_)
             | Self::Runtime(_)
             | Self::Grid(_)
             | Self::Text(_)

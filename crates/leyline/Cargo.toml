@@ -9,6 +9,7 @@ rust-version.workspace = true
 leyline-gfx.workspace = true
 leyline-pty.workspace = true
 leyline-text.workspace = true
+leyline-sound.workspace = true
 alacritty_terminal.workspace = true
 clap.workspace = true
 crossbeam-channel.workspace = true
@@ -20,6 +21,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 unicode-bidi.workspace = true
 unicode-segmentation.workspace = true
+zbus = { version = "5.11.0", default-features = false, features = ["async-io", "blocking-api"] }
 
 [dev-dependencies]
 tempfile = "3.21.0"

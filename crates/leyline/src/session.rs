@@ -573,6 +573,10 @@ impl TerminalSession {
     pub fn take_bell(&mut self) -> bool {
         std::mem::take(&mut self.pending_bell)
     }
+    #[must_use]
+    pub fn bell_effects_allowed(&self) -> bool {
+        self.state == SessionState::Running && self.exited.is_none()
+    }
     pub fn mark_failed(&mut self) {
         self.state = SessionState::Failed;
         self.pending_input.clear();

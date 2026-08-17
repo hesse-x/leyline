@@ -48,5 +48,17 @@ show_close_button = true
 new_tab_cwd = "inherit"
 # new_tab_fixed_cwd = "/srv/project"
 
+[bell]
+enabled = true
+visual = false
+visual_duration_ms = 120
+audible = true
+audible_when_unfocused = true
+attention = true
+# Desktop notifications are enabled by default and always use fixed, non-terminal-derived text.
+desktop_notifications = true
+notification_cooldown_seconds = 10
+notification_burst_per_minute = 6
+
 [behavior]
 confirm_multiline_paste = false

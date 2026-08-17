@@ -103,18 +103,29 @@ pub struct ParseAuditDelta {
     pub display_state_fallbacks: u32,
 }
 
+#[derive(Default)]
+struct ListenerState {
+    events: Vec<Event>,
+    bell_pending: bool,
+}
+
 #[derive(Clone, Default)]
-struct Listener(Rc<RefCell<Vec<Event>>>);
+struct Listener(Rc<RefCell<ListenerState>>);
 impl EventListener for Listener {
     fn send_event(&self, event: Event) {
-        self.0.borrow_mut().push(event);
+        let mut state = self.0.borrow_mut();
+        if matches!(event, Event::Bell) {
+            state.bell_pending = true;
+        } else {
+            state.events.push(event);
+        }
     }
 }
 
 pub struct TerminalCoreAdapter {
     term: Term<Listener>,
     parser: ansi::Processor,
-    events: Rc<RefCell<Vec<Event>>>,
+    events: Rc<RefCell<ListenerState>>,
     actions: Vec<TerminalAction>,
     generation: u64,
     size: GridSize,
@@ -537,7 +548,16 @@ impl TerminalCoreAdapter {
 
     fn collect_events(&mut self) -> ParseAuditDelta {
         let mut audit = ParseAuditDelta::default();
-        let events: Vec<_> = self.events.borrow_mut().drain(..).collect();
+        let (events, bell_pending) = {
+            let mut state = self.events.borrow_mut();
+            (
+                std::mem::take(&mut state.events),
+                std::mem::take(&mut state.bell_pending),
+            )
+        };
+        if bell_pending {
+            self.actions.push(TerminalAction::Bell);
+        }
         for event in events {
             match event {
                 Event::Title(title)
@@ -550,7 +570,7 @@ impl TerminalCoreAdapter {
                     self.title = None;
                     self.actions.push(TerminalAction::ResetTitle);
                 }
-                Event::Bell => self.actions.push(TerminalAction::Bell),
+                Event::Bell => unreachable!("BEL is coalesced by the event listener"),
                 Event::PtyWrite(text)
                     if text.len() <= MAX_PTY_REPLY_BYTES
                         && audit.reply_bytes.saturating_add(text.len()) <= MAX_PTY_REPLY_BYTES =>
@@ -1252,5 +1272,17 @@ mod tests {
         let mut core = TerminalCoreAdapter::new(GridSize::new(4, 2).unwrap(), 10).unwrap();
         core.advance("line\r\n".repeat(100).as_bytes()).unwrap();
         assert_eq!(core.history_size(), 10);
+    }
+
+    #[test]
+    fn bell_flood_is_coalesced_before_the_event_and_action_vectors() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(4, 2).unwrap(), 10).unwrap();
+        let bells = vec![b'\x07'; ByteBatch::MAX_LEN];
+        let delta = core.advance(&bells).unwrap();
+        assert_eq!(delta.actions, 1);
+        assert!(core.events.borrow().events.is_empty());
+        let mut actions = Vec::new();
+        core.drain_actions(&mut actions);
+        assert_eq!(actions, [TerminalAction::Bell]);
     }
 }

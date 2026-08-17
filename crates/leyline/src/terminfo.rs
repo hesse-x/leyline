@@ -264,12 +264,10 @@ fn validate_leyline(output: &[u8]) -> Result<(), TerminfoError> {
 fn infocmp(term: &'static str, database: Option<&OsStr>) -> Result<Vec<u8>, TerminfoError> {
     let mut command = Command::new("infocmp");
     command.args(["-x", "-1"]);
-    command.arg(term);
     if let Some(database) = database {
-        command
-            .env("TERMINFO", database)
-            .env("TERMINFO_DIRS", database);
+        command.arg("-A").arg(database);
     }
+    command.arg(term);
     let output = run_tool(command, "infocmp")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);

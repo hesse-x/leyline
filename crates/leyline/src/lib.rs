@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod bell;
 pub mod cli;
 pub mod clipboard;
 pub mod config;
@@ -11,9 +12,11 @@ pub mod input;
 pub mod interaction;
 pub mod layout;
 pub mod logging;
+pub mod notification;
 pub mod security;
 pub mod selection;
 pub mod session;
+pub mod sound;
 pub mod tab;
 pub mod terminal;
 pub mod terminfo;

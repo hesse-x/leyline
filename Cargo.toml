@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/leyline", "crates/leyline-gfx", "crates/leyline-probe", "crates/leyline-pty", "crates/leyline-text"]
+members = ["crates/leyline", "crates/leyline-gfx", "crates/leyline-probe", "crates/leyline-pty", "crates/leyline-sound", "crates/leyline-text"]
 exclude = ["third_party/vte"]
 resolver = "2"
 
@@ -32,6 +32,7 @@ libc = "0.2.175"
 leyline-pty = { version = "0.1.0", path = "crates/leyline-pty" }
 leyline-gfx = { version = "0.1.0", path = "crates/leyline-gfx" }
 leyline-text = { version = "0.1.0", path = "crates/leyline-text" }
+leyline-sound = { version = "0.1.0", path = "crates/leyline-sound" }
 shaderc = "0.10.1"
 
 [patch.crates-io]
