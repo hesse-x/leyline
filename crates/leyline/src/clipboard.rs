@@ -39,6 +39,8 @@ enum TransferJob {
         fd: OwnedFd,
     },
     Write {
+        target: TransferTarget,
+        source: u64,
         fd: OwnedFd,
         bytes: Arc<[u8]>,
     },
@@ -51,7 +53,11 @@ pub enum TransferResult {
         target: TransferTarget,
         result: Result<String, TransferError>,
     },
-    WriteFailed(TransferError),
+    WriteFailed {
+        target: TransferTarget,
+        source: u64,
+        error: TransferError,
+    },
 }
 
 pub struct TransferWorkers {
@@ -121,9 +127,20 @@ impl TransferWorkers {
     ///
     /// # Errors
     /// Returns [`TransferQueueError`] if the fixed worker queue cannot accept the transfer.
-    pub fn send(&self, fd: OwnedFd, bytes: Arc<[u8]>) -> Result<(), TransferQueueError> {
+    pub fn send(
+        &self,
+        target: TransferTarget,
+        source: u64,
+        fd: OwnedFd,
+        bytes: Arc<[u8]>,
+    ) -> Result<(), TransferQueueError> {
         self.jobs
-            .try_send(TransferJob::Write { fd, bytes })
+            .try_send(TransferJob::Write {
+                target,
+                source,
+                fd,
+                bytes,
+            })
             .map_err(TransferQueueError::from)
     }
 
@@ -133,6 +150,10 @@ impl TransferWorkers {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(request);
+    }
+
+    pub fn finish_request(&self, request: u64) {
+        clear_cancel(&self.control, request);
     }
 
     pub fn drain(&self, mut consume: impl FnMut(TransferResult)) {
@@ -189,12 +210,19 @@ fn transfer_worker(
                 target,
                 result: read_text_cancellable(fd, request, control),
             },
-            TransferJob::Write { fd, bytes } => {
-                match write_bytes_cancellable(fd, &bytes, control) {
-                    Ok(()) => continue,
-                    Err(error) => TransferResult::WriteFailed(error),
-                }
-            }
+            TransferJob::Write {
+                target,
+                source,
+                fd,
+                bytes,
+            } => match write_bytes_cancellable(fd, &bytes, control) {
+                Ok(()) => continue,
+                Err(error) => TransferResult::WriteFailed {
+                    target,
+                    source,
+                    error,
+                },
+            },
         };
         if !send_result(results, result, control) {
             return;
@@ -633,7 +661,11 @@ mod tests {
         };
         for _ in 0..3 {
             result_tx
-                .send(TransferResult::WriteFailed(TransferError::Timeout))
+                .send(TransferResult::WriteFailed {
+                    target: TransferTarget::Clipboard,
+                    source: 1,
+                    error: TransferError::Timeout,
+                })
                 .unwrap();
         }
 

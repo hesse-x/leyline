@@ -406,11 +406,11 @@ impl WaylandWindow {
                 data_device_manager,
                 data_device: None,
                 clipboard_offer: None,
-                clipboard_sources: Vec::new(),
+                clipboard_source: None,
                 primary_selection_manager,
                 primary_device: None,
                 primary_offer: None,
-                primary_sources: Vec::new(),
+                primary_source: None,
                 text_input_manager,
                 text_input: None,
                 text_input_focused: false,
@@ -759,7 +759,7 @@ impl WaylandWindow {
                     .data_device_manager
                     .create_copy_paste_source(&qh, MIMES);
                 source.set_selection(device, serial.value);
-                self.state.clipboard_sources.push((source_id, source));
+                self.state.clipboard_source = Some((source_id, source));
             }
             SelectionTarget::Primary => {
                 let (Some(manager), Some(device)) = (
@@ -770,7 +770,7 @@ impl WaylandWindow {
                 };
                 let source = manager.create_selection_source(&qh, MIMES);
                 source.set_selection(device, serial.value);
-                self.state.primary_sources.push((source_id, source));
+                self.state.primary_source = Some((source_id, source));
             }
         }
         self.flush()?;
@@ -843,11 +843,11 @@ pub(crate) struct WaylandState {
     data_device_manager: DataDeviceManagerState,
     data_device: Option<DataDevice>,
     clipboard_offer: Option<SelectionOffer>,
-    clipboard_sources: Vec<(u64, CopyPasteSource)>,
+    clipboard_source: Option<(u64, CopyPasteSource)>,
     primary_selection_manager: Option<PrimarySelectionManagerState>,
     primary_device: Option<PrimarySelectionDevice>,
     primary_offer: Option<PrimarySelectionOffer>,
-    primary_sources: Vec<(u64, PrimarySelectionSource)>,
+    primary_source: Option<(u64, PrimarySelectionSource)>,
     text_input_manager: Option<ZwpTextInputManagerV3>,
     text_input: Option<ZwpTextInputV3>,
     text_input_focused: bool,
@@ -965,6 +965,16 @@ impl SeatHandler for WaylandState {
             self.clipboard_offer = None;
             self.primary_device = None;
             self.primary_offer = None;
+            self.clipboard_source = None;
+            self.primary_source = None;
+            self.pending
+                .push_input(PlatformEvent::Clipboard(ClipboardEvent::Unavailable(
+                    SelectionTarget::Clipboard,
+                )));
+            self.pending
+                .push_input(PlatformEvent::Clipboard(ClipboardEvent::Unavailable(
+                    SelectionTarget::Primary,
+                )));
             self.seat_token = self.seat_token.next_generation();
         }
     }
@@ -1767,12 +1777,13 @@ impl DataSourceHandler for WaylandState {
         fd: smithay_client_toolkit::data_device_manager::WritePipe,
     ) {
         if let Some((source, _)) = self
-            .clipboard_sources
-            .iter()
-            .find(|(_, value)| value.inner() == source)
+            .clipboard_source
+            .as_ref()
+            .filter(|(_, value)| value.inner() == source)
         {
             self.pending
                 .push_input(PlatformEvent::Clipboard(ClipboardEvent::Send {
+                    target: SelectionTarget::Clipboard,
                     source: *source,
                     mime_type,
                     fd: OwnedFd::from(fd),
@@ -1785,14 +1796,15 @@ impl DataSourceHandler for WaylandState {
         _: &QueueHandle<Self>,
         source: &wl_data_source::WlDataSource,
     ) {
-        if let Some(index) = self
-            .clipboard_sources
-            .iter()
-            .position(|(_, value)| value.inner() == source)
+        if self
+            .clipboard_source
+            .as_ref()
+            .is_some_and(|(_, value)| value.inner() == source)
         {
-            let (source, _) = self.clipboard_sources.remove(index);
+            let (source, _) = self.clipboard_source.take().expect("source was checked");
             self.pending
                 .push_input(PlatformEvent::Clipboard(ClipboardEvent::SourceCancelled {
+                    target: SelectionTarget::Clipboard,
                     source,
                 }));
         }
@@ -1857,12 +1869,13 @@ impl PrimarySelectionSourceHandler for WaylandState {
         fd: smithay_client_toolkit::data_device_manager::WritePipe,
     ) {
         if let Some((source, _)) = self
-            .primary_sources
-            .iter()
-            .find(|(_, value)| value.inner() == source)
+            .primary_source
+            .as_ref()
+            .filter(|(_, value)| value.inner() == source)
         {
             self.pending
                 .push_input(PlatformEvent::Clipboard(ClipboardEvent::Send {
+                    target: SelectionTarget::Primary,
                     source: *source,
                     mime_type,
                     fd: OwnedFd::from(fd),
@@ -1875,14 +1888,15 @@ impl PrimarySelectionSourceHandler for WaylandState {
         _: &QueueHandle<Self>,
         source: &wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_source_v1::ZwpPrimarySelectionSourceV1,
     ) {
-        if let Some(index) = self
-            .primary_sources
-            .iter()
-            .position(|(_, value)| value.inner() == source)
+        if self
+            .primary_source
+            .as_ref()
+            .is_some_and(|(_, value)| value.inner() == source)
         {
-            let (source, _) = self.primary_sources.remove(index);
+            let (source, _) = self.primary_source.take().expect("source was checked");
             self.pending
                 .push_input(PlatformEvent::Clipboard(ClipboardEvent::SourceCancelled {
+                    target: SelectionTarget::Primary,
                     source,
                 }));
         }

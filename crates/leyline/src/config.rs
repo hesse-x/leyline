@@ -156,6 +156,8 @@ pub enum Modifier {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Action {
+    CopyClipboard,
+    PasteClipboard,
     PastePrimary,
     IncreaseFontSize,
     DecreaseFontSize,
@@ -226,11 +228,21 @@ impl Default for EffectiveConfig {
 fn default_keybindings() -> Vec<KeyBinding> {
     use crate::input::shortcut::{BindingOrigin, KeyChord, LogicalKeyPattern};
     use Action::{
-        CloseTab, DecreaseFontSize, IncreaseFontSize, NewTab, NextTab, PastePrimary, PreviousTab,
-        ResetFontSize, ScrollPageDown, ScrollPageUp,
+        CloseTab, CopyClipboard, DecreaseFontSize, IncreaseFontSize, NewTab, NextTab,
+        PasteClipboard, PastePrimary, PreviousTab, ResetFontSize, ScrollPageDown, ScrollPageUp,
     };
     use leyline_gfx::ModifierMask;
     [
+        (
+            LogicalKeyPattern::Character('c'),
+            modifier_mask(&[Modifier::Control, Modifier::Shift]),
+            CopyClipboard,
+        ),
+        (
+            LogicalKeyPattern::Character('v'),
+            modifier_mask(&[Modifier::Control, Modifier::Shift]),
+            PasteClipboard,
+        ),
         (LogicalKeyPattern::Insert, ModifierMask::SHIFT, PastePrimary),
         (
             LogicalKeyPattern::Character('+'),
@@ -1124,6 +1136,8 @@ fn parse_binding(path: &Path, index: usize, raw: RawKeyBinding) -> Result<KeyBin
     mods.sort_unstable();
     mods.dedup();
     let action = match raw.action.as_str() {
+        "CopyClipboard" => Action::CopyClipboard,
+        "PasteClipboard" => Action::PasteClipboard,
         "PastePrimary" => Action::PastePrimary,
         "IncreaseFontSize" => Action::IncreaseFontSize,
         "DecreaseFontSize" => Action::DecreaseFontSize,
@@ -1205,9 +1219,26 @@ mod tests {
     }
 
     #[test]
-    fn defaults_include_configurable_primary_paste() {
+    fn defaults_include_system_clipboard_and_primary_bindings_once() {
         use crate::input::shortcut::LogicalKeyPattern;
         let bindings = default_keybindings();
+        for (key, action) in [
+            (LogicalKeyPattern::Character('c'), Action::CopyClipboard),
+            (LogicalKeyPattern::Character('v'), Action::PasteClipboard),
+        ] {
+            assert_eq!(
+                bindings
+                    .iter()
+                    .filter(|binding| {
+                        binding.chord.key == key
+                            && binding.chord.modifiers
+                                == modifier_mask(&[Modifier::Control, Modifier::Shift])
+                            && binding.action == action
+                    })
+                    .count(),
+                1
+            );
+        }
         assert!(bindings.iter().any(|binding| {
             binding.chord.key == LogicalKeyPattern::Insert
                 && binding.chord.modifiers == leyline_gfx::ModifierMask::SHIFT
@@ -1234,6 +1265,27 @@ mod tests {
                 && binding.chord.modifiers == leyline_gfx::ModifierMask::CONTROL
                 && binding.action == Action::ResetFontSize
         }));
+    }
+
+    #[test]
+    fn clipboard_actions_parse_from_user_bindings() {
+        let source = "[[keybindings]]\nkey=\"C\"\nmods=[\"Control\",\"Shift\"]\naction=\"CopyClipboard\"\n[[keybindings]]\nkey=\"V\"\nmods=[\"Control\",\"Shift\"]\naction=\"PasteClipboard\"\n";
+        let raw: RawConfig = toml::from_str(source).expect("raw config");
+        let (effective, _) = raw
+            .into_effective(Path::new("config.toml"), source)
+            .expect("effective config");
+        assert!(
+            effective
+                .keybindings
+                .iter()
+                .any(|binding| binding.action == Action::CopyClipboard)
+        );
+        assert!(
+            effective
+                .keybindings
+                .iter()
+                .any(|binding| binding.action == Action::PasteClipboard)
+        );
     }
 
     #[test]

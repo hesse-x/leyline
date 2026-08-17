@@ -118,13 +118,15 @@ action = "ScrollPageUp"
 ```
 
 Selecting text publishes the primary selection; paste it with the middle mouse button or
-`Shift+Insert`.
+`Shift+Insert`. `Ctrl+Shift+C` explicitly copies the active tab's selection to the Wayland
+Clipboard, and `Ctrl+Shift+V` pastes the Clipboard into the same tab as long as it remains active.
 
 Tabs are always visible. `Ctrl+Shift+N` creates and activates a tab, `Ctrl+Shift+W` closes it,
 `Ctrl+Shift+Left/Right` cycles, and `Ctrl+Shift+1..9` activates an ordinal tab. Mouse clicks switch
 tabs; a close button or middle click closes one. New tabs repeat the startup launch request and
 inherit Leyline's startup directory. User `[[keybindings]]` entries can override the actions
-`NewTab`, `CloseTab`, `PreviousTab`, `NextTab`, and `ActivateTab1` through `ActivateTab9`.
+`CopyClipboard`, `PasteClipboard`, `PastePrimary`, `NewTab`, `CloseTab`, `PreviousTab`, `NextTab`,
+and `ActivateTab1` through `ActivateTab9`.
 
 [`config/reference.toml`](config/reference.toml) fixes the Ubuntu Sans Mono 13 opaque screenshot
 baseline. [`config/legacy.toml`](config/legacy.toml) restores the previous font metrics, palette,
@@ -133,8 +135,9 @@ background alpha, and gutter-free layout without relying on an implicit runtime 
 When paste confirmation is enabled, multiline or control-character clipboard content opens a
 modal warning that shows only its source, size, line count, and risk category. Press `Enter` or
 `Y` to paste; press `Escape` or `N` to reject. Any other key cancels the modal and is consumed.
-Losing keyboard focus, replacing the primary-selection offer, requesting another paste, or closing
-the session also cancels the pending paste.
+Losing keyboard focus, replacing the matching Clipboard or primary-selection offer, switching tabs,
+requesting another paste, or closing the session also cancels the pending paste. Changes to the
+other selection target do not close the modal.
 
 Unknown configuration fields produce warnings. General colors accept `#RRGGBB` or `#RRGGBBAA`;
 the ANSI palette must contain exactly 16 opaque `#RRGGBB` entries. Font size, line spacing,
@@ -161,9 +164,9 @@ available. Ligatures are disabled by default and always remain constrained to te
 Strong RTL runs are shaped, but v0.1 does not perform full Unicode bidi visual reordering: cursor
 and selection coordinates remain in logical cell order.
 
-Keyboard, mouse, IME, interactive selection, primary selection, and explicitly triggered OSC 8
-links are implemented. System-clipboard shortcuts are not exposed and OSC 52 clipboard requests
-remain deliberately rejected. OSC 8 `Ctrl+click` opening has been manually verified on GNOME.
+Keyboard, mouse, IME, interactive selection, Wayland Clipboard/primary selection, and explicitly
+triggered OSC 8 links are implemented. OSC 52 clipboard requests remain deliberately rejected.
+OSC 8 `Ctrl+click` opening has been manually verified on GNOME.
 Broader IBus/Fcitx, fractional-scale, and hardware Vulkan acceptance coverage is still pending.
 GNOME client-side decoration
 uses libdecor; compositors providing xdg-decoration use server-side decoration. Fractional scale is

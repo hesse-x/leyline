@@ -97,12 +97,15 @@ pub enum ClipboardEvent {
         mime_types: Vec<String>,
     },
     Cleared(SelectionTarget),
+    Unavailable(SelectionTarget),
     Send {
+        target: SelectionTarget,
         source: u64,
         mime_type: String,
         fd: OwnedFd,
     },
     SourceCancelled {
+        target: SelectionTarget,
         source: u64,
     },
 }

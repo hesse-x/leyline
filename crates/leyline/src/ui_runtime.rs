@@ -24,6 +24,7 @@ use crate::{
     tab::TabManager,
 };
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct UiRuntime {
     state: RuntimeState,
     app: App,
@@ -659,7 +660,8 @@ impl UiRuntime {
         }
         match self.app.handle_event(event)? {
             AppAction::BeginShutdown => {
-                if let Some(request) = self.selection.shutdown() {
+                let cancellation = self.selection.shutdown();
+                if let Some(request) = cancellation.request {
                     self.clipboard_workers.cancel(request.get());
                 }
                 for tab in self.tabs.tabs_mut() {
@@ -688,12 +690,7 @@ impl UiRuntime {
                 logical_key = ?key.logical_key,
                 "configurable shortcut matched"
             );
-            if !(key.repeat
-                && matches!(
-                    action,
-                    crate::config::Action::NewTab | crate::config::Action::CloseTab
-                ))
-            {
+            if !(key.repeat && ignores_key_repeat(action)) {
                 self.execute_action(action)?;
             }
             return Ok(());
@@ -948,11 +945,11 @@ impl UiRuntime {
     }
 
     fn cancel_paste_confirmation(&mut self) -> Result<(), UiRuntimeError> {
-        let resume_ime = self.selection.modal_ime_suspended();
-        if let Some(request) = self.selection.cancel_paste() {
+        let cancellation = self.selection.cancel_paste();
+        if let Some(request) = cancellation.request {
             self.clipboard_workers.cancel(request.get());
         }
-        self.restore_ime_after_paste_confirmation(resume_ime)?;
+        self.restore_ime_after_paste_confirmation(cancellation.resume_ime)?;
         self.compose_latest()
     }
 
@@ -972,16 +969,20 @@ impl UiRuntime {
         key: &leyline_gfx::KeyInput,
     ) -> Result<bool, UiRuntimeError> {
         let resume_ime = self.selection.modal_ime_suspended();
-        let outcome = self.selection.confirmation_input(key);
+        let active = self
+            .tabs
+            .active_id()
+            .expect("runtime always has an active tab");
+        let outcome = self.selection.confirmation_input(key, active);
         if outcome == crate::selection::ConfirmationOutcome::NotActive {
             return Ok(false);
         }
         tracing::debug!(?outcome, logical_key = ?key.logical_key, "paste confirmation key handled");
         match outcome {
-            crate::selection::ConfirmationOutcome::Paste(text) => {
+            crate::selection::ConfirmationOutcome::Paste { owner, text } => {
                 self.restore_ime_after_paste_confirmation(resume_ime)?;
                 self.compose_latest()?;
-                self.active_session_mut().paste(&text)?;
+                self.paste_for_owner(owner, &text)?;
             }
             crate::selection::ConfirmationOutcome::Closed => {
                 self.restore_ime_after_paste_confirmation(resume_ime)?;
@@ -1007,6 +1008,12 @@ impl UiRuntime {
     fn execute_action(&mut self, action: crate::config::Action) -> Result<(), UiRuntimeError> {
         use crate::config::Action;
         match action {
+            Action::CopyClipboard => {
+                self.copy_selection(leyline_gfx::SelectionTarget::Clipboard)?;
+            }
+            Action::PasteClipboard => {
+                self.request_paste(leyline_gfx::SelectionTarget::Clipboard)?;
+            }
             Action::IncreaseFontSize => {
                 let font_size = (self.font_size + 1.0).min(72.0);
                 self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), font_size)?;
@@ -1567,26 +1574,32 @@ impl UiRuntime {
             tracing::debug!(?target, "copy ignored because the selection is empty");
             return Ok(());
         }
-        let Some(source) = self.selection.publish(text) else {
+        let transfer_target = selection_transfer_target(target);
+        let Some(start) = self.selection.prepare_publish(transfer_target, text) else {
             tracing::warn!(?target, bytes, "copy selection rejected by size policy");
             return Ok(());
         };
-        let published = match self.gfx.publish_selection(target, source.get(), serial) {
+        let published = match self
+            .gfx
+            .publish_selection(target, start.source.get(), serial)
+        {
             Ok(published) => published,
             Err(error) => {
-                self.selection.source_cancelled(source);
+                self.selection.publish_failed(start.source);
                 return Err(error.into());
             }
         };
         if published {
+            self.selection
+                .publish_submitted(transfer_target, start.source);
             tracing::debug!(
                 ?target,
-                source = source.get(),
+                source = start.source.get(),
                 bytes,
                 "selection source published"
             );
         } else {
-            self.selection.source_cancelled(source);
+            self.selection.publish_failed(start.source);
             tracing::warn!(?target, "selection protocol is unavailable");
         }
         Ok(())
@@ -1596,16 +1609,20 @@ impl UiRuntime {
         &mut self,
         target: leyline_gfx::SelectionTarget,
     ) -> Result<(), UiRuntimeError> {
-        self.cancel_paste_confirmation()?;
-        let transfer_target = match target {
-            leyline_gfx::SelectionTarget::Clipboard => crate::clipboard::TransferTarget::Clipboard,
-            leyline_gfx::SelectionTarget::Primary => crate::clipboard::TransferTarget::Primary,
-        };
-        let Some(start) = self.selection.begin_request(transfer_target) else {
+        let transfer_target = selection_transfer_target(target);
+        let owner = self
+            .tabs
+            .active_id()
+            .expect("runtime always has an active tab");
+        let Some(start) = self.selection.begin_request(transfer_target, owner) else {
             return Ok(());
         };
-        if let Some(request) = start.cancel {
+        if let Some(request) = start.cancel.request {
             self.clipboard_workers.cancel(request.get());
+        }
+        self.restore_ime_after_paste_confirmation(start.cancel.resume_ime)?;
+        if start.cancel.overlay_changed {
+            self.compose_latest()?;
         }
         let fd = match self.gfx.receive_selection(target) {
             Ok(Some(fd)) => fd,
@@ -1643,6 +1660,7 @@ impl UiRuntime {
     ) -> Result<(), UiRuntimeError> {
         match event {
             leyline_gfx::ClipboardEvent::Send {
+                target,
                 source,
                 mime_type,
                 fd,
@@ -1651,21 +1669,54 @@ impl UiRuntime {
                     mime_type.as_str(),
                     "text/plain;charset=utf-8" | "UTF8_STRING" | "text/plain"
                 );
+                let transfer_target = selection_transfer_target(target);
                 if supported
-                    && let Some(bytes) = self
-                        .selection
-                        .source_bytes(crate::selection::SourceToken::from_raw(source))
-                    && let Err(error) = self.clipboard_workers.send(fd, bytes)
+                    && let Some(bytes) = self.selection.source_bytes(
+                        transfer_target,
+                        crate::selection::SourceToken::from_raw(source),
+                    )
+                    && let Err(error) =
+                        self.clipboard_workers
+                            .send(transfer_target, source, fd, bytes)
                 {
-                    tracing::warn!(%error, "clipboard send queue rejected transfer");
+                    tracing::warn!(%error, ?target, source, "clipboard send queue rejected transfer");
                 }
             }
-            leyline_gfx::ClipboardEvent::SourceCancelled { source } => {
-                self.selection
-                    .source_cancelled(crate::selection::SourceToken::from_raw(source));
+            leyline_gfx::ClipboardEvent::SourceCancelled { target, source } => {
+                self.selection.source_cancelled(
+                    selection_transfer_target(target),
+                    crate::selection::SourceToken::from_raw(source),
+                );
             }
-            leyline_gfx::ClipboardEvent::Offer { .. } | leyline_gfx::ClipboardEvent::Cleared(_) => {
-                self.cancel_paste_confirmation()?;
+            leyline_gfx::ClipboardEvent::Offer { target, mime_types } => {
+                let state = if mime_types.iter().any(|mime| {
+                    matches!(
+                        mime.as_str(),
+                        "text/plain;charset=utf-8" | "UTF8_STRING" | "text/plain"
+                    )
+                }) {
+                    crate::selection::OfferState::TextAvailable
+                } else {
+                    crate::selection::OfferState::Unsupported
+                };
+                let cancellation = self
+                    .selection
+                    .offer_changed(selection_transfer_target(target), state);
+                self.apply_paste_cancellation(cancellation)?;
+            }
+            leyline_gfx::ClipboardEvent::Cleared(target) => {
+                let cancellation = self.selection.offer_changed(
+                    selection_transfer_target(target),
+                    crate::selection::OfferState::Empty,
+                );
+                self.apply_paste_cancellation(cancellation)?;
+            }
+            leyline_gfx::ClipboardEvent::Unavailable(target) => {
+                let cancellation = self.selection.offer_changed(
+                    selection_transfer_target(target),
+                    crate::selection::OfferState::Unavailable,
+                );
+                self.apply_paste_cancellation(cancellation)?;
             }
         }
         Ok(())
@@ -1683,14 +1734,20 @@ impl UiRuntime {
                     target,
                     result,
                 } => {
+                    self.clipboard_workers.finish_request(request);
+                    let active = self
+                        .tabs
+                        .active_id()
+                        .expect("runtime always has an active tab");
                     match self.selection.transfer_completed(
                         crate::selection::RequestToken::from_raw(request),
                         target,
                         result,
                         self.app.config().behavior.confirm_multiline_paste,
+                        active,
                     ) {
-                        crate::selection::PasteTransition::Paste(text) => {
-                            self.active_session_mut().paste(&text)?;
+                        crate::selection::PasteTransition::Paste { owner, text } => {
+                            self.paste_for_owner(owner, &text)?;
                         }
                         crate::selection::PasteTransition::Confirming => {
                             self.enter_paste_confirmation()?;
@@ -1701,11 +1758,16 @@ impl UiRuntime {
                         crate::selection::PasteTransition::Failed(error) => {
                             tracing::warn!(%error, "clipboard transfer failed");
                         }
-                        crate::selection::PasteTransition::IgnoreStale => {}
+                        crate::selection::PasteTransition::Noop
+                        | crate::selection::PasteTransition::IgnoreStale => {}
                     }
                 }
-                crate::clipboard::TransferResult::WriteFailed(error) => {
-                    tracing::warn!(%error, "clipboard transfer failed");
+                crate::clipboard::TransferResult::WriteFailed {
+                    target,
+                    source,
+                    error,
+                } => {
+                    tracing::warn!(%error, ?target, source, "clipboard transfer failed");
                 }
             }
         }
@@ -1714,6 +1776,58 @@ impl UiRuntime {
         }
         Ok(())
     }
+
+    fn apply_paste_cancellation(
+        &mut self,
+        cancellation: crate::selection::PasteCancellation,
+    ) -> Result<(), UiRuntimeError> {
+        if let Some(request) = cancellation.request {
+            self.clipboard_workers.cancel(request.get());
+        }
+        self.restore_ime_after_paste_confirmation(cancellation.resume_ime)?;
+        if cancellation.overlay_changed {
+            self.compose_latest()?;
+        }
+        Ok(())
+    }
+
+    fn paste_for_owner(
+        &mut self,
+        owner: crate::tab::SessionId,
+        text: &str,
+    ) -> Result<(), UiRuntimeError> {
+        if self.tabs.active_id() != Some(owner) {
+            tracing::debug!(
+                session_id = owner.get(),
+                "stale paste owner is no longer active"
+            );
+            return Ok(());
+        }
+        if let Some(tab) = self.tabs.get_mut(owner) {
+            tab.session.paste(text)?;
+        }
+        Ok(())
+    }
+}
+
+fn selection_transfer_target(
+    target: leyline_gfx::SelectionTarget,
+) -> crate::clipboard::TransferTarget {
+    match target {
+        leyline_gfx::SelectionTarget::Clipboard => crate::clipboard::TransferTarget::Clipboard,
+        leyline_gfx::SelectionTarget::Primary => crate::clipboard::TransferTarget::Primary,
+    }
+}
+
+fn ignores_key_repeat(action: crate::config::Action) -> bool {
+    matches!(
+        action,
+        crate::config::Action::NewTab
+            | crate::config::Action::CloseTab
+            | crate::config::Action::CopyClipboard
+            | crate::config::Action::PasteClipboard
+            | crate::config::Action::PastePrimary
+    )
 }
 
 fn keep_selection_after_release(
@@ -1787,7 +1901,8 @@ fn window_title(ordinal: usize, count: usize, title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        accumulate_wheel_steps, keep_selection_after_release, key_text, terminal_modifiers,
+        accumulate_wheel_steps, ignores_key_repeat, keep_selection_after_release, key_text,
+        terminal_modifiers,
     };
 
     #[test]
@@ -1884,6 +1999,14 @@ mod tests {
             crate::input::shortcut::resolve(&bindings, &input),
             ShortcutResult::NotMatched
         );
+    }
+
+    #[test]
+    fn selection_actions_ignore_key_repeat() {
+        assert!(ignores_key_repeat(crate::config::Action::CopyClipboard));
+        assert!(ignores_key_repeat(crate::config::Action::PasteClipboard));
+        assert!(ignores_key_repeat(crate::config::Action::PastePrimary));
+        assert!(!ignores_key_repeat(crate::config::Action::ScrollPageDown));
     }
 
     #[test]

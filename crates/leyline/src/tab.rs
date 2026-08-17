@@ -10,6 +10,11 @@ impl SessionId {
     pub const fn get(self) -> u64 {
         self.0
     }
+
+    #[cfg(test)]
+    pub(crate) const fn from_raw(value: u64) -> Self {
+        Self(value)
+    }
 }
 
 pub struct TabEntry {
