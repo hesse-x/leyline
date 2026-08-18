@@ -15,6 +15,7 @@ gpu-allocator = { version = "0.28.0", default-features = false, features = ["std
 freetype-sys = { version = "0.23.0", features = ["bundled"] }
 harfbuzz-sys = { version = "0.8.0", default-features = false, features = ["bundled"] }
 smithay-client-toolkit = { version = "0.20.0", default-features = false, features = ["xkbcommon"] }
+xkbcommon = "0.8.0"
 wayland-client = { version = "0.31.14", features = ["system"] }
 wayland-protocols = { version = "0.32.13", features = ["client", "staging", "unstable"] }
 yeslogic-fontconfig-sys = { version = "6.0.1", features = ["dlopen"] }

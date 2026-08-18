@@ -13,8 +13,9 @@ mod wayland;
 pub use atlas::AtlasStats;
 
 pub use input::{
-    InputSerial, LogicalKey, ModifierMask, SeatToken, SerialKind, keysym_character,
-    logical_key_from_keysym,
+    InputSerial, KeyIdentity, KeyLocation, KeySide, KeypadKey, LogicalKey, ModifierKind,
+    ModifierMask, SeatToken, SerialKind, key_identity_from_keysym, keypad_key_from_keysym,
+    keysym_character, logical_key_from_keysym,
 };
 pub use model::{
     ClipboardEvent, CommittedFrameKey, FrameKey, GfxCommand, GlyphInstance, GlyphPlacement,

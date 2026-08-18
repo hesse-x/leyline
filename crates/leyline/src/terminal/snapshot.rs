@@ -142,10 +142,72 @@ pub struct TerminalModes {
     pub bracketed_paste: bool,
     pub application_cursor: bool,
     pub application_keypad: bool,
+    pub keyboard: KeyboardProtocolState,
     pub focus_reporting: bool,
     pub alternate_scroll: bool,
     pub mouse_protocol: MouseProtocol,
     pub mouse_encoding: MouseEncoding,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KeyboardProtocolState {
+    pub kitty: KittyKeyboardFlags,
+    pub modify_other_keys: ModifyOtherKeysLevel,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct KittyKeyboardFlags(u8);
+
+impl KittyKeyboardFlags {
+    pub const DISAMBIGUATE: Self = Self(1);
+    pub const REPORT_EVENTS: Self = Self(2);
+    pub const ALTERNATE_KEYS: Self = Self(4);
+    pub const ALL_KEYS: Self = Self(8);
+    pub const ASSOCIATED_TEXT: Self = Self(16);
+    pub const VALID_BITS: u8 = 31;
+
+    #[must_use]
+    pub const fn from_valid_bits(bits: u8) -> Option<Self> {
+        if bits & !Self::VALID_BITS == 0 {
+            Some(Self(bits))
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    #[must_use]
+    pub const fn contains(self, flag: Self) -> bool {
+        self.0 & flag.0 == flag.0
+    }
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    #[must_use]
+    pub const fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ModifyOtherKeysLevel {
+    #[default]
+    Disabled = 0,
+    ExceptWellDefined = 1,
+    All = 2,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

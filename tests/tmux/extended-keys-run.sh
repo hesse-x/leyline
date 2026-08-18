@@ -87,4 +87,51 @@ for mode in off on always; do
     printf 'extended_keys_%s_negotiated=no\n' "$mode"
 done
 
+# A declared client feature is the positive half of the contract. It is supplied on the
+# client command line rather than smuggled into the standalone terminfo entry.
+for mode in off on always; do
+    case_name="declared-$mode"
+    socket="$case_root/$case_name.sock"
+    config="$case_root/$case_name.conf"
+    bytes="$case_root/$case_name.bytes"
+    ready="$case_root/$case_name.ready"
+    typescript="$case_root/$case_name.typescript"
+    owned_sockets+=("$socket")
+    printf '%s\n' \
+        'set -g default-terminal tmux-256color' \
+        "set -g extended-keys $mode" >"$config"
+
+    printf -v pane_command '%q %q %q %q' "$BYTE_PROBE" "$bytes" 3 "$ready"
+    TERM=leyline-256color COLORTERM=truecolor \
+        tmux -S "$socket" -f "$config" new-session -d -x 80 -y 24 -s extkeys "$pane_command"
+
+    deadline=$((SECONDS + TIMEOUT_SECONDS))
+    while [[ ! -s $ready ]]; do
+        (( SECONDS < deadline )) || fail "$case_name byte probe did not become ready"
+        sleep 0.05
+    done
+    printf -v attach_command 'TERM=leyline-256color COLORTERM=truecolor tmux -T extkeys -S %q attach-session -t extkeys' \
+        "$socket"
+    { sleep 0.1; printf '\033[?1;2c\033[>0;4000;0c'; sleep 0.3; printf '\033OP'; sleep 0.2; printf '\002d'; } \
+        | timeout --foreground --kill-after=1s 3s script -qefc "$attach_command" "$typescript" \
+            >/dev/null \
+        || fail "$case_name client did not detach cleanly"
+
+    [[ -s $bytes ]] || fail "$case_name did not deliver the F1 fixture"
+    [[ $(<"$bytes") == 1b4f50 ]] || fail "$case_name changed the traditional F1 fixture"
+    negotiated=no
+    if rg --text --quiet --fixed-strings $'\033[>4;1m' "$typescript"; then
+        negotiated=yes
+    fi
+    if [[ $mode == off && $negotiated != no ]]; then
+        fail "$case_name negotiated while extended-keys was disabled"
+    fi
+    if [[ $mode != off && $negotiated != yes ]]; then
+        fail "$case_name did not negotiate the declared extkeys feature"
+    fi
+    printf 'extended_keys_%s=pass\n' "$case_name"
+    printf 'extended_keys_%s_f1=1b4f50\n' "$case_name"
+    printf 'extended_keys_%s_negotiated=%s\n' "$case_name" "$negotiated"
+done
+
 printf 'extended_keys_result=passed\n'

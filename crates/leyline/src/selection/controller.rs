@@ -714,6 +714,14 @@ mod tests {
             modifiers: leyline_gfx::ModifiersState::default(),
             shortcut_modifiers: leyline_gfx::ModifierMask::empty(),
             logical_key: LogicalKey::Enter,
+            identity: leyline_gfx::KeyIdentity {
+                logical: LogicalKey::Enter,
+                location: leyline_gfx::KeyLocation::Standard,
+                keypad: None,
+                base_codepoint: None,
+                shifted_codepoint: None,
+            },
+            keymap_generation: 1,
             state: KeyState::Pressed,
             repeat: false,
         };

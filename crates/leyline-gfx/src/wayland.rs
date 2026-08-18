@@ -74,13 +74,14 @@ use wayland_protocols::wp::{
         wp_viewporter::WpViewporter,
     },
 };
+use xkbcommon::xkb;
 
 use crate::decor::{Libdecor, ResizeEdge};
 use crate::{
     ClipboardEvent, GfxInitError, InputSerial, KeyInput, KeyState, LogicalSize, ModifierMask,
     ModifiersState, PlatformEvent, PointerCursor, PointerInput, PointerKind, Scale120, SeatToken,
     SelectionTarget, SerialKind, TextInputContext, TextInputEvent, TextInputPurpose, WindowState,
-    logical_key_from_keysym,
+    key_identity_from_keysym, logical_key_from_keysym,
 };
 
 const DEFAULT_SIZE: LogicalSize = LogicalSize {
@@ -129,6 +130,8 @@ impl PressedModifiers {
             alt: reported.alt || self.0 & (Self::ALT_LEFT | Self::ALT_RIGHT) != 0,
             super_key: reported.super_key || self.0 & (Self::SUPER_LEFT | Self::SUPER_RIGHT) != 0,
             alt_graph: reported.alt_graph || self.0 & Self::ALT_GRAPH != 0,
+            caps_lock: reported.caps_lock,
+            num_lock: reported.num_lock,
         }
     }
 
@@ -248,7 +251,11 @@ impl KeyRepeatState {
         };
         if matches!(
             logical_key_from_keysym(event.keysym.raw()),
-            crate::LogicalKey::Unidentified(_)
+            crate::LogicalKey::Modifier { .. }
+                | crate::LogicalKey::CapsLock
+                | crate::LogicalKey::NumLock
+                | crate::LogicalKey::Menu
+                | crate::LogicalKey::Unidentified(_)
         ) {
             return;
         }
@@ -423,6 +430,9 @@ impl WaylandWindow {
                 pressed_modifiers: PressedModifiers::default(),
                 key_repeat: KeyRepeatState::default(),
                 shortcut_digit_rows: HashMap::new(),
+                keymap_generation: 0,
+                xkb_keymap: None,
+                xkb_state: None,
                 logical_size: DEFAULT_SIZE,
                 scale: Scale120::ONE,
                 pending: PendingEvents::default(),
@@ -891,6 +901,9 @@ pub(crate) struct WaylandState {
     pressed_modifiers: PressedModifiers,
     key_repeat: KeyRepeatState,
     shortcut_digit_rows: HashMap<u32, std::num::NonZeroU8>,
+    keymap_generation: u64,
+    xkb_keymap: Option<xkb::Keymap>,
+    xkb_state: Option<xkb::State>,
     logical_size: LogicalSize,
     scale: Scale120,
     pending: PendingEvents,
@@ -1100,8 +1113,8 @@ impl KeyboardHandler for WaylandState {
         _: &wl_keyboard::WlKeyboard,
         _: u32,
         modifiers: Modifiers,
-        _: RawModifiers,
-        _: u32,
+        raw: RawModifiers,
+        layout: u32,
     ) {
         self.modifiers = ModifiersState {
             shift: modifiers.shift,
@@ -1109,7 +1122,12 @@ impl KeyboardHandler for WaylandState {
             alt: modifiers.alt,
             super_key: modifiers.logo,
             alt_graph: false,
+            caps_lock: modifiers.caps_lock,
+            num_lock: modifiers.num_lock,
         };
+        if let Some(state) = self.xkb_state.as_mut() {
+            state.update_mask(raw.depressed, raw.latched, raw.locked, 0, 0, layout);
+        }
         self.pending
             .push_input(PlatformEvent::ModifiersChanged(self.modifiers));
     }
@@ -1121,7 +1139,17 @@ impl KeyboardHandler for WaylandState {
         _: &wl_keyboard::WlKeyboard,
         keymap: Keymap<'_>,
     ) {
-        self.shortcut_digit_rows = parse_digit_row_keycodes(&keymap.as_string());
+        let keymap_text = keymap.as_string();
+        self.shortcut_digit_rows = parse_digit_row_keycodes(&keymap_text);
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        self.xkb_keymap = xkb::Keymap::new_from_string(
+            &context,
+            keymap_text,
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        );
+        self.xkb_state = self.xkb_keymap.as_ref().map(xkb::State::new);
+        self.keymap_generation = self.keymap_generation.wrapping_add(1);
         tracing::debug!("Wayland keyboard keymap initialized");
     }
 
@@ -1195,6 +1223,7 @@ impl WaylandState {
             super_key = modifiers.super_key,
             "Wayland keyboard event"
         );
+        let identity = self.key_identity(&event);
         self.pending.push_input(PlatformEvent::Key(KeyInput {
             serial: InputSerial {
                 seat: self.seat_token,
@@ -1207,16 +1236,73 @@ impl WaylandState {
             utf8: event.utf8,
             modifiers,
             shortcut_modifiers: shortcut_modifiers(modifiers, self.pressed_modifiers),
-            logical_key: logical_key_from_keysym(event.keysym.raw()),
+            logical_key: identity.logical,
+            identity,
+            keymap_generation: self.keymap_generation,
             state,
             repeat,
         }));
+    }
+
+    fn key_identity(&self, event: &KeyEvent) -> crate::KeyIdentity {
+        let mut identity = key_identity_from_keysym(event.keysym.raw());
+        let Some(raw_code) = event.raw_code.checked_add(8) else {
+            return identity;
+        };
+        let keycode = xkb::Keycode::new(raw_code);
+        let Some(keymap) = self.xkb_keymap.as_ref() else {
+            return identity;
+        };
+        if let Some(name) = keymap.key_get_name(keycode)
+            && let Some(keypad) = keypad_key_from_xkb_name(name)
+        {
+            identity.location = crate::KeyLocation::Numpad;
+            identity.keypad = Some(keypad);
+        }
+        let layout = self
+            .xkb_state
+            .as_ref()
+            .map_or(0, |state| state.key_get_layout(keycode));
+        identity.base_codepoint = keymap
+            .key_get_syms_by_level(keycode, 0, 0)
+            .first()
+            .and_then(|keysym| crate::keysym_character(keysym.raw()));
+        identity.shifted_codepoint = keymap
+            .key_get_syms_by_level(keycode, layout, 1)
+            .first()
+            .and_then(|keysym| crate::keysym_character(keysym.raw()));
+        identity
     }
 
     fn bump_text_input_commit(&mut self) -> Option<u32> {
         self.text_input_commits = self.text_input_commits.checked_add(1)?;
         Some(self.text_input_commits)
     }
+}
+
+fn keypad_key_from_xkb_name(name: &str) -> Option<crate::KeypadKey> {
+    use crate::KeypadKey;
+    Some(match name {
+        "KP0" => KeypadKey::Digit(0),
+        "KP1" => KeypadKey::Digit(1),
+        "KP2" => KeypadKey::Digit(2),
+        "KP3" => KeypadKey::Digit(3),
+        "KP4" => KeypadKey::Digit(4),
+        "KP5" => KeypadKey::Digit(5),
+        "KP6" => KeypadKey::Digit(6),
+        "KP7" => KeypadKey::Digit(7),
+        "KP8" => KeypadKey::Digit(8),
+        "KP9" => KeypadKey::Digit(9),
+        "KPDL" => KeypadKey::Decimal,
+        "KPCO" | "KPSP" => KeypadKey::Separator,
+        "KPAD" => KeypadKey::Add,
+        "KPSU" => KeypadKey::Subtract,
+        "KPMU" => KeypadKey::Multiply,
+        "KPDV" => KeypadKey::Divide,
+        "KPEQ" => KeypadKey::Equal,
+        "KPEN" => KeypadKey::Enter,
+        _ => return None,
+    })
 }
 
 impl PointerHandler for WaylandState {
@@ -1461,7 +1547,7 @@ mod key_repeat_tests {
 
     use smithay_client_toolkit::seat::keyboard::{KeyEvent, Keysym, RepeatInfo};
 
-    use super::{KeyRepeatState, parse_digit_row_keycodes};
+    use super::{KeyRepeatState, keypad_key_from_xkb_name, parse_digit_row_keycodes};
 
     fn key(raw_code: u32, keysym: u32) -> KeyEvent {
         KeyEvent {
@@ -1521,6 +1607,19 @@ mod key_repeat_tests {
         let parsed = parse_digit_row_keycodes("xkb_keycodes {\n <AE01> = 10;\n <AE09> = 18;\n};");
         assert_eq!(parsed.get(&2).map(|value| value.get()), Some(1));
         assert_eq!(parsed.get(&10).map(|value| value.get()), Some(9));
+    }
+
+    #[test]
+    fn xkb_key_names_keep_keypad_identity_independent_of_numlock_level() {
+        assert_eq!(
+            keypad_key_from_xkb_name("KP7"),
+            Some(crate::KeypadKey::Digit(7))
+        );
+        assert_eq!(
+            keypad_key_from_xkb_name("KPEN"),
+            Some(crate::KeypadKey::Enter)
+        );
+        assert_eq!(keypad_key_from_xkb_name("AE07"), None);
     }
 }
 

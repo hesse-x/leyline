@@ -168,6 +168,14 @@ mod tests {
             modifiers: leyline_gfx::ModifiersState::default(),
             shortcut_modifiers,
             logical_key,
+            identity: leyline_gfx::KeyIdentity {
+                logical: logical_key,
+                location: leyline_gfx::KeyLocation::Standard,
+                keypad: None,
+                base_codepoint: None,
+                shifted_codepoint: None,
+            },
+            keymap_generation: 1,
             state: KeyState::Pressed,
             repeat: false,
         }

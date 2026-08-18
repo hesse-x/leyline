@@ -5,6 +5,7 @@ readonly SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 readonly REPO_ROOT=$(cd -- "$SCRIPT_DIR/../.." && pwd -P)
 readonly BYTE_PROBE="$SCRIPT_DIR/byte-probe.sh"
 readonly CUSTOM_TERM=leyline-256color
+readonly MISSING_TERM=leyline-test-missing
 readonly TIMEOUT_SECONDS=5
 
 fail() {
@@ -110,10 +111,11 @@ missing_config="$case_root/missing.conf"
 missing_typescript="$case_root/missing.typescript"
 owned_sockets+=("$missing_socket")
 printf '%s\n' 'set -g default-terminal tmux-256color' >"$missing_config"
-TERM=xterm-256color tmux -S "$missing_socket" -f "$missing_config" \
+TERM=xterm-256color TERMINFO="$empty_db" TERMINFO_DIRS="$empty_db" \
+    tmux -S "$missing_socket" -f "$missing_config" \
     new-session -d -x 80 -y 24 -s missing 'exec sleep 30'
 printf -v missing_command 'TERM=%q TERMINFO=%q TERMINFO_DIRS=%q tmux -S %q attach-session -t missing' \
-    "$CUSTOM_TERM" "$empty_db" "$empty_db" "$missing_socket"
+    "$MISSING_TERM" "$empty_db" "$empty_db" "$missing_socket"
 set +e
 timeout --foreground 3s script -qefc "$missing_command" "$missing_typescript" </dev/null >/dev/null
 missing_status=$?

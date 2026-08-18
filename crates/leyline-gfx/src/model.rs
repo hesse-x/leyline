@@ -204,6 +204,8 @@ pub struct ModifiersState {
     pub alt: bool,
     pub super_key: bool,
     pub alt_graph: bool,
+    pub caps_lock: bool,
+    pub num_lock: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -222,6 +224,8 @@ pub struct KeyInput {
     pub modifiers: ModifiersState,
     pub shortcut_modifiers: crate::ModifierMask,
     pub logical_key: crate::LogicalKey,
+    pub identity: crate::KeyIdentity,
+    pub keymap_generation: u64,
     pub state: KeyState,
     pub repeat: bool,
 }

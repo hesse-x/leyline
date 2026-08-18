@@ -2,6 +2,7 @@ mod core;
 pub mod cwd;
 mod debug_grid;
 mod input;
+mod protocol;
 mod search;
 mod snapshot;
 
@@ -12,8 +13,9 @@ pub use core::{
 };
 pub use debug_grid::format_debug_grid;
 pub use input::{
-    ButtonState, InputError, MAX_PASTE_BODY_BYTES, MAX_TRANSACTION_BYTES, Modifiers, MouseButton,
-    TerminalKey, commit_text, encode_alternate_scroll, encode_focus, encode_key, encode_mouse,
+    ButtonState, EncodedKey, IgnoreReason, InputError, KeyboardEventKind, MAX_PASTE_BODY_BYTES,
+    MAX_TRANSACTION_BYTES, Modifiers, MouseButton, TerminalKey, TerminalKeyboardEvent, commit_text,
+    encode_alternate_scroll, encode_focus, encode_key, encode_keyboard_event, encode_mouse,
     paste_transaction,
 };
 pub use search::{
@@ -24,6 +26,7 @@ pub use search::{
 };
 pub use snapshot::{
     CellFlags, CellWidth, CursorBlink, CursorShape, CursorSnapshot, FrameSnapshot, GridSize,
-    MouseEncoding, MouseProtocol, ProjectedSelection, SearchBuffer, SelectionKind, SelectionPoint,
-    SelectionSide, SnapshotCell, SnapshotHyperlink, TerminalColor, TerminalModes, UnderlineStyle,
+    KeyboardProtocolState, KittyKeyboardFlags, ModifyOtherKeysLevel, MouseEncoding, MouseProtocol,
+    ProjectedSelection, SearchBuffer, SelectionKind, SelectionPoint, SelectionSide, SnapshotCell,
+    SnapshotHyperlink, TerminalColor, TerminalModes, UnderlineStyle,
 };

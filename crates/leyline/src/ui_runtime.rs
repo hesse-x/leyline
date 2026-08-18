@@ -1,4 +1,5 @@
 use std::{
+    collections::{HashMap, HashSet},
     num::NonZeroU8,
     sync::Arc,
     time::{Duration, Instant},
@@ -39,6 +40,14 @@ struct SearchDialogDrag {
     grab_offset: [i64; 2],
 }
 
+#[derive(Clone, Copy, Debug)]
+struct PressedTerminalKey {
+    owner: crate::tab::SessionId,
+    identity: leyline_gfx::KeyIdentity,
+    associated_text_allowed: bool,
+    foreground_process_group: Option<u32>,
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct UiRuntime {
     state: RuntimeState,
@@ -58,6 +67,8 @@ pub struct UiRuntime {
     modifiers: leyline_gfx::ModifiersState,
     terminal_control_gesture: bool,
     keyboard_focused: bool,
+    local_pressed_keys: HashSet<(leyline_gfx::SeatToken, u32)>,
+    terminal_pressed_keys: HashMap<(leyline_gfx::SeatToken, u32), PressedTerminalKey>,
     cursor_blink_visible: bool,
     cursor_blink_deadline: Option<Instant>,
     selecting: bool,
@@ -106,6 +117,7 @@ const DRAG_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
 const CLIPBOARD_RESULT_BUDGET: usize = 2;
+const MAX_PRESSED_KEYS: usize = 256;
 
 impl UiRuntime {
     fn active_session(&self) -> &TerminalSession {
@@ -430,6 +442,8 @@ impl UiRuntime {
             modifiers: leyline_gfx::ModifiersState::default(),
             terminal_control_gesture: false,
             keyboard_focused: false,
+            local_pressed_keys: HashSet::new(),
+            terminal_pressed_keys: HashMap::new(),
             cursor_blink_visible: true,
             cursor_blink_deadline: None,
             selecting: false,
@@ -508,6 +522,8 @@ impl UiRuntime {
                         }
                         self.active_session_mut().focus_changed(focused)?;
                         if !focused {
+                            self.local_pressed_keys.clear();
+                            self.terminal_pressed_keys.clear();
                             self.terminal_control_gesture = false;
                             self.cancel_paste_confirmation()?;
                             self.cancel_pointer_gesture();
@@ -943,24 +959,46 @@ impl UiRuntime {
     }
 
     fn handle_key(&mut self, key: &leyline_gfx::KeyInput) -> Result<(), UiRuntimeError> {
-        if self.handle_paste_confirmation_key(key)? {
+        let physical = (key.serial.seat, key.physical_keycode);
+        if key.state == leyline_gfx::KeyState::Released {
+            if self.local_pressed_keys.remove(&physical) {
+                return Ok(());
+            }
+            if let Some(pressed) = self.terminal_pressed_keys.remove(&physical) {
+                return self.send_terminal_keyboard_event(
+                    key,
+                    pressed,
+                    crate::terminal::KeyboardEventKind::Release,
+                );
+            }
             return Ok(());
         }
-        if key.state == leyline_gfx::KeyState::Released {
+        if key.repeat
+            && let Some(pressed) = self.terminal_pressed_keys.get(&physical).copied()
+        {
+            return self.send_terminal_keyboard_event(
+                key,
+                pressed,
+                crate::terminal::KeyboardEventKind::Repeat,
+            );
+        }
+        if self.handle_paste_confirmation_key(key)? {
+            self.remember_local_key(physical);
             return Ok(());
         }
         self.last_input_serial = Some(key.serial);
         if should_cancel_search(self.active_session().search().is_open(), key.logical_key) {
             self.execute_action(crate::config::Action::CancelSearch)?;
+            self.remember_local_key(physical);
             return Ok(());
         }
         if self.search_focused
             && self.active_session().search().is_open()
             && self.handle_search_key(key)?
         {
+            self.remember_local_key(physical);
             return Ok(());
         }
-        let modifiers = terminal_modifiers(key);
         if let Some(action) = self.resolve_shortcut(key) {
             tracing::debug!(
                 ?action,
@@ -970,46 +1008,108 @@ impl UiRuntime {
             if !(key.repeat && ignores_key_repeat(action)) {
                 self.execute_action(action)?;
             }
+            self.remember_local_key(physical);
             return Ok(());
         }
-        let terminal_key = match key.logical_key {
-            leyline_gfx::LogicalKey::Backspace => Some(crate::terminal::TerminalKey::Backspace),
-            leyline_gfx::LogicalKey::Tab => Some(crate::terminal::TerminalKey::Tab),
-            leyline_gfx::LogicalKey::Enter => Some(crate::terminal::TerminalKey::Enter),
-            leyline_gfx::LogicalKey::Escape => Some(crate::terminal::TerminalKey::Escape),
-            leyline_gfx::LogicalKey::ArrowUp => Some(crate::terminal::TerminalKey::Up),
-            leyline_gfx::LogicalKey::ArrowDown => Some(crate::terminal::TerminalKey::Down),
-            leyline_gfx::LogicalKey::ArrowLeft => Some(crate::terminal::TerminalKey::Left),
-            leyline_gfx::LogicalKey::ArrowRight => Some(crate::terminal::TerminalKey::Right),
-            leyline_gfx::LogicalKey::Home => Some(crate::terminal::TerminalKey::Home),
-            leyline_gfx::LogicalKey::End => Some(crate::terminal::TerminalKey::End),
-            leyline_gfx::LogicalKey::Insert => Some(crate::terminal::TerminalKey::Insert),
-            leyline_gfx::LogicalKey::Delete => Some(crate::terminal::TerminalKey::Delete),
-            leyline_gfx::LogicalKey::PageUp => Some(crate::terminal::TerminalKey::PageUp),
-            leyline_gfx::LogicalKey::PageDown => Some(crate::terminal::TerminalKey::PageDown),
-            leyline_gfx::LogicalKey::Function(number) => {
-                Some(crate::terminal::TerminalKey::Function(number))
-            }
-            _ => None,
+        if key.repeat && self.local_pressed_keys.contains(&physical) {
+            return Ok(());
+        }
+        if self
+            .local_pressed_keys
+            .len()
+            .saturating_add(self.terminal_pressed_keys.len())
+            >= MAX_PRESSED_KEYS
+        {
+            self.local_pressed_keys.clear();
+            self.terminal_pressed_keys.clear();
+            self.remember_local_key(physical);
+            tracing::warn!(
+                category = "pressed_key_overflow",
+                "pressed-key ownership table reset"
+            );
+            return Ok(());
+        }
+        let pressed = PressedTerminalKey {
+            owner: self
+                .tabs
+                .active_id()
+                .expect("runtime always has an active tab"),
+            identity: key.identity,
+            // Text-input focus is normally active for the whole terminal focus lifetime.
+            // Only an actual preedit proves that the IME currently owns text composition.
+            associated_text_allowed: xkb_text_allowed(&self.ime),
+            foreground_process_group: self.active_session().foreground_process_group(),
         };
-        if let Some(key) = terminal_key {
-            self.active_session_mut().input_key(key, modifiers)?;
-        } else if let Some(text) = key_text(key) {
-            if modifiers.control || modifiers.alt {
-                if let Some(ch) = match key.logical_key {
-                    leyline_gfx::LogicalKey::Character(ch) => Some(ch),
-                    _ => text.chars().next(),
-                } {
-                    self.active_session_mut()
-                        .input_key(crate::terminal::TerminalKey::Char(ch), modifiers)?;
-                    if modifiers.control {
-                        self.terminal_control_gesture = true;
-                    }
-                }
-            } else {
-                // Wayland still delivers unconsumed printable keys while text-input is enabled.
-                self.active_session_mut().commit_text(&text)?;
-            }
+        self.terminal_pressed_keys.insert(physical, pressed);
+        self.send_terminal_keyboard_event(key, pressed, crate::terminal::KeyboardEventKind::Press)
+    }
+
+    fn remember_local_key(&mut self, physical: (leyline_gfx::SeatToken, u32)) {
+        if !self.local_pressed_keys.contains(&physical)
+            && self
+                .local_pressed_keys
+                .len()
+                .saturating_add(self.terminal_pressed_keys.len())
+                >= MAX_PRESSED_KEYS
+        {
+            self.local_pressed_keys.clear();
+            self.terminal_pressed_keys.clear();
+            tracing::warn!(
+                category = "pressed_key_overflow",
+                "pressed-key ownership table reset"
+            );
+        }
+        self.local_pressed_keys.insert(physical);
+    }
+
+    fn send_terminal_keyboard_event(
+        &mut self,
+        key: &leyline_gfx::KeyInput,
+        pressed: PressedTerminalKey,
+        kind: crate::terminal::KeyboardEventKind,
+    ) -> Result<(), UiRuntimeError> {
+        let modifiers = terminal_modifiers(key);
+        let text = if kind == crate::terminal::KeyboardEventKind::Release {
+            None
+        } else {
+            key_text(key)
+        };
+        let event = crate::terminal::TerminalKeyboardEvent {
+            identity: pressed.identity,
+            text: text.clone(),
+            modifiers,
+            caps_lock: key.modifiers.caps_lock,
+            num_lock: key.modifiers.num_lock,
+            kind,
+            associated_text_allowed: pressed.associated_text_allowed,
+        };
+        let Some(owner) = self.tabs.get_mut(pressed.owner) else {
+            return Ok(());
+        };
+        let current_process_group = owner.session.foreground_process_group();
+        if kind != crate::terminal::KeyboardEventKind::Press
+            && terminal_key_owner_changed(pressed.foreground_process_group, current_process_group)
+        {
+            tracing::debug!(
+                pressed_process_group = pressed.foreground_process_group,
+                current_process_group,
+                ?kind,
+                "discarding keyboard event after foreground job change"
+            );
+            return Ok(());
+        }
+        let fallback = owner.session.input_keyboard_event(&event)?;
+        if fallback
+            && pressed.associated_text_allowed
+            && let Some(text) = text
+        {
+            let Some(owner) = self.tabs.get_mut(pressed.owner) else {
+                return Ok(());
+            };
+            owner.session.commit_text(&text)?;
+        }
+        if starts_terminal_control_gesture(pressed.identity.logical, modifiers, kind) {
+            self.terminal_control_gesture = true;
         }
         Ok(())
     }
@@ -2713,6 +2813,20 @@ fn terminal_modifiers(key: &leyline_gfx::KeyInput) -> crate::terminal::Modifiers
     }
 }
 
+fn starts_terminal_control_gesture(
+    key: leyline_gfx::LogicalKey,
+    modifiers: crate::terminal::Modifiers,
+    kind: crate::terminal::KeyboardEventKind,
+) -> bool {
+    modifiers.control
+        && kind != crate::terminal::KeyboardEventKind::Release
+        && !matches!(key, leyline_gfx::LogicalKey::Modifier { .. })
+}
+
+fn terminal_key_owner_changed(expected: Option<u32>, current: Option<u32>) -> bool {
+    matches!((expected, current), (Some(expected), Some(current)) if expected != current)
+}
+
 fn key_text(key: &leyline_gfx::KeyInput) -> Option<String> {
     key.utf8
         .as_ref()
@@ -2722,6 +2836,10 @@ fn key_text(key: &leyline_gfx::KeyInput) -> Option<String> {
             leyline_gfx::LogicalKey::Character(ch) => Some(ch.to_string()),
             _ => None,
         })
+}
+
+fn xkb_text_allowed(ime: &crate::interaction::ImeState) -> bool {
+    !ime.has_preedit()
 }
 
 fn visible_search_query(
@@ -2817,8 +2935,9 @@ mod tests {
     use super::{
         accumulate_wheel_steps, format_terminal_query, ignores_key_repeat,
         keep_selection_after_release, key_text, search_query_capacity, select_new_tab_cwd,
-        should_cancel_search, take_matching_pending, terminal_modifiers, visible_search_query,
-        visual_mapping_changed,
+        should_cancel_search, starts_terminal_control_gesture, take_matching_pending,
+        terminal_key_owner_changed, terminal_modifiers, visible_search_query,
+        visual_mapping_changed, xkb_text_allowed,
     };
 
     #[test]
@@ -2897,6 +3016,8 @@ mod tests {
             modifiers: leyline_gfx::ModifiersState::default(),
             shortcut_modifiers: leyline_gfx::ModifierMask::empty(),
             logical_key: leyline_gfx::logical_key_from_keysym(keysym),
+            identity: leyline_gfx::key_identity_from_keysym(keysym),
+            keymap_generation: 1,
             state: leyline_gfx::KeyState::Pressed,
             repeat: false,
         }
@@ -2922,6 +3043,46 @@ mod tests {
         );
         assert_eq!(key_text(&key(0x0100_4e2d, None)).as_deref(), Some("中"));
         assert_eq!(key_text(&key(0xff51, None)), None);
+    }
+
+    #[test]
+    fn text_input_focus_does_not_suppress_unconsumed_keyboard_text() {
+        let mut ime = crate::interaction::ImeState::default();
+        ime.activate();
+        assert!(xkb_text_allowed(&ime));
+
+        ime.preedit_string("compose".into(), None).unwrap();
+        assert!(!xkb_text_allowed(&ime));
+    }
+
+    #[test]
+    fn pressing_control_alone_does_not_disable_application_shortcuts() {
+        let modifiers = crate::terminal::Modifiers {
+            control: true,
+            shift: true,
+            ..crate::terminal::Modifiers::default()
+        };
+        assert!(!starts_terminal_control_gesture(
+            leyline_gfx::LogicalKey::Modifier {
+                kind: leyline_gfx::ModifierKind::Control,
+                side: leyline_gfx::KeySide::Left,
+            },
+            modifiers,
+            crate::terminal::KeyboardEventKind::Press,
+        ));
+        assert!(starts_terminal_control_gesture(
+            leyline_gfx::LogicalKey::Character('c'),
+            modifiers,
+            crate::terminal::KeyboardEventKind::Press,
+        ));
+    }
+
+    #[test]
+    fn foreground_job_change_discards_late_key_events() {
+        assert!(terminal_key_owner_changed(Some(41), Some(42)));
+        assert!(!terminal_key_owner_changed(Some(41), Some(41)));
+        assert!(!terminal_key_owner_changed(None, Some(42)));
+        assert!(!terminal_key_owner_changed(Some(41), None));
     }
 
     #[test]

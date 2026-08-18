@@ -10,6 +10,7 @@ use alacritty_terminal::{
     vte::ansi::{self, Color, NamedColor, Rgb},
 };
 
+use super::protocol::{KeyboardProtocolTracker, ProtocolAudit};
 use super::search::{
     CompiledLiteral, CompiledRegex, RegexScanCursor, RegexScanStep, SearchAnchor, SearchBudget,
     SearchContentId, SearchError, SearchMatch, SearchProjection, SearchScanCursor, SearchScanStep,
@@ -105,6 +106,10 @@ pub struct ParseAuditDelta {
     pub query_replies: u32,
     pub query_rejected: u32,
     pub display_state_fallbacks: u32,
+    pub keyboard_protocol_changes: u32,
+    pub keyboard_queries: u32,
+    pub keyboard_unknown_flags: u32,
+    pub keyboard_stack_overflow: u32,
 }
 
 #[derive(Default)]
@@ -138,6 +143,7 @@ pub struct TerminalCoreAdapter {
     cached: RefCell<Option<FrameSnapshot>>,
     selection_revision: u64,
     sync_epoch: u64,
+    keyboard_protocol: KeyboardProtocolTracker,
     _main_thread: Rc<()>,
 }
 
@@ -176,6 +182,7 @@ impl TerminalCoreAdapter {
             cached: RefCell::new(None),
             selection_revision: 0,
             sync_epoch: 0,
+            keyboard_protocol: KeyboardProtocolTracker::default(),
             _main_thread: Rc::new(()),
         })
     }
@@ -187,8 +194,15 @@ impl TerminalCoreAdapter {
         if bytes.len() > ByteBatch::MAX_LEN {
             return Err(TerminalError::BatchTooLarge(bytes.len()));
         }
+        let (keyboard_replies, keyboard_audit) = self.keyboard_protocol.advance(bytes);
         let was_pending = self.parser.sync_timeout().sync_timeout().is_some();
-        self.parser.advance(&mut self.term, bytes);
+        let mut start = 0;
+        for (offset, reply) in keyboard_replies {
+            self.parser.advance(&mut self.term, &bytes[start..=offset]);
+            self.queue_keyboard_reply(reply);
+            start = offset.saturating_add(1);
+        }
+        self.parser.advance(&mut self.term, &bytes[start..]);
         let commits = self.parser.take_sync_commit_delta();
         let is_pending = self.parser.sync_timeout().sync_timeout().is_some();
         if is_pending && (!was_pending || commits.explicit != 0 || commits.capacity != 0) {
@@ -204,7 +218,7 @@ impl TerminalCoreAdapter {
             return Ok(TerminalDelta {
                 dirty: false,
                 actions: self.actions.len(),
-                audit: merge_audit(event_audit, parser_audit, commits.capacity),
+                audit: merge_audit(event_audit, parser_audit, commits.capacity, keyboard_audit),
             });
         }
         self.bump_content_revision()?;
@@ -219,7 +233,8 @@ impl TerminalCoreAdapter {
                     .saturating_add(parser_audit.unknown_sequences),
                 rejected_actions: event_audit
                     .rejected_actions
-                    .saturating_add(parser_audit.rejected_actions),
+                    .saturating_add(parser_audit.rejected_actions)
+                    .saturating_add(keyboard_audit.rejected),
                 truncated_sequences: parser_audit.truncated_sequences,
                 reply_bytes: event_audit.reply_bytes,
                 sync_forced_commits: commits.capacity,
@@ -227,8 +242,16 @@ impl TerminalCoreAdapter {
                 query_replies: event_audit.query_replies,
                 query_rejected: event_audit.query_rejected,
                 display_state_fallbacks: 0,
+                keyboard_protocol_changes: keyboard_audit.changes,
+                keyboard_queries: keyboard_audit.queries,
+                keyboard_unknown_flags: keyboard_audit.unknown_flags,
+                keyboard_stack_overflow: keyboard_audit.stack_overflow,
             },
         })
+    }
+
+    pub fn reset_keyboard_protocol(&mut self) {
+        self.keyboard_protocol.reset();
     }
 
     #[must_use]
@@ -257,7 +280,7 @@ impl TerminalCoreAdapter {
         self.bump_content_revision()?;
         self.cached.get_mut().take();
         let event_audit = self.collect_events();
-        let mut audit = merge_audit(event_audit, parser_audit, 0);
+        let mut audit = merge_audit(event_audit, parser_audit, 0, ProtocolAudit::default());
         audit.sync_timeouts = u32::from(matches!(reason, SyncFlushReason::Timeout));
         Ok(TerminalDelta {
             dirty: true,
@@ -751,7 +774,7 @@ impl TerminalCoreAdapter {
                     CursorBlink::Steady
                 },
             },
-            modes: map_modes(mode),
+            modes: map_modes(mode, self.keyboard_protocol.state()),
             display_offset: content.display_offset,
             history_size: self.term.history_size(),
             title: self.title.clone(),
@@ -815,7 +838,13 @@ impl TerminalCoreAdapter {
         self.term.selection_to_string()
     }
     pub fn input_modes(&self) -> TerminalModes {
-        map_modes(*self.term.mode())
+        map_modes(*self.term.mode(), self.keyboard_protocol.state())
+    }
+
+    fn queue_keyboard_reply(&mut self, reply: Vec<u8>) {
+        if let Ok(reply) = String::from_utf8(reply) {
+            self.events.borrow_mut().events.push(Event::PtyWrite(reply));
+        }
     }
 
     #[must_use]
@@ -982,12 +1011,13 @@ fn map_selection_side(side: SelectionSide) -> Side {
     }
 }
 
-fn map_modes(mode: TermMode) -> TerminalModes {
+fn map_modes(mode: TermMode, keyboard: super::KeyboardProtocolState) -> TerminalModes {
     TerminalModes {
         alternate_screen: mode.contains(TermMode::ALT_SCREEN),
         bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
         application_cursor: mode.contains(TermMode::APP_CURSOR),
         application_keypad: mode.contains(TermMode::APP_KEYPAD),
+        keyboard,
         focus_reporting: mode.contains(TermMode::FOCUS_IN_OUT),
         alternate_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
         mouse_protocol: if mode.contains(TermMode::MOUSE_MOTION) {
@@ -1090,6 +1120,7 @@ fn merge_audit(
     event: ParseAuditDelta,
     parser: alacritty_terminal::vte::ParseAuditDelta,
     forced_commits: u32,
+    keyboard: ProtocolAudit,
 ) -> ParseAuditDelta {
     ParseAuditDelta {
         unknown_sequences: event
@@ -1097,7 +1128,8 @@ fn merge_audit(
             .saturating_add(parser.unknown_sequences),
         rejected_actions: event
             .rejected_actions
-            .saturating_add(parser.rejected_actions),
+            .saturating_add(parser.rejected_actions)
+            .saturating_add(keyboard.rejected),
         truncated_sequences: parser.truncated_sequences,
         reply_bytes: event.reply_bytes,
         sync_forced_commits: forced_commits,
@@ -1105,6 +1137,16 @@ fn merge_audit(
         query_replies: event.query_replies,
         query_rejected: event.query_rejected,
         display_state_fallbacks: event.display_state_fallbacks,
+        keyboard_protocol_changes: event
+            .keyboard_protocol_changes
+            .saturating_add(keyboard.changes),
+        keyboard_queries: event.keyboard_queries.saturating_add(keyboard.queries),
+        keyboard_unknown_flags: event
+            .keyboard_unknown_flags
+            .saturating_add(keyboard.unknown_flags),
+        keyboard_stack_overflow: event
+            .keyboard_stack_overflow
+            .saturating_add(keyboard.stack_overflow),
     }
 }
 fn default_cell() -> SnapshotCell {
@@ -1253,6 +1295,41 @@ mod tests {
             replies.iter().map(Vec::len).sum::<usize>()
         );
         assert!(delta.audit.reply_bytes <= MAX_PTY_REPLY_BYTES);
+    }
+
+    #[test]
+    fn keyboard_protocol_state_query_and_screen_lifecycle_form_a_closed_loop() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(20, 4).unwrap(), 0).unwrap();
+        let delta = core
+            .advance(b"\x1b[=3;1u\x1b[>4;2m\x1b[?u\x1b[?4m")
+            .unwrap();
+        assert_eq!(core.input_modes().keyboard.kitty.bits(), 3);
+        assert_eq!(
+            core.input_modes().keyboard.modify_other_keys,
+            super::super::ModifyOtherKeysLevel::All
+        );
+        let mut actions = Vec::new();
+        core.drain_actions(&mut actions);
+        let replies: Vec<_> = actions
+            .into_iter()
+            .filter_map(|action| match action {
+                TerminalAction::WriteToPty(bytes) => Some(bytes),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(replies, [b"\x1b[?3u".to_vec(), b"\x1b[>4;2m".to_vec()]);
+        assert_eq!(delta.audit.keyboard_queries, 2);
+        assert_eq!(delta.audit.keyboard_protocol_changes, 2);
+
+        core.advance(b"\x1b[?1049h\x1b[=8u").unwrap();
+        assert_eq!(core.input_modes().keyboard.kitty.bits(), 8);
+        core.advance(b"\x1b[?1049l").unwrap();
+        assert_eq!(core.input_modes().keyboard.kitty.bits(), 3);
+        core.advance(b"\x1bc").unwrap();
+        assert_eq!(
+            core.input_modes().keyboard,
+            super::super::KeyboardProtocolState::default()
+        );
     }
 
     #[test]

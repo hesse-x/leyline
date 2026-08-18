@@ -1,4 +1,6 @@
+use super::{KittyKeyboardFlags, ModifyOtherKeysLevel};
 use super::{MouseEncoding, MouseProtocol, TerminalModes};
+use leyline_gfx::{KeyIdentity, KeyLocation, KeySide, KeypadKey, LogicalKey, ModifierKind};
 
 const MAX_COMMIT_BYTES: usize = 64 * 1024;
 pub const MAX_TRANSACTION_BYTES: usize = 1024 * 1024;
@@ -31,6 +33,454 @@ pub enum TerminalKey {
     PageDown,
     Function(u8),
     Char(char),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KeyboardEventKind {
+    Press,
+    Repeat,
+    Release,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalKeyboardEvent {
+    pub identity: KeyIdentity,
+    pub text: Option<String>,
+    pub modifiers: Modifiers,
+    pub caps_lock: bool,
+    pub num_lock: bool,
+    pub kind: KeyboardEventKind,
+    pub associated_text_allowed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum EncodedKey {
+    Bytes(Vec<u8>),
+    TextFallback,
+    Ignored(IgnoreReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IgnoreReason {
+    ReleaseNotReported,
+    UnknownKey,
+}
+
+const MAX_ENCODED_KEY_BYTES: usize = 256;
+const MAX_ASSOCIATED_TEXT_BYTES: usize = 64;
+const MAX_ASSOCIATED_TEXT_SCALARS: usize = 16;
+
+#[allow(clippy::missing_errors_doc)]
+pub fn encode_keyboard_event(
+    event: &TerminalKeyboardEvent,
+    modes: TerminalModes,
+) -> Result<EncodedKey, InputError> {
+    let kitty = modes.keyboard.kitty;
+    if !kitty.is_empty() || matches!(event.identity.logical, LogicalKey::Function(13..=35)) {
+        return encode_kitty(event, kitty, modes);
+    }
+    if event.kind == KeyboardEventKind::Release {
+        return Ok(EncodedKey::Ignored(IgnoreReason::ReleaseNotReported));
+    }
+    if let Some(encoded) = encode_modify_other_keys(event, modes.keyboard.modify_other_keys)? {
+        return Ok(EncodedKey::Bytes(encoded));
+    }
+    if event.identity.location == KeyLocation::Numpad {
+        return encode_keypad(event, modes);
+    }
+    let Some(key) = terminal_key(event.identity.logical) else {
+        return if event.text.is_some() {
+            Ok(EncodedKey::TextFallback)
+        } else {
+            Ok(EncodedKey::Ignored(IgnoreReason::UnknownKey))
+        };
+    };
+    if matches!(key, TerminalKey::Char(_)) && !event.modifiers.control && !event.modifiers.alt {
+        return Ok(EncodedKey::TextFallback);
+    }
+    Ok(EncodedKey::Bytes(encode_key(key, event.modifiers, modes)?))
+}
+
+fn encode_kitty(
+    event: &TerminalKeyboardEvent,
+    flags: KittyKeyboardFlags,
+    modes: TerminalModes,
+) -> Result<EncodedKey, InputError> {
+    let text_key = matches!(event.identity.logical, LogicalKey::Character(_));
+    let legacy_functional = terminal_key(event.identity.logical).filter(|key| {
+        matches!(
+            key,
+            TerminalKey::Up
+                | TerminalKey::Down
+                | TerminalKey::Left
+                | TerminalKey::Right
+                | TerminalKey::Home
+                | TerminalKey::End
+                | TerminalKey::Insert
+                | TerminalKey::Delete
+                | TerminalKey::PageUp
+                | TerminalKey::PageDown
+                | TerminalKey::Function(1..=12)
+        )
+    });
+    if event.identity.location != KeyLocation::Numpad
+        && let Some(key) = legacy_functional
+    {
+        if flags.contains(KittyKeyboardFlags::REPORT_EVENTS) {
+            return encode_kitty_legacy_functional(key, event).map(EncodedKey::Bytes);
+        }
+        if event.kind == KeyboardEventKind::Release {
+            return Ok(EncodedKey::Ignored(IgnoreReason::ReleaseNotReported));
+        }
+        return encode_key(key, event.modifiers, modes).map(EncodedKey::Bytes);
+    }
+    let reset_key = matches!(
+        event.identity.logical,
+        LogicalKey::Backspace | LogicalKey::Tab | LogicalKey::Enter
+    );
+    if reset_key
+        && event.kind == KeyboardEventKind::Release
+        && !flags.contains(KittyKeyboardFlags::ALL_KEYS)
+    {
+        return Ok(EncodedKey::Ignored(IgnoreReason::ReleaseNotReported));
+    }
+    let special_disambiguated = matches!(
+        event.identity.logical,
+        LogicalKey::Backspace | LogicalKey::Tab | LogicalKey::Enter | LogicalKey::Escape
+    ) || (text_key && (event.modifiers.alt || event.modifiers.control));
+    let use_csi = flags.contains(KittyKeyboardFlags::ALL_KEYS)
+        || event.identity.location == KeyLocation::Numpad
+        || matches!(event.identity.logical, LogicalKey::Function(13..=35))
+        || (!reset_key && !text_key && flags.contains(KittyKeyboardFlags::REPORT_EVENTS))
+        || (flags.contains(KittyKeyboardFlags::DISAMBIGUATE) && special_disambiguated);
+    if !use_csi {
+        if event.kind == KeyboardEventKind::Release {
+            return Ok(EncodedKey::Ignored(IgnoreReason::ReleaseNotReported));
+        }
+        if text_key && !event.modifiers.alt && !event.modifiers.control {
+            return Ok(EncodedKey::TextFallback);
+        }
+        let Some(key) = terminal_key(event.identity.logical) else {
+            return Ok(EncodedKey::Ignored(IgnoreReason::UnknownKey));
+        };
+        return Ok(EncodedKey::Bytes(encode_key(key, event.modifiers, modes)?));
+    }
+    if event.kind == KeyboardEventKind::Release
+        && !flags.contains(KittyKeyboardFlags::REPORT_EVENTS)
+    {
+        return Ok(EncodedKey::Ignored(IgnoreReason::ReleaseNotReported));
+    }
+    let Some(code) = kitty_key_code(&event.identity) else {
+        return Ok(EncodedKey::Ignored(IgnoreReason::UnknownKey));
+    };
+    let mut output = format!("\x1b[{code}");
+    append_kitty_alternate_keys(&mut output, event, flags);
+    output.push(';');
+    output.push_str(&kitty_modifiers(event).to_string());
+    if flags.contains(KittyKeyboardFlags::REPORT_EVENTS) {
+        output.push(':');
+        output.push(char::from(b'0' + kitty_event_type(event.kind)));
+    }
+    append_kitty_associated_text(&mut output, event, flags)?;
+    output.push('u');
+    checked_key_bytes(output.into_bytes()).map(EncodedKey::Bytes)
+}
+
+fn append_kitty_alternate_keys(
+    output: &mut String,
+    event: &TerminalKeyboardEvent,
+    flags: KittyKeyboardFlags,
+) {
+    if !flags.contains(KittyKeyboardFlags::ALTERNATE_KEYS) {
+        return;
+    }
+    let shifted = event
+        .modifiers
+        .shift
+        .then_some(event.identity.shifted_codepoint)
+        .flatten();
+    let base = event.identity.base_codepoint;
+    if shifted.is_some() || base.is_some() {
+        output.push(':');
+    }
+    if let Some(shifted) = shifted {
+        push_codepoint(output, shifted);
+    }
+    if let Some(base) = base {
+        output.push(':');
+        push_codepoint(output, base);
+    }
+}
+
+fn append_kitty_associated_text(
+    output: &mut String,
+    event: &TerminalKeyboardEvent,
+    flags: KittyKeyboardFlags,
+) -> Result<(), InputError> {
+    if !flags.contains(KittyKeyboardFlags::ASSOCIATED_TEXT)
+        || !event.associated_text_allowed
+        || event.kind == KeyboardEventKind::Release
+    {
+        return Ok(());
+    }
+    let Some(text) = event.text.as_deref() else {
+        return Ok(());
+    };
+    if text.len() > MAX_ASSOCIATED_TEXT_BYTES || text.chars().count() > MAX_ASSOCIATED_TEXT_SCALARS
+    {
+        return Err(InputError::AssociatedTextCapacity);
+    }
+    if text
+        .chars()
+        .any(|ch| ch <= '\u{1f}' || ('\u{7f}'..='\u{9f}').contains(&ch))
+    {
+        return Err(InputError::AssociatedTextControl);
+    }
+    if !text.is_empty() {
+        output.push(';');
+        for (index, ch) in text.chars().enumerate() {
+            if index != 0 {
+                output.push(':');
+            }
+            push_codepoint(output, ch);
+        }
+    }
+    Ok(())
+}
+
+const fn kitty_event_type(kind: KeyboardEventKind) -> u8 {
+    match kind {
+        KeyboardEventKind::Press => 1,
+        KeyboardEventKind::Repeat => 2,
+        KeyboardEventKind::Release => 3,
+    }
+}
+
+fn encode_kitty_legacy_functional(
+    key: TerminalKey,
+    event: &TerminalKeyboardEvent,
+) -> Result<Vec<u8>, InputError> {
+    let modifiers = kitty_modifiers(event);
+    let kind = kitty_event_type(event.kind);
+    let suffix = format!("{modifiers}:{kind}");
+    let output = match key {
+        TerminalKey::Up => format!("\x1b[1;{suffix}A"),
+        TerminalKey::Down => format!("\x1b[1;{suffix}B"),
+        TerminalKey::Right => format!("\x1b[1;{suffix}C"),
+        TerminalKey::Left => format!("\x1b[1;{suffix}D"),
+        TerminalKey::Home => format!("\x1b[1;{suffix}H"),
+        TerminalKey::End => format!("\x1b[1;{suffix}F"),
+        TerminalKey::Insert => format!("\x1b[2;{suffix}~"),
+        TerminalKey::Delete => format!("\x1b[3;{suffix}~"),
+        TerminalKey::PageUp => format!("\x1b[5;{suffix}~"),
+        TerminalKey::PageDown => format!("\x1b[6;{suffix}~"),
+        TerminalKey::Function(number @ 1..=4) => {
+            let final_byte = char::from(b'P' + number - 1);
+            format!("\x1b[1;{suffix}{final_byte}")
+        }
+        TerminalKey::Function(number @ 5..=12) => {
+            let code = [15, 17, 18, 19, 20, 21, 23, 24][usize::from(number - 5)];
+            format!("\x1b[{code};{suffix}~")
+        }
+        _ => return Err(InputError::UnknownKey),
+    };
+    checked_key_bytes(output.into_bytes())
+}
+
+fn encode_modify_other_keys(
+    event: &TerminalKeyboardEvent,
+    level: ModifyOtherKeysLevel,
+) -> Result<Option<Vec<u8>>, InputError> {
+    if level == ModifyOtherKeysLevel::Disabled || event.kind == KeyboardEventKind::Release {
+        return Ok(None);
+    }
+    let LogicalKey::Character(ch) = event.identity.logical else {
+        return Ok(None);
+    };
+    let modified = event.modifiers.shift || event.modifiers.alt || event.modifiers.control;
+    if !modified {
+        return Ok(None);
+    }
+    let base = event.identity.base_codepoint.unwrap_or(ch);
+    let well_defined = !event.modifiers.alt
+        && ((event.modifiers.shift && !event.modifiers.control)
+            || (event.modifiers.control
+                && (matches!(ch, '@'..='~' | ' ')
+                    || (!event.modifiers.shift && matches!(base, '2'..='8')))));
+    if level == ModifyOtherKeysLevel::ExceptWellDefined && well_defined {
+        return Ok(None);
+    }
+    let modifier_code = modifier_parameter(event.modifiers);
+    checked_key_bytes(format!("\x1b[27;{modifier_code};{}~", u32::from(ch)).into_bytes()).map(Some)
+}
+
+fn encode_keypad(
+    event: &TerminalKeyboardEvent,
+    modes: TerminalModes,
+) -> Result<EncodedKey, InputError> {
+    let Some(keypad) = event.identity.keypad else {
+        return if event.text.is_some() {
+            Ok(EncodedKey::TextFallback)
+        } else {
+            Ok(EncodedKey::Ignored(IgnoreReason::UnknownKey))
+        };
+    };
+    if !modes.application_keypad {
+        if event.text.is_some() {
+            return Ok(EncodedKey::TextFallback);
+        }
+        if let Some(key) = terminal_key(event.identity.logical)
+            && !matches!(key, TerminalKey::Char(_) | TerminalKey::Function(_))
+        {
+            return Ok(EncodedKey::Bytes(encode_key(key, event.modifiers, modes)?));
+        }
+        if let Some(key) = keypad_navigation(keypad) {
+            return Ok(EncodedKey::Bytes(encode_key(key, event.modifiers, modes)?));
+        }
+        return Ok(EncodedKey::Ignored(IgnoreReason::UnknownKey));
+    }
+    let final_byte = match keypad {
+        KeypadKey::Digit(digit @ 0..=9) => b'p' + digit,
+        KeypadKey::Decimal => b'n',
+        KeypadKey::Divide => b'o',
+        KeypadKey::Multiply => b'j',
+        KeypadKey::Subtract => b'm',
+        KeypadKey::Add => b'k',
+        KeypadKey::Separator => b'l',
+        KeypadKey::Equal => b'X',
+        KeypadKey::Enter => b'M',
+        navigation => {
+            if let Some(key) = keypad_navigation(navigation) {
+                return Ok(EncodedKey::Bytes(encode_key(key, event.modifiers, modes)?));
+            }
+            return Ok(EncodedKey::Ignored(IgnoreReason::UnknownKey));
+        }
+    };
+    let parameter = modifier_parameter(event.modifiers);
+    let bytes = if parameter == 1 {
+        vec![0x1b, b'O', final_byte]
+    } else {
+        format!("\x1b[1;{parameter}{}", char::from(final_byte)).into_bytes()
+    };
+    Ok(EncodedKey::Bytes(bytes))
+}
+
+fn keypad_navigation(key: KeypadKey) -> Option<TerminalKey> {
+    Some(match key {
+        KeypadKey::Home => TerminalKey::Home,
+        KeypadKey::End => TerminalKey::End,
+        KeypadKey::PageUp => TerminalKey::PageUp,
+        KeypadKey::PageDown => TerminalKey::PageDown,
+        KeypadKey::Insert => TerminalKey::Insert,
+        KeypadKey::Delete => TerminalKey::Delete,
+        KeypadKey::ArrowUp => TerminalKey::Up,
+        KeypadKey::ArrowDown => TerminalKey::Down,
+        KeypadKey::ArrowLeft => TerminalKey::Left,
+        KeypadKey::ArrowRight => TerminalKey::Right,
+        _ => return None,
+    })
+}
+
+fn terminal_key(key: LogicalKey) -> Option<TerminalKey> {
+    Some(match key {
+        LogicalKey::Backspace => TerminalKey::Backspace,
+        LogicalKey::Tab => TerminalKey::Tab,
+        LogicalKey::Enter => TerminalKey::Enter,
+        LogicalKey::Escape => TerminalKey::Escape,
+        LogicalKey::Insert => TerminalKey::Insert,
+        LogicalKey::Delete => TerminalKey::Delete,
+        LogicalKey::Home => TerminalKey::Home,
+        LogicalKey::End => TerminalKey::End,
+        LogicalKey::PageUp => TerminalKey::PageUp,
+        LogicalKey::PageDown => TerminalKey::PageDown,
+        LogicalKey::ArrowUp => TerminalKey::Up,
+        LogicalKey::ArrowDown => TerminalKey::Down,
+        LogicalKey::ArrowLeft => TerminalKey::Left,
+        LogicalKey::ArrowRight => TerminalKey::Right,
+        LogicalKey::Function(number) => TerminalKey::Function(number),
+        LogicalKey::Character(ch) => TerminalKey::Char(ch),
+        _ => return None,
+    })
+}
+
+fn kitty_key_code(identity: &KeyIdentity) -> Option<u32> {
+    if let Some(keypad) = identity.keypad {
+        return Some(match keypad {
+            KeypadKey::Digit(digit @ 0..=9) => 57_399 + u32::from(digit),
+            KeypadKey::Decimal => 57_409,
+            KeypadKey::Divide => 57_410,
+            KeypadKey::Multiply => 57_411,
+            KeypadKey::Subtract => 57_412,
+            KeypadKey::Add => 57_413,
+            KeypadKey::Enter => 57_414,
+            KeypadKey::Equal => 57_415,
+            KeypadKey::Separator => 57_416,
+            KeypadKey::ArrowLeft => 57_417,
+            KeypadKey::ArrowRight => 57_418,
+            KeypadKey::ArrowUp => 57_419,
+            KeypadKey::ArrowDown => 57_420,
+            KeypadKey::PageUp => 57_421,
+            KeypadKey::PageDown => 57_422,
+            KeypadKey::Home => 57_423,
+            KeypadKey::End => 57_424,
+            KeypadKey::Insert => 57_425,
+            KeypadKey::Delete => 57_426,
+            KeypadKey::Digit(_) => return None,
+        });
+    }
+    Some(match identity.logical {
+        LogicalKey::Character(ch) => u32::from(identity.base_codepoint.unwrap_or(ch)),
+        LogicalKey::Escape => 27,
+        LogicalKey::Enter => 13,
+        LogicalKey::Tab => 9,
+        LogicalKey::Backspace => 127,
+        LogicalKey::Insert => 57_348,
+        LogicalKey::Delete => 57_349,
+        LogicalKey::ArrowLeft => 57_350,
+        LogicalKey::ArrowRight => 57_351,
+        LogicalKey::ArrowUp => 57_352,
+        LogicalKey::ArrowDown => 57_353,
+        LogicalKey::PageUp => 57_354,
+        LogicalKey::PageDown => 57_355,
+        LogicalKey::Home => 57_356,
+        LogicalKey::End => 57_357,
+        LogicalKey::CapsLock => 57_358,
+        LogicalKey::NumLock => 57_360,
+        LogicalKey::Menu => 57_363,
+        LogicalKey::Function(number @ 1..=35) => 57_363 + u32::from(number),
+        LogicalKey::Modifier { kind, side } => match (kind, side) {
+            (ModifierKind::Shift, KeySide::Left) => 57_441,
+            (ModifierKind::Control, KeySide::Left) => 57_442,
+            (ModifierKind::Alt, KeySide::Left) => 57_443,
+            (ModifierKind::Super, KeySide::Left) => 57_444,
+            (ModifierKind::Shift, KeySide::Right) => 57_447,
+            (ModifierKind::Control, KeySide::Right) => 57_448,
+            (ModifierKind::Alt, KeySide::Right) => 57_449,
+            (ModifierKind::Super, KeySide::Right) => 57_450,
+        },
+        _ => return None,
+    })
+}
+
+fn kitty_modifiers(event: &TerminalKeyboardEvent) -> u16 {
+    1 + u16::from(event.modifiers.shift)
+        + 2 * u16::from(event.modifiers.alt)
+        + 4 * u16::from(event.modifiers.control)
+        + 8 * u16::from(event.modifiers.super_key)
+        + 64 * u16::from(event.caps_lock)
+        + 128 * u16::from(event.num_lock)
+}
+
+fn push_codepoint(output: &mut String, ch: char) {
+    output.push_str(&u32::from(ch).to_string());
+}
+
+fn checked_key_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, InputError> {
+    if bytes.len() > MAX_ENCODED_KEY_BYTES {
+        Err(InputError::EncodedKeyCapacity)
+    } else {
+        Ok(bytes)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -309,13 +759,324 @@ pub enum InputError {
     Nul,
     #[error("input transaction exceeds its capacity")]
     Capacity,
+    #[error("keyboard event has no protocol key code")]
+    UnknownKey,
+    #[error("associated text exceeds keyboard protocol limits")]
+    AssociatedTextCapacity,
+    #[error("associated text contains a control codepoint")]
+    AssociatedTextControl,
+    #[error("encoded keyboard event exceeds 256 bytes")]
+    EncodedKeyCapacity,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use leyline_gfx::{KeyIdentity, KeyLocation};
     fn modes() -> TerminalModes {
         TerminalModes::default()
+    }
+
+    fn keyboard_event(logical: LogicalKey, kind: KeyboardEventKind) -> TerminalKeyboardEvent {
+        TerminalKeyboardEvent {
+            identity: KeyIdentity {
+                logical,
+                location: KeyLocation::Standard,
+                keypad: None,
+                base_codepoint: match logical {
+                    LogicalKey::Character(ch) => Some(ch),
+                    _ => None,
+                },
+                shifted_codepoint: None,
+            },
+            text: match logical {
+                LogicalKey::Character(ch) => Some(ch.to_string()),
+                _ => None,
+            },
+            modifiers: Modifiers::default(),
+            caps_lock: false,
+            num_lock: false,
+            kind,
+            associated_text_allowed: true,
+        }
+    }
+
+    fn kitty_modes(bits: u8) -> TerminalModes {
+        TerminalModes {
+            keyboard: super::super::KeyboardProtocolState {
+                kitty: KittyKeyboardFlags::from_valid_bits(bits).unwrap(),
+                modify_other_keys: ModifyOtherKeysLevel::Disabled,
+            },
+            ..TerminalModes::default()
+        }
+    }
+
+    #[test]
+    fn kitty_event_and_all_keys_truth_table_is_explicit() {
+        for bits in [0, 2, 8, 10] {
+            for kind in [
+                KeyboardEventKind::Press,
+                KeyboardEventKind::Repeat,
+                KeyboardEventKind::Release,
+            ] {
+                let event = keyboard_event(LogicalKey::Character('a'), kind);
+                let encoded = encode_keyboard_event(&event, kitty_modes(bits)).unwrap();
+                match (bits, kind) {
+                    (0 | 2, KeyboardEventKind::Press | KeyboardEventKind::Repeat) => {
+                        assert_eq!(encoded, EncodedKey::TextFallback);
+                    }
+                    (8, KeyboardEventKind::Press | KeyboardEventKind::Repeat) => {
+                        assert_eq!(encoded, EncodedKey::Bytes(b"\x1b[97;1u".to_vec()));
+                    }
+                    (10, KeyboardEventKind::Press) => {
+                        assert_eq!(encoded, EncodedKey::Bytes(b"\x1b[97;1:1u".to_vec()));
+                    }
+                    (10, KeyboardEventKind::Repeat) => {
+                        assert_eq!(encoded, EncodedKey::Bytes(b"\x1b[97;1:2u".to_vec()));
+                    }
+                    (10, KeyboardEventKind::Release) => {
+                        assert_eq!(encoded, EncodedKey::Bytes(b"\x1b[97;1:3u".to_vec()));
+                    }
+                    (_, KeyboardEventKind::Release) => assert_eq!(
+                        encoded,
+                        EncodedKey::Ignored(IgnoreReason::ReleaseNotReported)
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        let arrow = keyboard_event(LogicalKey::ArrowUp, KeyboardEventKind::Repeat);
+        assert_eq!(
+            encode_keyboard_event(&arrow, kitty_modes(2)).unwrap(),
+            EncodedKey::Bytes(b"\x1b[1;1:2A".to_vec())
+        );
+    }
+
+    #[test]
+    fn codex_flags_keep_legacy_functional_key_identities() {
+        let cases = [
+            (LogicalKey::ArrowLeft, b"\x1b[1;1:1D".as_slice()),
+            (LogicalKey::ArrowRight, b"\x1b[1;1:1C".as_slice()),
+            (LogicalKey::Home, b"\x1b[1;1:1H".as_slice()),
+            (LogicalKey::Delete, b"\x1b[3;1:1~".as_slice()),
+            (LogicalKey::PageDown, b"\x1b[6;1:1~".as_slice()),
+            (LogicalKey::Function(1), b"\x1b[1;1:1P".as_slice()),
+            (LogicalKey::Function(12), b"\x1b[24;1:1~".as_slice()),
+        ];
+        for (key, expected) in cases {
+            let event = keyboard_event(key, KeyboardEventKind::Press);
+            assert_eq!(
+                encode_keyboard_event(&event, kitty_modes(7)).unwrap(),
+                EncodedKey::Bytes(expected.to_vec())
+            );
+        }
+
+        let release = keyboard_event(LogicalKey::ArrowLeft, KeyboardEventKind::Release);
+        assert_eq!(
+            encode_keyboard_event(&release, kitty_modes(7)).unwrap(),
+            EncodedKey::Bytes(b"\x1b[1;1:3D".to_vec())
+        );
+
+        let all_keys = keyboard_event(LogicalKey::ArrowLeft, KeyboardEventKind::Press);
+        assert_eq!(
+            encode_keyboard_event(&all_keys, kitty_modes(8)).unwrap(),
+            EncodedKey::Bytes(b"\x1b[D".to_vec())
+        );
+    }
+
+    #[test]
+    fn kitty_ignores_unidentified_system_keys() {
+        let event = keyboard_event(
+            LogicalKey::Unidentified(0x1008_ff4a),
+            KeyboardEventKind::Press,
+        );
+        assert_eq!(
+            encode_keyboard_event(&event, kitty_modes(8)).unwrap(),
+            EncodedKey::Ignored(IgnoreReason::UnknownKey)
+        );
+    }
+
+    #[test]
+    fn kitty_alternate_associated_text_and_release_are_bounded() {
+        let mut event = keyboard_event(LogicalKey::Character('A'), KeyboardEventKind::Press);
+        event.identity.base_codepoint = Some('a');
+        event.identity.shifted_codepoint = Some('A');
+        event.modifiers.shift = true;
+        event.text = Some("A".into());
+        assert_eq!(
+            encode_keyboard_event(&event, kitty_modes(4 | 8 | 16)).unwrap(),
+            EncodedKey::Bytes(b"\x1b[97:65:97;2;65u".to_vec())
+        );
+        event.text = Some("x".repeat(MAX_ASSOCIATED_TEXT_SCALARS + 1));
+        assert_eq!(
+            encode_keyboard_event(&event, kitty_modes(8 | 16)),
+            Err(InputError::AssociatedTextCapacity)
+        );
+    }
+
+    #[test]
+    fn kitty_precedes_mok_and_application_keypad_is_independent() {
+        let mut event = keyboard_event(LogicalKey::Character('a'), KeyboardEventKind::Press);
+        event.modifiers.control = true;
+        let mut state = kitty_modes(1);
+        state.keyboard.modify_other_keys = ModifyOtherKeysLevel::All;
+        assert_eq!(
+            encode_keyboard_event(&event, state).unwrap(),
+            EncodedKey::Bytes(b"\x1b[97;5u".to_vec())
+        );
+        state.keyboard.kitty = KittyKeyboardFlags::default();
+        assert_eq!(
+            encode_keyboard_event(&event, state).unwrap(),
+            EncodedKey::Bytes(b"\x1b[27;5;97~".to_vec())
+        );
+
+        let mut keypad = keyboard_event(LogicalKey::Enter, KeyboardEventKind::Press);
+        keypad.identity.location = KeyLocation::Numpad;
+        keypad.identity.keypad = Some(KeypadKey::Enter);
+        assert_eq!(
+            encode_keyboard_event(
+                &keypad,
+                TerminalModes {
+                    application_keypad: true,
+                    ..modes()
+                }
+            )
+            .unwrap(),
+            EncodedKey::Bytes(b"\x1bOM".to_vec())
+        );
+    }
+
+    #[test]
+    fn modify_other_keys_level_one_preserves_xterm_well_defined_aliases() {
+        let modes = TerminalModes {
+            keyboard: super::super::KeyboardProtocolState {
+                kitty: KittyKeyboardFlags::default(),
+                modify_other_keys: ModifyOtherKeysLevel::ExceptWellDefined,
+            },
+            ..TerminalModes::default()
+        };
+        let mut shifted = keyboard_event(LogicalKey::Character('A'), KeyboardEventKind::Press);
+        shifted.identity.base_codepoint = Some('a');
+        shifted.modifiers.shift = true;
+        assert_eq!(
+            encode_keyboard_event(&shifted, modes).unwrap(),
+            EncodedKey::TextFallback
+        );
+        let cases = [
+            (
+                'a',
+                'a',
+                Modifiers {
+                    control: true,
+                    ..Modifiers::default()
+                },
+                b"\x01".as_slice(),
+            ),
+            (
+                'a',
+                'a',
+                Modifiers {
+                    alt: true,
+                    ..Modifiers::default()
+                },
+                b"\x1b[27;3;97~".as_slice(),
+            ),
+            (
+                '?',
+                '/',
+                Modifiers {
+                    control: true,
+                    shift: true,
+                    ..Modifiers::default()
+                },
+                b"\x1b[27;6;63~".as_slice(),
+            ),
+            (
+                '3',
+                '3',
+                Modifiers {
+                    control: true,
+                    ..Modifiers::default()
+                },
+                b"3".as_slice(),
+            ),
+            (
+                '#',
+                '3',
+                Modifiers {
+                    control: true,
+                    shift: true,
+                    ..Modifiers::default()
+                },
+                b"\x1b[27;6;35~".as_slice(),
+            ),
+        ];
+        for (ch, base, modifiers, expected) in cases {
+            let mut event = keyboard_event(LogicalKey::Character(ch), KeyboardEventKind::Press);
+            event.identity.base_codepoint = Some(base);
+            event.modifiers = modifiers;
+            assert_eq!(
+                encode_keyboard_event(&event, modes).unwrap(),
+                EncodedKey::Bytes(expected.to_vec()),
+                "character {ch:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn application_keypad_table_and_numeric_navigation_are_deterministic() {
+        let application = TerminalModes {
+            application_keypad: true,
+            ..modes()
+        };
+        let table: [(KeypadKey, &[u8]); 18] = [
+            (KeypadKey::Digit(0), b"\x1bOp"),
+            (KeypadKey::Digit(1), b"\x1bOq"),
+            (KeypadKey::Digit(2), b"\x1bOr"),
+            (KeypadKey::Digit(3), b"\x1bOs"),
+            (KeypadKey::Digit(4), b"\x1bOt"),
+            (KeypadKey::Digit(5), b"\x1bOu"),
+            (KeypadKey::Digit(6), b"\x1bOv"),
+            (KeypadKey::Digit(7), b"\x1bOw"),
+            (KeypadKey::Digit(8), b"\x1bOx"),
+            (KeypadKey::Digit(9), b"\x1bOy"),
+            (KeypadKey::Decimal, b"\x1bOn"),
+            (KeypadKey::Divide, b"\x1bOo"),
+            (KeypadKey::Multiply, b"\x1bOj"),
+            (KeypadKey::Subtract, b"\x1bOm"),
+            (KeypadKey::Add, b"\x1bOk"),
+            (KeypadKey::Separator, b"\x1bOl"),
+            (KeypadKey::Equal, b"\x1bOX"),
+            (KeypadKey::Enter, b"\x1bOM"),
+        ];
+        for (keypad, expected) in table {
+            let mut event = keyboard_event(LogicalKey::Unidentified(0), KeyboardEventKind::Press);
+            event.identity.location = KeyLocation::Numpad;
+            event.identity.keypad = Some(keypad);
+            assert_eq!(
+                encode_keyboard_event(&event, application).unwrap(),
+                EncodedKey::Bytes(expected.to_vec()),
+                "keypad {keypad:?}"
+            );
+        }
+
+        let mut navigation = keyboard_event(LogicalKey::Home, KeyboardEventKind::Press);
+        navigation.identity.location = KeyLocation::Numpad;
+        navigation.identity.keypad = Some(KeypadKey::Digit(7));
+        navigation.text = None;
+        assert_eq!(
+            encode_keyboard_event(&navigation, modes()).unwrap(),
+            EncodedKey::Bytes(b"\x1b[H".to_vec())
+        );
+        let mut modified = navigation.clone();
+        modified.identity.logical = LogicalKey::Unidentified(0);
+        modified.identity.keypad = Some(KeypadKey::Add);
+        modified.modifiers.control = true;
+        assert_eq!(
+            encode_keyboard_event(&modified, application).unwrap(),
+            EncodedKey::Bytes(b"\x1b[1;5k".to_vec())
+        );
     }
     #[test]
     fn keys_cover_control_application_and_modifiers() {

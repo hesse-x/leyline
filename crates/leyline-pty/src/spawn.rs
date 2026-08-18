@@ -272,6 +272,7 @@ pub struct PtyProcess {
     shutdown: Arc<AtomicBool>,
     outstanding_write_bytes: Arc<AtomicUsize>,
     latest_resize: Arc<Mutex<Option<PtySize>>>,
+    terminal: File,
     io_thread: Option<JoinHandle<()>>,
     wait_thread: Option<JoinHandle<()>>,
 }
@@ -284,6 +285,7 @@ impl PtyProcess {
     pub fn spawn(spec: SpawnSpec, sinks: PtySinks) -> Result<Self, SpawnError> {
         validate_spec(&spec)?;
         let (master, slave) = open_pty(spec.initial_size)?;
+        let terminal = master.try_clone().map_err(SpawnError::Pty)?;
         let cwd_fd = spec.cwd.handle.as_raw_fd();
         let mut command = Command::new(&spec.program);
         command.args(&spec.args).env_clear().envs(spec.environment);
@@ -364,6 +366,7 @@ impl PtyProcess {
             shutdown,
             outstanding_write_bytes,
             latest_resize,
+            terminal,
             io_thread: Some(io_thread),
             wait_thread: Some(wait_thread),
         })
@@ -424,6 +427,19 @@ impl PtyProcess {
     #[must_use]
     pub fn outstanding_write_bytes(&self) -> usize {
         self.outstanding_write_bytes.load(Ordering::Acquire)
+    }
+    /// Returns the process group currently receiving input from the PTY.
+    ///
+    /// # Errors
+    /// Returns the kernel error when the PTY no longer has a foreground process group.
+    pub fn foreground_process_group(&self) -> io::Result<u32> {
+        // SAFETY: `terminal` is an owned descriptor for this PTY's master side.
+        let process_group = unsafe { libc::tcgetpgrp(self.terminal.as_raw_fd()) };
+        if process_group == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        u32::try_from(process_group)
+            .map_err(|_| io::Error::other("invalid foreground process group"))
     }
     /// Requests worker shutdown and master closure.
     ///
@@ -896,6 +912,53 @@ mod tests {
         let text = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
         assert!(text.contains("leyline-256color:truecolor"), "{text:?}");
         assert!(text.contains(":/tmp:/tmp"), "{text:?}");
+    }
+
+    #[test]
+    fn interactive_shell_keeps_stopped_foreground_jobs_suspended() {
+        let size = PtySize::new(80, 24, 0, 0).unwrap();
+        let spec = SpawnSpec::command(
+            "/bin/bash".into(),
+            vec!["--noprofile".into(), "--norc".into(), "-i".into()],
+            cwd(),
+            size,
+        )
+        .unwrap();
+        let (process, output, _done) = collect(spec);
+        process.try_write(b"stty -echo\n".to_vec()).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        output.lock().unwrap().clear();
+        process
+            .try_write(
+                b"/bin/sh -c 'kill -TSTP $$; printf \"\\137\\137RESUMED\\137\\137\"'\n".to_vec(),
+            )
+            .unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let stopped_output = output.lock().unwrap().clone();
+        assert!(
+            !stopped_output
+                .windows(11)
+                .any(|bytes| bytes == b"__RESUMED__"),
+            "{}",
+            String::from_utf8_lossy(&stopped_output)
+        );
+        process.try_write(b"fg\n".to_vec()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !output
+            .lock()
+            .unwrap()
+            .windows(11)
+            .any(|bytes| bytes == b"__RESUMED__")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "stopped job did not resume after fg: {}",
+                String::from_utf8_lossy(&output.lock().unwrap())
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        process.request_shutdown().unwrap();
+        process.join().unwrap();
     }
 
     #[test]

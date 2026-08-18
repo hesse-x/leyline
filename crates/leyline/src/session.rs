@@ -76,6 +76,31 @@ struct InputTransaction {
 
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
 
+fn keyboard_protocol_active(state: crate::terminal::KeyboardProtocolState) -> bool {
+    !state.kitty.is_empty()
+        || state.modify_other_keys != crate::terminal::ModifyOtherKeysLevel::Disabled
+}
+
+fn stale_keyboard_protocol_enable(
+    before: crate::terminal::KeyboardProtocolState,
+    after: crate::terminal::KeyboardProtocolState,
+    owner: Option<u32>,
+    foreground: Option<u32>,
+) -> bool {
+    !keyboard_protocol_active(before)
+        && keyboard_protocol_active(after)
+        && matches!((owner, foreground), (Some(owner), Some(foreground)) if owner != foreground)
+}
+
+fn keyboard_protocol_owner_changed(
+    state: crate::terminal::KeyboardProtocolState,
+    owner: Option<u32>,
+    foreground: Option<u32>,
+) -> bool {
+    keyboard_protocol_active(state)
+        && matches!((owner, foreground), (Some(owner), Some(foreground)) if owner != foreground)
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct TerminalSession {
     core: TerminalCoreAdapter,
@@ -96,6 +121,7 @@ pub struct TerminalSession {
     shutdown_deadline: Option<Instant>,
     security_audit: ParseAuditDelta,
     audit_log_limiter: MetadataRateLimiter,
+    keyboard_protocol_owner: Option<u32>,
     search: crate::search::SearchController,
 }
 
@@ -189,6 +215,7 @@ impl TerminalSession {
             shutdown_deadline: None,
             security_audit: ParseAuditDelta::default(),
             audit_log_limiter: MetadataRateLimiter::default(),
+            keyboard_protocol_owner: None,
             search: crate::search::SearchController::default(),
         })
     }
@@ -200,7 +227,40 @@ impl TerminalSession {
                     return Err(SessionError::OutputAfterClose);
                 }
                 self.cwd_tracker.advance(batch.as_slice());
+                let keyboard_before = self.core.input_modes().keyboard;
                 let delta = self.core.advance(batch.as_slice())?;
+                let mut keyboard_after = self.core.input_modes().keyboard;
+                let foreground_process_group = self.foreground_process_group();
+                if !keyboard_protocol_active(keyboard_before)
+                    && keyboard_protocol_active(keyboard_after)
+                {
+                    if stale_keyboard_protocol_enable(
+                        keyboard_before,
+                        keyboard_after,
+                        self.keyboard_protocol_owner,
+                        foreground_process_group,
+                    ) {
+                        tracing::debug!(
+                            keyboard_protocol_owner = self.keyboard_protocol_owner,
+                            foreground_process_group,
+                            "discarding stale keyboard protocol enable after foreground job change"
+                        );
+                        self.core.reset_keyboard_protocol();
+                        keyboard_after = self.core.input_modes().keyboard;
+                    } else {
+                        self.keyboard_protocol_owner = foreground_process_group;
+                    }
+                }
+                if keyboard_before != keyboard_after {
+                    tracing::trace!(
+                        kitty_before = keyboard_before.kitty.bits(),
+                        kitty_after = keyboard_after.kitty.bits(),
+                        mok_before = ?keyboard_before.modify_other_keys,
+                        mok_after = ?keyboard_after.modify_other_keys,
+                        foreground_process_group,
+                        "terminal keyboard protocol state changed"
+                    );
+                }
                 self.accumulate_audit(delta.audit);
                 if delta.audit.unknown_sequences != 0
                     || delta.audit.rejected_actions != 0
@@ -403,6 +463,9 @@ impl TerminalSession {
     pub fn input_modes(&self) -> crate::terminal::TerminalModes {
         self.core.input_modes()
     }
+    pub fn foreground_process_group(&self) -> Option<u32> {
+        self.process.as_ref()?.foreground_process_group().ok()
+    }
     pub fn input_key(
         &mut self,
         key: crate::terminal::TerminalKey,
@@ -412,6 +475,56 @@ impl TerminalSession {
             .map_err(SessionError::Input)?;
         self.restore_viewport_after_input()?;
         self.queue_transaction(QueueClass::Interactive, bytes)
+    }
+    pub fn input_keyboard_event(
+        &mut self,
+        event: &crate::terminal::TerminalKeyboardEvent,
+    ) -> Result<bool, SessionError> {
+        let mut modes = self.core.input_modes();
+        let foreground_process_group = self.foreground_process_group();
+        if keyboard_protocol_owner_changed(
+            modes.keyboard,
+            self.keyboard_protocol_owner,
+            foreground_process_group,
+        ) {
+            tracing::debug!(
+                keyboard_protocol_owner = self.keyboard_protocol_owner,
+                foreground_process_group,
+                "resetting keyboard protocol after foreground job change"
+            );
+            self.core.reset_keyboard_protocol();
+            self.keyboard_protocol_owner = None;
+            modes = self.core.input_modes();
+        }
+        if event.kind == crate::terminal::KeyboardEventKind::Press
+            && !keyboard_protocol_active(modes.keyboard)
+            && matches!(
+                (self.keyboard_protocol_owner, foreground_process_group),
+                (Some(owner), Some(foreground)) if owner != foreground
+            )
+        {
+            self.keyboard_protocol_owner = None;
+        }
+        let encoded =
+            crate::terminal::encode_keyboard_event(event, modes).map_err(SessionError::Input)?;
+        tracing::trace!(
+            logical = ?event.identity.logical,
+            kind = ?event.kind,
+            kitty = modes.keyboard.kitty.bits(),
+            modify_other_keys = ?modes.keyboard.modify_other_keys,
+            encoded = ?encoded,
+            foreground_process_group = self.foreground_process_group(),
+            "terminal keyboard event encoded"
+        );
+        match encoded {
+            crate::terminal::EncodedKey::Bytes(bytes) => {
+                self.restore_viewport_after_input()?;
+                self.queue_transaction(QueueClass::Interactive, bytes)?;
+                Ok(false)
+            }
+            crate::terminal::EncodedKey::TextFallback => Ok(true),
+            crate::terminal::EncodedKey::Ignored(_) => Ok(false),
+        }
     }
     pub fn commit_text(&mut self, text: &str) -> Result<(), SessionError> {
         let bytes = crate::terminal::commit_text(text).map_err(SessionError::Input)?;
@@ -611,6 +724,10 @@ impl TerminalSession {
                 unknown = delta.unknown_sequences,
                 rejected = delta.rejected_actions,
                 truncated = delta.truncated_sequences,
+                keyboard_changes = delta.keyboard_protocol_changes,
+                keyboard_queries = delta.keyboard_queries,
+                keyboard_unknown_flags = delta.keyboard_unknown_flags,
+                keyboard_stack_overflow = delta.keyboard_stack_overflow,
                 previously_suppressed,
                 "terminal sequence audit event"
             );
@@ -654,6 +771,22 @@ impl TerminalSession {
             .security_audit
             .display_state_fallbacks
             .saturating_add(delta.display_state_fallbacks);
+        self.security_audit.keyboard_protocol_changes = self
+            .security_audit
+            .keyboard_protocol_changes
+            .saturating_add(delta.keyboard_protocol_changes);
+        self.security_audit.keyboard_queries = self
+            .security_audit
+            .keyboard_queries
+            .saturating_add(delta.keyboard_queries);
+        self.security_audit.keyboard_unknown_flags = self
+            .security_audit
+            .keyboard_unknown_flags
+            .saturating_add(delta.keyboard_unknown_flags);
+        self.security_audit.keyboard_stack_overflow = self
+            .security_audit
+            .keyboard_stack_overflow
+            .saturating_add(delta.keyboard_stack_overflow);
     }
 
     fn note_reply_rejected(&mut self, is_query: bool) {
@@ -928,6 +1061,44 @@ mod tests {
     }
 
     #[test]
+    fn protocol_owner_rejects_stale_enable_from_a_background_job() {
+        let disabled = crate::terminal::KeyboardProtocolState::default();
+        let enabled = crate::terminal::KeyboardProtocolState {
+            kitty: crate::terminal::KittyKeyboardFlags::from_valid_bits(7).unwrap(),
+            ..disabled
+        };
+        assert!(stale_keyboard_protocol_enable(
+            disabled,
+            enabled,
+            Some(10),
+            Some(20)
+        ));
+        assert!(!stale_keyboard_protocol_enable(
+            disabled,
+            enabled,
+            Some(10),
+            Some(10)
+        ));
+        assert!(!stale_keyboard_protocol_enable(
+            enabled,
+            disabled,
+            Some(10),
+            Some(20)
+        ));
+        assert!(keyboard_protocol_owner_changed(enabled, Some(10), Some(20)));
+        assert!(!keyboard_protocol_owner_changed(
+            enabled,
+            Some(10),
+            Some(10)
+        ));
+        assert!(!keyboard_protocol_owner_changed(
+            disabled,
+            Some(10),
+            Some(20)
+        ));
+    }
+
+    #[test]
     fn bulk_and_parser_replies_preserve_interactive_credit() {
         assert_eq!(
             queue_class_limit(QueueClass::Interactive),
@@ -1152,6 +1323,8 @@ impl Drop for TerminalSession {
         if self.security_audit.unknown_sequences != 0
             || self.security_audit.rejected_actions != 0
             || self.security_audit.truncated_sequences != 0
+            || self.security_audit.keyboard_unknown_flags != 0
+            || self.security_audit.keyboard_stack_overflow != 0
         {
             tracing::debug!(
                 category = "rejected_input",
@@ -1160,6 +1333,10 @@ impl Drop for TerminalSession {
                 rejected = self.security_audit.rejected_actions,
                 truncated = self.security_audit.truncated_sequences,
                 reply_bytes = self.security_audit.reply_bytes,
+                keyboard_changes = self.security_audit.keyboard_protocol_changes,
+                keyboard_queries = self.security_audit.keyboard_queries,
+                keyboard_unknown_flags = self.security_audit.keyboard_unknown_flags,
+                keyboard_stack_overflow = self.security_audit.keyboard_stack_overflow,
                 "terminal security audit summary"
             );
         }
