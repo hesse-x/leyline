@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     GfxCommand, LinearColor, LogicalSize, PlatformEvent, RectangleInstance, RenderOutcome,
-    RenderScene, Scale120, SelectionTarget, TextInputRectangle,
+    RenderScene, Scale120, SelectionTarget, TextInputContext,
     atlas::{AtlasManager, AtlasPreparation},
     model::SceneData,
     vulkan::{RenderStatus, VulkanRenderer},
@@ -226,6 +226,7 @@ impl GfxRuntime {
                 }
                 self.wayland.set_title(&title);
             }
+            GfxCommand::SetPointerCursor(cursor) => self.wayland.set_pointer_cursor(cursor),
             GfxCommand::SetDirty => self.dirty = true,
             GfxCommand::SetScene(scene) => {
                 if self.pending_atlas.take().is_some() {
@@ -425,10 +426,10 @@ impl GfxRuntime {
     /// Returns a platform error when the compositor connection cannot be flushed.
     pub fn enable_text_input(
         &mut self,
-        rectangle: TextInputRectangle,
+        context: TextInputContext,
     ) -> Result<Option<u32>, GfxError> {
         self.wayland
-            .enable_text_input(rectangle)
+            .enable_text_input(context)
             .map_err(GfxError::Platform)
     }
 
@@ -438,10 +439,10 @@ impl GfxRuntime {
     /// Returns a platform error when the compositor connection cannot be flushed.
     pub fn update_text_input(
         &mut self,
-        rectangle: TextInputRectangle,
+        context: TextInputContext,
     ) -> Result<Option<u32>, GfxError> {
         self.wayland
-            .update_text_input(rectangle)
+            .update_text_input(context)
             .map_err(GfxError::Platform)
     }
 

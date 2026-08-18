@@ -119,6 +119,10 @@ pub struct ColorsConfig {
     pub cursor: Color,
     pub selection_foreground: Color,
     pub selection_background: Color,
+    pub search_current_foreground: Color,
+    pub search_current_background: Color,
+    pub search_match_foreground: Color,
+    pub search_match_background: Color,
     pub ansi: [Color; 16],
 }
 
@@ -225,6 +229,10 @@ pub enum Action {
     NextTab,
     ActivateTab(u8),
     ToggleBellMute,
+    Search,
+    SearchNext,
+    SearchPrevious,
+    CancelSearch,
 }
 
 impl Default for EffectiveConfig {
@@ -247,6 +255,10 @@ impl Default for EffectiveConfig {
                 cursor: Color(0xd8dc_d8ff),
                 selection_foreground: Color(0xf4f6_f4ff),
                 selection_background: Color(0x5865_6dcc),
+                search_current_foreground: Color(0x171a_1cff),
+                search_current_background: Color(0xffb4_54ff),
+                search_match_foreground: Color(0xf4f6_f4ff),
+                search_match_background: Color(0x8a65_32cc),
                 ansi: DEFAULT_ANSI_PALETTE,
             },
             window: WindowConfig {
@@ -295,6 +307,7 @@ fn default_keybindings() -> Vec<KeyBinding> {
     use Action::{
         CloseTab, CopyClipboard, DecreaseFontSize, IncreaseFontSize, NewTab, NextTab,
         PasteClipboard, PastePrimary, PreviousTab, ResetFontSize, ScrollPageDown, ScrollPageUp,
+        Search,
     };
     use leyline_gfx::ModifierMask;
     [
@@ -344,6 +357,11 @@ fn default_keybindings() -> Vec<KeyBinding> {
             LogicalKeyPattern::Character('W'),
             modifier_mask(&[Modifier::Control, Modifier::Shift]),
             CloseTab,
+        ),
+        (
+            LogicalKeyPattern::Character('F'),
+            ModifierMask::CONTROL,
+            Search,
         ),
         (
             LogicalKeyPattern::ArrowLeft,
@@ -621,6 +639,10 @@ struct RawColors {
     cursor: Option<String>,
     selection_foreground: Option<String>,
     selection_background: Option<String>,
+    search_current_foreground: Option<String>,
+    search_current_background: Option<String>,
+    search_match_foreground: Option<String>,
+    search_match_background: Option<String>,
     ansi: Option<Vec<String>>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
@@ -756,6 +778,10 @@ impl RawConfig {
                 "cursor",
                 "selection_foreground",
                 "selection_background",
+                "search_current_foreground",
+                "search_current_background",
+                "search_match_foreground",
+                "search_match_background",
                 "ansi",
             ],
         );
@@ -927,6 +953,30 @@ impl RawConfig {
             "colors.selection_background",
             self.colors.selection_background,
             &mut result.colors.selection_background,
+        )?;
+        set_color(
+            path,
+            "colors.search_current_foreground",
+            self.colors.search_current_foreground,
+            &mut result.colors.search_current_foreground,
+        )?;
+        set_color(
+            path,
+            "colors.search_current_background",
+            self.colors.search_current_background,
+            &mut result.colors.search_current_background,
+        )?;
+        set_color(
+            path,
+            "colors.search_match_foreground",
+            self.colors.search_match_foreground,
+            &mut result.colors.search_match_foreground,
+        )?;
+        set_color(
+            path,
+            "colors.search_match_background",
+            self.colors.search_match_background,
+            &mut result.colors.search_match_background,
         )?;
         set_bounded(
             path,
@@ -1398,6 +1448,10 @@ fn parse_binding(path: &Path, index: usize, raw: RawKeyBinding) -> Result<KeyBin
         "PreviousTab" => Action::PreviousTab,
         "NextTab" => Action::NextTab,
         "ToggleBellMute" => Action::ToggleBellMute,
+        "Search" => Action::Search,
+        "SearchNext" => Action::SearchNext,
+        "SearchPrevious" => Action::SearchPrevious,
+        "CancelSearch" => Action::CancelSearch,
         "ActivateTab1" => Action::ActivateTab(1),
         "ActivateTab2" => Action::ActivateTab(2),
         "ActivateTab3" => Action::ActivateTab(3),
@@ -1536,6 +1590,45 @@ mod tests {
                 .iter()
                 .any(|binding| binding.action == Action::PasteClipboard)
         );
+    }
+
+    #[test]
+    fn search_actions_parse_and_default_entry_is_unique() {
+        use crate::input::shortcut::LogicalKeyPattern;
+        let defaults = default_keybindings();
+        assert_eq!(
+            defaults
+                .iter()
+                .filter(|binding| {
+                    binding.chord.key == LogicalKeyPattern::Character('F')
+                        && binding.chord.modifiers == leyline_gfx::ModifierMask::CONTROL
+                        && binding.action == Action::Search
+                })
+                .count(),
+            1
+        );
+        let source = "[[keybindings]]\nkey=\"F1\"\nmods=[]\naction=\"Search\"\n\
+[[keybindings]]\nkey=\"F2\"\nmods=[]\naction=\"SearchNext\"\n\
+[[keybindings]]\nkey=\"F3\"\nmods=[]\naction=\"SearchPrevious\"\n\
+[[keybindings]]\nkey=\"F4\"\nmods=[]\naction=\"CancelSearch\"\n";
+        let raw: RawConfig = toml::from_str(source).expect("raw config");
+        let loaded = raw
+            .into_effective(Path::new("search.toml"), source)
+            .expect("effective config");
+        for action in [
+            Action::Search,
+            Action::SearchNext,
+            Action::SearchPrevious,
+            Action::CancelSearch,
+        ] {
+            assert!(
+                loaded
+                    .0
+                    .keybindings
+                    .iter()
+                    .any(|binding| binding.action == action)
+            );
+        }
     }
 
     #[test]

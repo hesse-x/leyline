@@ -34,6 +34,11 @@ struct PendingVisualBuild {
     builder: VisualMapBuilder,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct SearchDialogDrag {
+    grab_offset: [i64; 2],
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct UiRuntime {
     state: RuntimeState,
@@ -64,13 +69,18 @@ pub struct UiRuntime {
     link_candidate: Option<LinkCandidate>,
     desktop_launcher: crate::desktop::DesktopLauncher,
     ime: ImeState,
-    ime_rectangle: Option<leyline_gfx::TextInputRectangle>,
+    ime_context: Option<leyline_gfx::TextInputContext>,
     clipboard_workers: crate::clipboard::TransferWorkers,
     selection: crate::selection::SelectionController,
+    pending_search_paste: Option<(crate::tab::SessionId, u64)>,
     last_input_serial: Option<leyline_gfx::InputSerial>,
     wheel_remainder_120: i32,
     scrollbar: ScrollbarController,
     tab_bar: crate::tab::TabBarPresentation,
+    search_dialog: Option<crate::search::SearchDialogPresentation>,
+    search_focused: bool,
+    search_dialog_origin: Option<[u32; 2]>,
+    search_dialog_drag: Option<SearchDialogDrag>,
     visual_build: Option<PendingVisualBuild>,
     pending_visual_map: Option<(leyline_gfx::FrameKey, Arc<VisualGridMap>)>,
     published_visual_map: Option<Arc<VisualGridMap>>,
@@ -431,13 +441,18 @@ impl UiRuntime {
             link_candidate: None,
             desktop_launcher: crate::desktop::DesktopLauncher::new(),
             ime: ImeState::default(),
-            ime_rectangle: None,
+            ime_context: None,
             clipboard_workers,
             selection: crate::selection::SelectionController::default(),
+            pending_search_paste: None,
             last_input_serial: None,
             wheel_remainder_120: 0,
             scrollbar: ScrollbarController::default(),
             tab_bar: crate::tab::TabBarPresentation::default(),
+            search_dialog: None,
+            search_focused: false,
+            search_dialog_origin: None,
+            search_dialog_drag: None,
             visual_build: None,
             pending_visual_map: None,
             published_visual_map: None,
@@ -500,7 +515,7 @@ impl UiRuntime {
                                 self.ime.record_commit_serial(serial);
                             }
                             self.ime.deactivate();
-                            self.ime_rectangle = None;
+                            self.ime_context = None;
                         }
                         self.compose_latest()?;
                     }
@@ -527,6 +542,10 @@ impl UiRuntime {
                 self.compose_latest()?;
             }
             if self.visual_bell.expire(Instant::now()) {
+                self.compose_latest()?;
+            }
+            let search_effect = self.active_session_mut().advance_search(Instant::now())?;
+            if search_effect.needs_frame && search_effect.scroll_target.is_none() {
                 self.compose_latest()?;
             }
             if let Some(snapshot) = self.active_session_mut().end_drain_round()? {
@@ -602,6 +621,7 @@ impl UiRuntime {
             let timeout = earliest_timeout(timeout, sync_deadline);
             let timeout = earliest_timeout(timeout, self.cursor_blink_deadline);
             let timeout = earliest_timeout(timeout, self.visual_bell.deadline());
+            let timeout = earliest_timeout(timeout, self.active_session().search().next_deadline());
             let timeout = if self.visual_build.is_some() {
                 Some(Duration::ZERO)
             } else {
@@ -930,6 +950,16 @@ impl UiRuntime {
             return Ok(());
         }
         self.last_input_serial = Some(key.serial);
+        if should_cancel_search(self.active_session().search().is_open(), key.logical_key) {
+            self.execute_action(crate::config::Action::CancelSearch)?;
+            return Ok(());
+        }
+        if self.search_focused
+            && self.active_session().search().is_open()
+            && self.handle_search_key(key)?
+        {
+            return Ok(());
+        }
         let modifiers = terminal_modifiers(key);
         if let Some(action) = self.resolve_shortcut(key) {
             tracing::debug!(
@@ -984,6 +1014,85 @@ impl UiRuntime {
         Ok(())
     }
 
+    fn handle_search_key(&mut self, key: &leyline_gfx::KeyInput) -> Result<bool, UiRuntimeError> {
+        use crate::search::{SearchDirection, SearchEdit};
+        let modifiers = terminal_modifiers(key);
+        let now = Instant::now();
+        let edit = match key.logical_key {
+            leyline_gfx::LogicalKey::Enter => {
+                let direction = if modifiers.shift {
+                    SearchDirection::Previous
+                } else {
+                    SearchDirection::Next
+                };
+                self.active_session_mut().navigate_search(direction, now)?;
+                self.compose_latest()?;
+                return Ok(true);
+            }
+            leyline_gfx::LogicalKey::Backspace => Some(SearchEdit::Backspace),
+            leyline_gfx::LogicalKey::Delete => Some(SearchEdit::Delete),
+            leyline_gfx::LogicalKey::ArrowLeft => Some(SearchEdit::Left),
+            leyline_gfx::LogicalKey::ArrowRight => Some(SearchEdit::Right),
+            leyline_gfx::LogicalKey::Home => Some(SearchEdit::Home),
+            leyline_gfx::LogicalKey::End => Some(SearchEdit::End),
+            _ => None,
+        };
+        if let Some(edit) = edit {
+            self.active_session_mut().edit_search(edit, now);
+            self.compose_latest()?;
+            self.refresh_text_input_rectangle()?;
+            return Ok(true);
+        }
+        if modifiers.control
+            && matches!(
+                key.logical_key,
+                leyline_gfx::LogicalKey::Character('g' | 'G')
+            )
+        {
+            let direction = if modifiers.shift {
+                SearchDirection::Previous
+            } else {
+                SearchDirection::Next
+            };
+            self.active_session_mut().navigate_search(direction, now)?;
+            self.compose_latest()?;
+            return Ok(true);
+        }
+        if let Some(action) = self.resolve_shortcut(key) {
+            match action {
+                crate::config::Action::PastePrimary => {}
+                crate::config::Action::CopyClipboard
+                | crate::config::Action::PasteClipboard
+                | crate::config::Action::IncreaseFontSize
+                | crate::config::Action::DecreaseFontSize
+                | crate::config::Action::ResetFontSize
+                | crate::config::Action::ScrollPageUp
+                | crate::config::Action::ScrollPageDown
+                | crate::config::Action::NewTab
+                | crate::config::Action::CloseTab
+                | crate::config::Action::PreviousTab
+                | crate::config::Action::NextTab
+                | crate::config::Action::ActivateTab(_)
+                | crate::config::Action::ToggleBellMute
+                | crate::config::Action::Search
+                | crate::config::Action::SearchNext
+                | crate::config::Action::SearchPrevious
+                | crate::config::Action::CancelSearch => self.execute_action(action)?,
+            }
+            return Ok(true);
+        }
+        if !modifiers.control
+            && !modifiers.alt
+            && let Some(text) = key_text(key)
+        {
+            self.active_session_mut()
+                .edit_search(SearchEdit::Insert(&text), now);
+            self.compose_latest()?;
+            self.refresh_text_input_rectangle()?;
+        }
+        Ok(true)
+    }
+
     fn modifiers_changed(&mut self, modifiers: leyline_gfx::ModifiersState) {
         self.modifiers = modifiers;
         if !modifiers.control {
@@ -1014,12 +1123,12 @@ impl UiRuntime {
         match event {
             TextInputEvent::Enter => {
                 self.ime.activate();
-                self.ime_rectangle = None;
+                self.ime_context = None;
                 self.enable_text_input()?;
             }
             TextInputEvent::Leave => {
                 self.ime.deactivate();
-                self.ime_rectangle = None;
+                self.ime_context = None;
             }
             TextInputEvent::Preedit { text, cursor } => {
                 self.ime.preedit_string(text, cursor)?;
@@ -1037,13 +1146,30 @@ impl UiRuntime {
                 };
                 let anchor = [snapshot.cursor.column, snapshot.cursor.line];
                 let done = self.ime.done(serial, snapshot.generation, anchor)?;
+                let search_focused =
+                    self.search_focused && self.active_session().search().is_open();
+                if let Some((before_bytes, after_bytes)) = done.delete_surrounding {
+                    if search_focused {
+                        self.active_session_mut().edit_search(
+                            crate::search::SearchEdit::DeleteSurrounding {
+                                before_bytes,
+                                after_bytes,
+                            },
+                            Instant::now(),
+                        );
+                    } else {
+                        tracing::warn!("IME delete-surrounding request ignored for terminal input");
+                    }
+                }
                 if let Some(commit) = done.commit {
                     let text = std::str::from_utf8(&commit)
                         .map_err(|_| crate::interaction::ImeError::CommitTooLarge)?;
-                    self.active_session_mut().commit_text(text)?;
-                }
-                if done.delete_ignored {
-                    tracing::warn!("IME delete-surrounding request ignored for terminal input");
+                    if search_focused {
+                        self.active_session_mut()
+                            .edit_search(crate::search::SearchEdit::Insert(text), Instant::now());
+                    } else {
+                        self.active_session_mut().commit_text(text)?;
+                    }
                 }
                 if done.outbound_resend_required {
                     self.refresh_text_input_rectangle()?;
@@ -1058,16 +1184,16 @@ impl UiRuntime {
         if !self.ime.is_active() || !self.gfx.text_input_available() {
             return Ok(());
         }
-        let Some(rectangle) = self.text_input_rectangle() else {
+        let Some(context) = self.text_input_context() else {
             return Ok(());
         };
-        if self.ime_rectangle == Some(rectangle) && !self.ime.outbound.dirty {
+        if self.ime_context.as_ref() == Some(&context) && !self.ime.outbound.dirty {
             return Ok(());
         }
-        let serial = self.gfx.update_text_input(rectangle)?;
+        let serial = self.gfx.update_text_input(context.clone())?;
         if let Some(serial) = serial {
             self.ime.record_commit_serial(serial);
-            self.ime_rectangle = Some(rectangle);
+            self.ime_context = Some(context);
         }
         Ok(())
     }
@@ -1076,19 +1202,46 @@ impl UiRuntime {
         if !self.ime.is_active() || !self.gfx.text_input_available() {
             return Ok(());
         }
-        let Some(rectangle) = self.text_input_rectangle() else {
+        let Some(context) = self.text_input_context() else {
             return Ok(());
         };
-        if let Some(serial) = self.gfx.enable_text_input(rectangle)? {
+        if let Some(serial) = self.gfx.enable_text_input(context.clone())? {
             self.ime.record_commit_serial(serial);
-            self.ime_rectangle = Some(rectangle);
+            self.ime_context = Some(context);
         }
         Ok(())
     }
 
     fn text_input_rectangle(&self) -> Option<leyline_gfx::TextInputRectangle> {
-        let snapshot = self.active_session().latest_snapshot()?;
         let scale = self.gfx.scale().0.max(1);
+        let logical = |value: u32| {
+            i32::try_from(u64::from(value) * 120 / u64::from(scale)).unwrap_or(i32::MAX)
+        };
+        if self.search_focused && self.active_session().search().is_open() {
+            let dialog = self.search_dialog.clone().unwrap_or_else(|| {
+                let viewport = [
+                    self.layout.viewport_px.width,
+                    self.layout.viewport_px.height,
+                ];
+                let mut dialog = crate::search::SearchDialogPresentation::layout(
+                    viewport,
+                    self.gfx.scale().0,
+                    self.active_session().search().query().to_owned(),
+                );
+                if let Some(origin) = self.search_dialog_origin {
+                    dialog.move_to(origin, viewport);
+                }
+                dialog
+            });
+            let input = dialog.input;
+            return Some(leyline_gfx::TextInputRectangle {
+                x: logical(input.x),
+                y: logical(input.y),
+                width: logical(input.width).max(1),
+                height: logical(input.height).max(1),
+            });
+        }
+        let snapshot = self.active_session().latest_snapshot()?;
         let visual_column = self.published_visual_map.as_ref().map_or_else(
             || (!self.app.config().unicode.bidi).then_some(snapshot.cursor.column),
             |map| {
@@ -1108,15 +1261,27 @@ impl UiRuntime {
         let physical_y = self.layout.content_origin_px[1].saturating_add(
             u32::from(snapshot.cursor.line) * u32::from(self.layout.cell_px[1].get()),
         );
-        let logical = |value: u32| {
-            i32::try_from(u64::from(value) * 120 / u64::from(scale)).unwrap_or(i32::MAX)
-        };
         Some(leyline_gfx::TextInputRectangle {
             x: logical(physical_x),
             y: logical(physical_y),
             width: logical(u32::from(self.layout.cell_px[0].get())).max(1),
             height: logical(u32::from(self.layout.cell_px[1].get())).max(1),
         })
+    }
+
+    fn text_input_context(&self) -> Option<leyline_gfx::TextInputContext> {
+        let rectangle = self.text_input_rectangle()?;
+        if self.search_focused && self.active_session().search().is_open() {
+            let search = self.active_session().search();
+            leyline_gfx::TextInputContext::search(
+                rectangle,
+                search.query().to_owned(),
+                search.cursor_byte(),
+            )
+            .ok()
+        } else {
+            Some(leyline_gfx::TextInputContext::terminal(rectangle))
+        }
     }
 
     fn compose_latest(&mut self) -> Result<(), UiRuntimeError> {
@@ -1166,6 +1331,8 @@ impl UiRuntime {
         visual_map: Arc<VisualGridMap>,
     ) -> Result<(), UiRuntimeError> {
         self.update_tab_bar();
+        let search_dialog = self.search_dialog_presentation();
+        self.search_dialog.clone_from(&search_dialog);
         self.ime.reanchor_preedit(
             snapshot.generation,
             [snapshot.cursor.column, snapshot.cursor.line],
@@ -1173,6 +1340,8 @@ impl UiRuntime {
         self.refresh_text_input_rectangle()?;
         let paste_confirmation = self.paste_confirmation_overlay().copied();
         let selection = self.active_session().selection_overlay(snapshot.generation);
+        let search = self.active_session().search_overlay(snapshot);
+        let search_focused = self.search_focused && self.active_session().search().is_open();
         let geometry = ScrollbarGeometry::calculate(
             snapshot,
             &self.layout,
@@ -1193,10 +1362,14 @@ impl UiRuntime {
             snapshot,
             FrameOverlays {
                 selection: &selection,
-                preedit: self.ime.preedit.as_ref(),
+                search: search.as_ref(),
+                preedit: (!search_focused)
+                    .then_some(self.ime.preedit.as_ref())
+                    .flatten(),
                 paste_confirmation: paste_confirmation.as_ref(),
                 scrollbar: scrollbar.as_ref(),
                 tab_bar: Some(&self.tab_bar),
+                search_dialog: search_dialog.as_ref(),
                 visual_bell: Some(&crate::bell::VisualBellPresentation {
                     active: self
                         .tabs
@@ -1240,6 +1413,68 @@ impl UiRuntime {
         );
     }
 
+    fn search_dialog_presentation(&self) -> Option<crate::search::SearchDialogPresentation> {
+        let search = self.active_session().search();
+        if !search.is_open() {
+            return None;
+        }
+        let mut query = search.query().to_owned();
+        let mut cursor = search.cursor_byte();
+        if self.search_focused
+            && let Some(preedit) = &self.ime.preedit
+            && query.is_char_boundary(cursor)
+        {
+            query.insert_str(cursor, &preedit.text);
+            cursor = cursor.saturating_add(preedit.text.len());
+        }
+        if query.is_char_boundary(cursor) {
+            let viewport = [
+                self.layout.viewport_px.width,
+                self.layout.viewport_px.height,
+            ];
+            let mut layout = crate::search::SearchDialogPresentation::layout(
+                viewport,
+                self.gfx.scale().0,
+                String::new(),
+            );
+            if let Some(origin) = self.search_dialog_origin {
+                layout.move_to(origin, viewport);
+            }
+            let visible_chars =
+                search_query_capacity(layout.input.width, self.text.metrics().width_px.get());
+            layout.query_text =
+                visible_search_query(&query, cursor, visible_chars, self.search_focused);
+            return Some(layout);
+        }
+        None
+    }
+
+    fn set_search_focus(&mut self, focused: bool) -> Result<(), UiRuntimeError> {
+        if self.search_focused == focused || !self.active_session().search().is_open() {
+            return Ok(());
+        }
+        self.search_focused = focused;
+        if !focused {
+            self.pending_search_paste = None;
+        }
+        if self.ime.is_active() {
+            self.ime.deactivate();
+            self.ime.activate();
+            self.ime_context = None;
+        }
+        self.compose_latest()?;
+        self.refresh_text_input_rectangle()
+    }
+
+    fn set_pointer_cursor(
+        &mut self,
+        cursor: leyline_gfx::PointerCursor,
+    ) -> Result<(), UiRuntimeError> {
+        self.gfx
+            .apply(leyline_gfx::GfxCommand::SetPointerCursor(cursor))?;
+        Ok(())
+    }
+
     fn paste_confirmation_overlay(&self) -> Option<&crate::clipboard::PasteConfirmationOverlay> {
         self.selection.overlay()
     }
@@ -1259,7 +1494,7 @@ impl UiRuntime {
                 self.ime.record_commit_serial(serial);
             }
             self.ime.deactivate();
-            self.ime_rectangle = None;
+            self.ime_context = None;
         }
         if let Some(overlay) = self.selection.overlay() {
             tracing::warn!(
@@ -1340,6 +1575,14 @@ impl UiRuntime {
                 self.copy_selection(leyline_gfx::SelectionTarget::Clipboard)?;
             }
             Action::PasteClipboard => {
+                if self.search_focused && self.active_session().search().is_open() {
+                    self.pending_search_paste = Some((
+                        self.tabs.active_id().expect("active tab"),
+                        self.active_session().search().revision(),
+                    ));
+                } else {
+                    self.pending_search_paste = None;
+                }
                 self.request_paste(leyline_gfx::SelectionTarget::Clipboard)?;
             }
             Action::IncreaseFontSize => {
@@ -1393,6 +1636,35 @@ impl UiRuntime {
                     "tab bell mute changed"
                 );
                 self.compose_latest()?;
+            }
+            Action::Search => {
+                self.active_session_mut().open_search();
+                if self.search_focused {
+                    self.compose_latest()?;
+                    self.refresh_text_input_rectangle()?;
+                } else {
+                    self.set_search_focus(true)?;
+                }
+            }
+            Action::SearchNext => {
+                self.active_session_mut()
+                    .navigate_search(crate::search::SearchDirection::Next, Instant::now())?;
+                self.compose_latest()?;
+            }
+            Action::SearchPrevious => {
+                self.active_session_mut()
+                    .navigate_search(crate::search::SearchDirection::Previous, Instant::now())?;
+                self.compose_latest()?;
+            }
+            Action::CancelSearch => {
+                self.pending_search_paste = None;
+                self.search_dialog_drag = None;
+                self.search_dialog_origin = None;
+                self.set_pointer_cursor(leyline_gfx::PointerCursor::Text)?;
+                self.set_search_focus(false)?;
+                self.active_session_mut().cancel_search();
+                self.compose_latest()?;
+                self.refresh_text_input_rectangle()?;
             }
         }
         Ok(())
@@ -1571,7 +1843,7 @@ impl UiRuntime {
             self.ime.record_commit_serial(serial);
         }
         self.ime.deactivate();
-        self.ime_rectangle = None;
+        self.ime_context = None;
         if self.keyboard_focused {
             self.active_session_mut().focus_changed(false)?;
         }
@@ -1620,6 +1892,104 @@ impl UiRuntime {
             (event.position.0 * scale).floor() as u32,
             (event.position.1 * scale).max(0.0).floor() as u32,
         ];
+        let viewport = [
+            self.layout.viewport_px.width,
+            self.layout.viewport_px.height,
+        ];
+        let drag_outset = 8_u32.saturating_mul(self.gfx.scale().0).saturating_add(119) / 120;
+        let drag_hit = self.search_dialog.as_ref().is_some_and(|dialog| {
+            self.active_session().search().is_open()
+                && dialog.drag_hit_test(pixel, viewport, drag_outset)
+        });
+        if let Some(drag) = self.search_dialog_drag {
+            self.gfx.apply(leyline_gfx::GfxCommand::SetPointerCursor(
+                leyline_gfx::PointerCursor::Grabbing,
+            ))?;
+            match event.kind {
+                leyline_gfx::PointerKind::Motion { .. } => {
+                    self.search_dialog_origin = Some([
+                        u32::try_from(
+                            (i64::from(pixel[0]) - drag.grab_offset[0])
+                                .clamp(0, i64::from(u32::MAX)),
+                        )
+                        .unwrap_or(0),
+                        u32::try_from(
+                            (i64::from(pixel[1]) - drag.grab_offset[1])
+                                .clamp(0, i64::from(u32::MAX)),
+                        )
+                        .unwrap_or(0),
+                    ]);
+                    self.compose_latest()?;
+                    return Ok(());
+                }
+                leyline_gfx::PointerKind::Release { button: 0x110, .. } => {
+                    self.search_dialog_drag = None;
+                    self.gfx
+                        .apply(leyline_gfx::GfxCommand::SetPointerCursor(if drag_hit {
+                            leyline_gfx::PointerCursor::Grab
+                        } else {
+                            leyline_gfx::PointerCursor::Text
+                        }))?;
+                    return Ok(());
+                }
+                _ => return Ok(()),
+            }
+        }
+        self.gfx
+            .apply(leyline_gfx::GfxCommand::SetPointerCursor(if drag_hit {
+                leyline_gfx::PointerCursor::Grab
+            } else {
+                leyline_gfx::PointerCursor::Text
+            }))?;
+        if self.active_session().search().is_open()
+            && let Some(dialog) = self.search_dialog.clone()
+        {
+            let primary_press = matches!(
+                event.kind,
+                leyline_gfx::PointerKind::Press { button: 0x110, .. }
+            );
+            if dialog.panel.contains(pixel) {
+                if primary_press && dialog.input.contains(pixel) {
+                    self.set_search_focus(true)?;
+                } else if primary_press && dialog.previous.contains(pixel) {
+                    self.active_session_mut().navigate_search(
+                        crate::search::SearchDirection::Previous,
+                        Instant::now(),
+                    )?;
+                    self.compose_latest()?;
+                } else if primary_press && dialog.next.contains(pixel) {
+                    self.active_session_mut()
+                        .navigate_search(crate::search::SearchDirection::Next, Instant::now())?;
+                    self.compose_latest()?;
+                } else if primary_press {
+                    self.search_dialog_drag = Some(SearchDialogDrag {
+                        grab_offset: [
+                            i64::from(pixel[0]) - i64::from(dialog.panel.x),
+                            i64::from(pixel[1]) - i64::from(dialog.panel.y),
+                        ],
+                    });
+                    self.gfx.apply(leyline_gfx::GfxCommand::SetPointerCursor(
+                        leyline_gfx::PointerCursor::Grabbing,
+                    ))?;
+                }
+                return Ok(());
+            }
+            if primary_press && drag_hit {
+                self.search_dialog_drag = Some(SearchDialogDrag {
+                    grab_offset: [
+                        i64::from(pixel[0]) - i64::from(dialog.panel.x),
+                        i64::from(pixel[1]) - i64::from(dialog.panel.y),
+                    ],
+                });
+                self.gfx.apply(leyline_gfx::GfxCommand::SetPointerCursor(
+                    leyline_gfx::PointerCursor::Grabbing,
+                ))?;
+                return Ok(());
+            }
+            if primary_press {
+                self.set_search_focus(false)?;
+            }
+        }
         if self.tab_bar.bar.is_some_and(|bar| bar.contains(pixel)) {
             match event.kind {
                 leyline_gfx::PointerKind::Press { button: 0x110, .. } => {
@@ -2194,15 +2564,32 @@ impl UiRuntime {
                         .tabs
                         .active_id()
                         .expect("runtime always has an active tab");
+                    let search_target = self.pending_search_paste.take();
                     match self.selection.transfer_completed(
                         crate::selection::RequestToken::from_raw(request),
                         target,
                         result,
-                        self.app.config().behavior.confirm_multiline_paste,
+                        search_target.is_none()
+                            && self.app.config().behavior.confirm_multiline_paste,
                         active,
                     ) {
                         crate::selection::PasteTransition::Paste { owner, text } => {
-                            self.paste_for_owner(owner, &text)?;
+                            if let Some((search_owner, revision)) = search_target {
+                                if owner == search_owner
+                                    && self.tabs.active_id() == Some(owner)
+                                    && self.search_focused
+                                    && self.active_session().search().is_open()
+                                    && self.active_session().search().revision() == revision
+                                {
+                                    self.active_session_mut().edit_search(
+                                        crate::search::SearchEdit::Insert(&text),
+                                        Instant::now(),
+                                    );
+                                    self.compose_latest()?;
+                                }
+                            } else {
+                                self.paste_for_owner(owner, &text)?;
+                            }
                         }
                         crate::selection::PasteTransition::Confirming => {
                             self.enter_paste_confirmation()?;
@@ -2282,6 +2669,8 @@ fn ignores_key_repeat(action: crate::config::Action) -> bool {
             | crate::config::Action::CopyClipboard
             | crate::config::Action::PasteClipboard
             | crate::config::Action::PastePrimary
+            | crate::config::Action::Search
+            | crate::config::Action::CancelSearch
     )
 }
 
@@ -2301,6 +2690,10 @@ fn accumulate_wheel_steps(remainder_120: &mut i32, delta_120: i32) -> i32 {
     let steps = (total / 120).clamp(-4, 4);
     *remainder_120 = total % 120;
     steps
+}
+
+fn should_cancel_search(search_open: bool, key: leyline_gfx::LogicalKey) -> bool {
+    search_open && key == leyline_gfx::LogicalKey::Escape
 }
 
 fn terminal_modifiers(key: &leyline_gfx::KeyInput) -> crate::terminal::Modifiers {
@@ -2329,6 +2722,44 @@ fn key_text(key: &leyline_gfx::KeyInput) -> Option<String> {
             leyline_gfx::LogicalKey::Character(ch) => Some(ch.to_string()),
             _ => None,
         })
+}
+
+fn visible_search_query(
+    query: &str,
+    cursor_byte: usize,
+    max_chars: usize,
+    show_cursor: bool,
+) -> String {
+    if !query.is_char_boundary(cursor_byte) {
+        return if show_cursor { "|" } else { "" }.to_owned();
+    }
+    let query_capacity = max_chars.saturating_sub(usize::from(show_cursor));
+    let total_chars = query.chars().count();
+    let cursor_char = query[..cursor_byte].chars().count();
+    let start_char = cursor_char
+        .saturating_sub(query_capacity / 2)
+        .min(total_chars.saturating_sub(query_capacity));
+    let end_char = start_char.saturating_add(query_capacity).min(total_chars);
+    let byte_at = |index: usize| {
+        query
+            .char_indices()
+            .nth(index)
+            .map_or(query.len(), |(byte, _)| byte)
+    };
+    let start_byte = byte_at(start_char);
+    let end_byte = byte_at(end_char);
+    let mut visible = String::with_capacity(end_byte.saturating_sub(start_byte) + 1);
+    visible.push_str(&query[start_byte..cursor_byte]);
+    if show_cursor {
+        visible.push('|');
+    }
+    visible.push_str(&query[cursor_byte..end_byte]);
+    visible
+}
+
+fn search_query_capacity(input_width: u32, cell_width: u16) -> usize {
+    usize::try_from(input_width.saturating_sub(20)).unwrap_or(usize::MAX)
+        / usize::from(cell_width.max(1))
 }
 
 fn select_new_tab_cwd(
@@ -2385,9 +2816,21 @@ fn window_title(ordinal: usize, count: usize, title: &str) -> String {
 mod tests {
     use super::{
         accumulate_wheel_steps, format_terminal_query, ignores_key_repeat,
-        keep_selection_after_release, key_text, select_new_tab_cwd, take_matching_pending,
-        terminal_modifiers, visual_mapping_changed,
+        keep_selection_after_release, key_text, search_query_capacity, select_new_tab_cwd,
+        should_cancel_search, take_matching_pending, terminal_modifiers, visible_search_query,
+        visual_mapping_changed,
     };
+
+    #[test]
+    fn search_query_window_follows_the_utf8_cursor() {
+        assert_eq!(search_query_capacity(112, 9), 10);
+        assert_eq!(visible_search_query("abc", 3, 10, true), "abc|");
+        assert_eq!(visible_search_query("0123456789", 0, 5, true), "|0123");
+        assert_eq!(visible_search_query("0123456789", 5, 5, true), "34|56");
+        assert_eq!(visible_search_query("0123456789", 10, 5, true), "6789|");
+        assert_eq!(visible_search_query("甲乙丙丁戊", 9, 3, true), "丙|丁");
+        assert_eq!(visible_search_query("0123456789", 5, 5, false), "34567");
+    }
 
     #[test]
     fn new_tab_policy_selects_fixed_home_and_base_candidates() {
@@ -2520,6 +2963,16 @@ mod tests {
         assert!(ignores_key_repeat(crate::config::Action::PasteClipboard));
         assert!(ignores_key_repeat(crate::config::Action::PastePrimary));
         assert!(!ignores_key_repeat(crate::config::Action::ScrollPageDown));
+    }
+
+    #[test]
+    fn escape_closes_an_open_search_regardless_of_editor_focus() {
+        assert!(should_cancel_search(true, leyline_gfx::LogicalKey::Escape));
+        assert!(!should_cancel_search(
+            false,
+            leyline_gfx::LogicalKey::Escape
+        ));
+        assert!(!should_cancel_search(true, leyline_gfx::LogicalKey::Enter));
     }
 
     #[test]

@@ -78,8 +78,9 @@ use wayland_protocols::wp::{
 use crate::decor::{Libdecor, ResizeEdge};
 use crate::{
     ClipboardEvent, GfxInitError, InputSerial, KeyInput, KeyState, LogicalSize, ModifierMask,
-    ModifiersState, PlatformEvent, PointerInput, PointerKind, Scale120, SeatToken, SelectionTarget,
-    SerialKind, TextInputEvent, TextInputRectangle, WindowState, logical_key_from_keysym,
+    ModifiersState, PlatformEvent, PointerCursor, PointerInput, PointerKind, Scale120, SeatToken,
+    SelectionTarget, SerialKind, TextInputContext, TextInputEvent, TextInputPurpose, WindowState,
+    logical_key_from_keysym,
 };
 
 const DEFAULT_SIZE: LogicalSize = LogicalSize {
@@ -402,6 +403,8 @@ impl WaylandWindow {
                 cursor_surface,
                 libdecor_resize_fallback: !has_server_decor,
                 pointer_icon: None,
+                pointer_cursor: PointerCursor::Text,
+                pointer_resize_edge: None,
                 resize_press_active: false,
                 data_device_manager,
                 data_device: None,
@@ -679,7 +682,7 @@ impl WaylandWindow {
 
     pub(crate) fn enable_text_input(
         &mut self,
-        rectangle: TextInputRectangle,
+        context: TextInputContext,
     ) -> Result<Option<u32>, String> {
         if !self.state.text_input_focused {
             return Ok(None);
@@ -688,12 +691,23 @@ impl WaylandWindow {
             return Ok(None);
         };
         input.enable();
-        input.set_content_type(ContentHint::None, ContentPurpose::Terminal);
+        input.set_content_type(
+            ContentHint::None,
+            match context.purpose {
+                TextInputPurpose::Terminal => ContentPurpose::Terminal,
+                TextInputPurpose::Normal => ContentPurpose::Normal,
+            },
+        );
+        input.set_surrounding_text(
+            context.surrounding_text,
+            context.cursor_byte,
+            context.anchor_byte,
+        );
         input.set_cursor_rectangle(
-            rectangle.x,
-            rectangle.y,
-            rectangle.width.max(1),
-            rectangle.height.max(1),
+            context.rectangle.x,
+            context.rectangle.y,
+            context.rectangle.width.max(1),
+            context.rectangle.height.max(1),
         );
         input.commit();
         self.surface.commit();
@@ -704,7 +718,7 @@ impl WaylandWindow {
 
     pub(crate) fn update_text_input(
         &mut self,
-        rectangle: TextInputRectangle,
+        context: TextInputContext,
     ) -> Result<Option<u32>, String> {
         if !self.state.text_input_focused {
             return Ok(None);
@@ -712,12 +726,23 @@ impl WaylandWindow {
         let Some(input) = self.state.text_input.as_ref() else {
             return Ok(None);
         };
-        input.set_content_type(ContentHint::None, ContentPurpose::Terminal);
+        input.set_content_type(
+            ContentHint::None,
+            match context.purpose {
+                TextInputPurpose::Terminal => ContentPurpose::Terminal,
+                TextInputPurpose::Normal => ContentPurpose::Normal,
+            },
+        );
+        input.set_surrounding_text(
+            context.surrounding_text,
+            context.cursor_byte,
+            context.anchor_byte,
+        );
         input.set_cursor_rectangle(
-            rectangle.x,
-            rectangle.y,
-            rectangle.width.max(1),
-            rectangle.height.max(1),
+            context.rectangle.x,
+            context.rectangle.y,
+            context.rectangle.width.max(1),
+            context.rectangle.height.max(1),
         );
         input.commit();
         self.surface.commit();
@@ -730,6 +755,8 @@ impl WaylandWindow {
         let Some(input) = self.state.text_input.as_ref() else {
             return Ok(None);
         };
+        input.set_surrounding_text(String::new(), 0, 0);
+        input.set_content_type(ContentHint::None, ContentPurpose::Terminal);
         input.disable();
         input.commit();
         self.surface.commit();
@@ -820,6 +847,11 @@ impl WaylandWindow {
             let _ = decor.set_title(title);
         }
     }
+    pub(crate) fn set_pointer_cursor(&mut self, cursor: PointerCursor) {
+        self.state.pointer_cursor = cursor;
+        let edge = self.state.pointer_resize_edge;
+        self.state.set_pointer_cursor(&self.connection, edge);
+    }
     pub(crate) fn display_ptr(&self) -> *mut c_void {
         self.connection.backend().display_ptr().cast()
     }
@@ -839,6 +871,8 @@ pub(crate) struct WaylandState {
     cursor_surface: wl_surface::WlSurface,
     libdecor_resize_fallback: bool,
     pointer_icon: Option<CursorIcon>,
+    pointer_cursor: PointerCursor,
+    pointer_resize_edge: Option<ResizeEdge>,
     resize_press_active: bool,
     data_device_manager: DataDeviceManagerState,
     data_device: Option<DataDevice>,
@@ -1201,6 +1235,7 @@ impl PointerHandler for WaylandState {
                 .libdecor_resize_fallback
                 .then(|| content_resize_edge(event.position, self.logical_size))
                 .flatten();
+            self.pointer_resize_edge = edge;
             let kind = match &event.kind {
                 PointerEventKind::Enter { serial } => {
                     // Cursor requests are serial-bound and must be repeated for every enter.
@@ -1210,9 +1245,12 @@ impl PointerHandler for WaylandState {
                         serial: self.pointer_serial(*serial),
                     }
                 }
-                PointerEventKind::Leave { serial } => PointerKind::Leave {
-                    serial: self.pointer_serial(*serial),
-                },
+                PointerEventKind::Leave { serial } => {
+                    self.pointer_resize_edge = None;
+                    PointerKind::Leave {
+                        serial: self.pointer_serial(*serial),
+                    }
+                }
                 PointerEventKind::Motion { time } => {
                     self.set_pointer_cursor(connection, edge);
                     PointerKind::Motion { time_ms: *time }
@@ -1292,7 +1330,11 @@ impl WaylandState {
             Some(ResizeEdge::Right) => CursorIcon::EResize,
             Some(ResizeEdge::TopRight) => CursorIcon::NeResize,
             Some(ResizeEdge::BottomRight) => CursorIcon::SeResize,
-            None => CursorIcon::Text,
+            None => match self.pointer_cursor {
+                PointerCursor::Text => CursorIcon::Text,
+                PointerCursor::Grab => CursorIcon::Grab,
+                PointerCursor::Grabbing => CursorIcon::Grabbing,
+            },
         };
         if self.pointer_icon == Some(icon) {
             return;

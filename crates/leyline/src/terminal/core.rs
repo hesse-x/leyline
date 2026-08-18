@@ -10,10 +10,14 @@ use alacritty_terminal::{
     vte::ansi::{self, Color, NamedColor, Rgb},
 };
 
+use super::search::{
+    CompiledLiteral, CompiledRegex, RegexScanCursor, RegexScanStep, SearchAnchor, SearchBudget,
+    SearchContentId, SearchError, SearchMatch, SearchProjection, SearchScanCursor, SearchScanStep,
+};
 use super::snapshot::{
     CellFlags, CellWidth, CursorBlink, CursorShape, CursorSnapshot, FrameSnapshot, GridSize,
-    MouseEncoding, MouseProtocol, ProjectedSelection, SelectionKind, SelectionPoint, SelectionSide,
-    SnapshotCell, SnapshotHyperlink, TerminalColor, TerminalModes, UnderlineStyle,
+    MouseEncoding, MouseProtocol, ProjectedSelection, SearchBuffer, SelectionKind, SelectionPoint,
+    SelectionSide, SnapshotCell, SnapshotHyperlink, TerminalColor, TerminalModes, UnderlineStyle,
 };
 use crate::{
     app::event::ByteBatch,
@@ -128,6 +132,7 @@ pub struct TerminalCoreAdapter {
     events: Rc<RefCell<ListenerState>>,
     actions: Vec<TerminalAction>,
     generation: u64,
+    content_revision: u64,
     size: GridSize,
     title: Option<Arc<str>>,
     cached: RefCell<Option<FrameSnapshot>>,
@@ -165,6 +170,7 @@ impl TerminalCoreAdapter {
             events,
             actions: Vec::new(),
             generation: 0,
+            content_revision: 0,
             size,
             title: None,
             cached: RefCell::new(None),
@@ -201,10 +207,7 @@ impl TerminalCoreAdapter {
                 audit: merge_audit(event_audit, parser_audit, commits.capacity),
             });
         }
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .ok_or(TerminalError::GenerationOverflow)?;
+        self.bump_content_revision()?;
         self.cached.get_mut().take();
         let event_audit = self.collect_events();
         Ok(TerminalDelta {
@@ -251,10 +254,7 @@ impl TerminalCoreAdapter {
         self.parser.stop_sync(&mut self.term);
         self.parser.take_sync_commit_delta();
         let parser_audit = self.parser.take_audit_delta();
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .ok_or(TerminalError::GenerationOverflow)?;
+        self.bump_content_revision()?;
         self.cached.get_mut().take();
         let event_audit = self.collect_events();
         let mut audit = merge_audit(event_audit, parser_audit, 0);
@@ -284,10 +284,7 @@ impl TerminalCoreAdapter {
         self.term
             .resize(TermSize::new(size.columns(), size.lines()));
         self.size = size;
-        self.generation = self
-            .generation
-            .checked_add(1)
-            .ok_or(TerminalError::GenerationOverflow)?;
+        self.bump_content_revision()?;
         self.cached.get_mut().take();
         Ok(TerminalDelta {
             dirty: true,
@@ -299,6 +296,349 @@ impl TerminalCoreAdapter {
     #[must_use]
     pub const fn size(&self) -> GridSize {
         self.size
+    }
+
+    #[must_use]
+    pub fn search_content_id(&self) -> SearchContentId {
+        SearchContentId::new(
+            self.content_revision,
+            self.size,
+            if self.term.mode().contains(TermMode::ALT_SCREEN) {
+                SearchBuffer::Alternate
+            } else {
+                SearchBuffer::Normal
+            },
+        )
+    }
+
+    pub fn compile_literal_search(&self, query: &str) -> Result<CompiledLiteral, SearchError> {
+        super::search::compile(query)
+    }
+
+    pub fn compile_regex_search(&self, query: &str) -> Result<CompiledRegex, SearchError> {
+        super::search::compile_regex(query)
+    }
+
+    #[must_use]
+    pub fn search_scan_cursor(&self) -> SearchScanCursor {
+        SearchScanCursor {
+            content: self.search_content_id(),
+            line: self.term.topmost_line().0,
+            column: 0,
+            scalar_offset: 0,
+            progress: 0,
+            recent: std::collections::VecDeque::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn regex_scan_cursor(&self) -> RegexScanCursor {
+        RegexScanCursor {
+            content: self.search_content_id(),
+            line: self.term.topmost_line().0,
+            column: 0,
+            scalar_offset: 0,
+            text: String::new(),
+            anchors: Vec::new(),
+            byte_offsets: Vec::new(),
+            matching: false,
+            match_offset: 0,
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn scan_regex_slice(
+        &self,
+        compiled: &CompiledRegex,
+        mut cursor: RegexScanCursor,
+        budget: SearchBudget,
+    ) -> Result<RegexScanStep, SearchError> {
+        let content = self.search_content_id();
+        if cursor.content != content {
+            return Err(SearchError::StaleContent);
+        }
+        let max_rows = budget.max_rows.min(super::search::MAX_SEARCH_SLICE_ROWS);
+        let max_matches = budget.max_matches.min(super::search::MAX_SEARCH_MATCHES);
+        let last_line =
+            i32::try_from(self.size.lines()).map_err(|_| SearchError::InvalidCoordinate)? - 1;
+        let columns = self.size.columns();
+        let mut matches = Vec::new();
+        let mut scanned_rows = 0;
+        let mut scalars_since_clock = 0;
+
+        loop {
+            if cursor.matching {
+                collect_regex_matches(compiled, &mut cursor, &mut matches, max_matches)?;
+                if matches.len() == max_matches {
+                    return Ok(RegexScanStep {
+                        content,
+                        matches,
+                        next: Some(cursor),
+                        scanned_rows,
+                    });
+                }
+                cursor.text.clear();
+                cursor.anchors.clear();
+                cursor.byte_offsets.clear();
+                cursor.matching = false;
+                cursor.match_offset = 0;
+            }
+            if cursor.line > last_line || scanned_rows == max_rows {
+                break;
+            }
+            let cell = &self.term.grid()[Point::new(Line(cursor.line), Column(cursor.column))];
+            let is_spacer = cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+            let zero_width = cell
+                .zerowidth()
+                .filter(|value| !value.is_empty() && value.len() <= MAX_ZERO_WIDTH_PER_CELL);
+            let scalar_count = if is_spacer {
+                0
+            } else {
+                1 + zero_width.map_or(0, <[char]>::len)
+            };
+            while cursor.scalar_offset < scalar_count {
+                let value = if cursor.scalar_offset == 0 {
+                    if cell.c == '\t' { ' ' } else { cell.c }
+                } else {
+                    *zero_width
+                        .and_then(|values| values.get(cursor.scalar_offset - 1))
+                        .ok_or(SearchError::InvalidCoordinate)?
+                };
+                let next_bytes = cursor
+                    .text
+                    .len()
+                    .checked_add(value.len_utf8())
+                    .ok_or(SearchError::RegexLineTooLong)?;
+                if next_bytes > super::search::MAX_REGEX_LOGICAL_LINE_BYTES {
+                    return Err(SearchError::RegexLineTooLong);
+                }
+                cursor
+                    .text
+                    .try_reserve(value.len_utf8())
+                    .map_err(|_| SearchError::Allocation)?;
+                cursor
+                    .anchors
+                    .try_reserve(1)
+                    .map_err(|_| SearchError::Allocation)?;
+                cursor
+                    .byte_offsets
+                    .try_reserve(1)
+                    .map_err(|_| SearchError::Allocation)?;
+                cursor.byte_offsets.push(cursor.text.len());
+                cursor.anchors.push(SearchAnchor {
+                    history_line: cursor.line,
+                    column: u16::try_from(cursor.column)
+                        .map_err(|_| SearchError::InvalidCoordinate)?,
+                    scalar_offset: u8::try_from(cursor.scalar_offset)
+                        .map_err(|_| SearchError::InvalidCoordinate)?,
+                });
+                cursor.text.push(value);
+                cursor.scalar_offset += 1;
+                scalars_since_clock += 1;
+                if scalars_since_clock == 64 {
+                    scalars_since_clock = 0;
+                    if (budget.clock)() >= budget.deadline {
+                        return Ok(RegexScanStep {
+                            content,
+                            matches,
+                            next: Some(cursor),
+                            scanned_rows,
+                        });
+                    }
+                }
+            }
+            cursor.scalar_offset = 0;
+            cursor.column += 1;
+            if cursor.column == columns {
+                let wrapped = cell.flags.contains(Flags::WRAPLINE);
+                cursor.column = 0;
+                cursor.line += 1;
+                scanned_rows += 1;
+                if !wrapped || cursor.line > last_line {
+                    cursor.matching = true;
+                }
+                if (budget.clock)() >= budget.deadline {
+                    break;
+                }
+            }
+        }
+        let next = (cursor.line <= last_line || cursor.matching).then_some(cursor);
+        Ok(RegexScanStep {
+            content,
+            matches,
+            next,
+            scanned_rows,
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub fn scan_search_slice(
+        &self,
+        compiled: &CompiledLiteral,
+        mut cursor: SearchScanCursor,
+        budget: SearchBudget,
+    ) -> Result<SearchScanStep, SearchError> {
+        let content = self.search_content_id();
+        if cursor.content != content {
+            return Err(SearchError::StaleContent);
+        }
+        let max_rows = budget.max_rows.min(super::search::MAX_SEARCH_SLICE_ROWS);
+        let max_matches = budget.max_matches.min(super::search::MAX_SEARCH_MATCHES);
+        let last_line =
+            i32::try_from(self.size.lines()).map_err(|_| SearchError::InvalidCoordinate)? - 1;
+        let columns = self.size.columns();
+        let mut matches = Vec::new();
+        let mut scanned_rows = 0;
+        let mut scalars_since_clock = 0;
+
+        while cursor.line <= last_line && scanned_rows < max_rows && matches.len() < max_matches {
+            let cell = &self.term.grid()[Point::new(Line(cursor.line), Column(cursor.column))];
+            let is_spacer = cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER);
+            let zero_width = cell
+                .zerowidth()
+                .filter(|value| !value.is_empty() && value.len() <= MAX_ZERO_WIDTH_PER_CELL);
+            let scalar_count = if is_spacer {
+                0
+            } else {
+                1 + zero_width.map_or(0, <[char]>::len)
+            };
+            while cursor.scalar_offset < scalar_count {
+                let value = if cursor.scalar_offset == 0 {
+                    if cell.c == '\t' { ' ' } else { cell.c }
+                } else {
+                    *zero_width
+                        .and_then(|values| values.get(cursor.scalar_offset - 1))
+                        .ok_or(SearchError::InvalidCoordinate)?
+                };
+                let anchor = SearchAnchor {
+                    history_line: cursor.line,
+                    column: u16::try_from(cursor.column)
+                        .map_err(|_| SearchError::InvalidCoordinate)?,
+                    scalar_offset: u8::try_from(cursor.scalar_offset)
+                        .map_err(|_| SearchError::InvalidCoordinate)?,
+                };
+                while cursor.progress > 0 && value != compiled.pattern[cursor.progress] {
+                    cursor.progress = compiled.prefix[cursor.progress - 1];
+                }
+                if value == compiled.pattern[cursor.progress] {
+                    cursor.progress += 1;
+                }
+                cursor.recent.push_back(anchor);
+                while cursor.recent.len() > compiled.pattern.len() {
+                    cursor.recent.pop_front();
+                }
+                cursor.scalar_offset += 1;
+                scalars_since_clock += 1;
+                if cursor.progress == compiled.pattern.len() {
+                    if let Some(start) = cursor.recent.front().copied() {
+                        matches.push(SearchMatch { start, end: anchor });
+                    }
+                    cursor.progress = compiled.prefix[cursor.progress - 1];
+                }
+                if scalars_since_clock == 64 {
+                    scalars_since_clock = 0;
+                    if (budget.clock)() >= budget.deadline {
+                        return Ok(SearchScanStep {
+                            content,
+                            matches,
+                            next: Some(cursor),
+                            scanned_rows,
+                        });
+                    }
+                }
+                if matches.len() == max_matches {
+                    return Ok(SearchScanStep {
+                        content,
+                        matches,
+                        next: Some(cursor),
+                        scanned_rows,
+                    });
+                }
+            }
+            cursor.scalar_offset = 0;
+            cursor.column += 1;
+            if cursor.column == columns {
+                let wrapped = cell.flags.contains(Flags::WRAPLINE);
+                cursor.column = 0;
+                cursor.line += 1;
+                scanned_rows += 1;
+                if !wrapped {
+                    cursor.progress = 0;
+                    cursor.recent.clear();
+                }
+                if (budget.clock)() >= budget.deadline {
+                    break;
+                }
+            }
+        }
+        let next = (cursor.line <= last_line).then_some(cursor);
+        Ok(SearchScanStep {
+            content,
+            matches,
+            next,
+            scanned_rows,
+        })
+    }
+
+    pub fn project_search_match(
+        &self,
+        value: SearchMatch,
+    ) -> Result<SearchProjection, SearchError> {
+        let offset = i32::try_from(self.term.grid().display_offset())
+            .map_err(|_| SearchError::InvalidCoordinate)?;
+        let project = |anchor: SearchAnchor| -> Result<[u16; 2], SearchError> {
+            if usize::from(anchor.column) >= self.size.columns() {
+                return Err(SearchError::InvalidCoordinate);
+            }
+            let line = anchor
+                .history_line
+                .checked_add(offset)
+                .ok_or(SearchError::InvalidCoordinate)?;
+            if line < 0
+                || usize::try_from(line)
+                    .ok()
+                    .is_none_or(|line| line >= self.size.lines())
+            {
+                return Err(SearchError::InvalidCoordinate);
+            }
+            Ok([
+                anchor.column,
+                u16::try_from(line).map_err(|_| SearchError::InvalidCoordinate)?,
+            ])
+        };
+        Ok(SearchProjection {
+            start: project(value.start)?,
+            end: project(value.end)?,
+        })
+    }
+
+    pub fn search_display_offset(&self, value: SearchMatch) -> Result<usize, SearchError> {
+        if value.start > value.end {
+            return Err(SearchError::InvalidCoordinate);
+        }
+        let viewport_top = -i32::try_from(self.term.grid().display_offset())
+            .map_err(|_| SearchError::InvalidCoordinate)?;
+        let viewport_bottom = viewport_top
+            .checked_add(
+                i32::try_from(self.size.lines()).map_err(|_| SearchError::InvalidCoordinate)? - 1,
+            )
+            .ok_or(SearchError::InvalidCoordinate)?;
+        let target_top = if value.start.history_line < viewport_top {
+            value.start.history_line
+        } else if value.end.history_line > viewport_bottom {
+            value.end.history_line
+                - i32::try_from(self.size.lines()).map_err(|_| SearchError::InvalidCoordinate)?
+                + 1
+        } else {
+            viewport_top
+        };
+        usize::try_from(target_top.saturating_neg())
+            .map(|offset| offset.min(self.term.history_size()))
+            .map_err(|_| SearchError::InvalidCoordinate)
     }
 
     #[allow(clippy::too_many_lines)]
@@ -392,6 +732,12 @@ impl TerminalCoreAdapter {
         let cursor_style = self.term.cursor_style();
         let snapshot = FrameSnapshot {
             generation: self.generation,
+            content_revision: self.content_revision,
+            active_buffer: if mode.contains(TermMode::ALT_SCREEN) {
+                SearchBuffer::Alternate
+            } else {
+                SearchBuffer::Normal
+            },
             grid: self.size,
             cells: cells.into(),
             cursor: CursorSnapshot {
@@ -417,6 +763,20 @@ impl TerminalCoreAdapter {
 
     pub fn drain_actions(&mut self, out: &mut Vec<TerminalAction>) {
         out.append(&mut self.actions);
+    }
+
+    fn bump_content_revision(&mut self) -> Result<(), TerminalError> {
+        let generation = self
+            .generation
+            .checked_add(1)
+            .ok_or(TerminalError::GenerationOverflow)?;
+        let content_revision = self
+            .content_revision
+            .checked_add(1)
+            .ok_or(TerminalError::GenerationOverflow)?;
+        self.generation = generation;
+        self.content_revision = content_revision;
+        Ok(())
     }
 
     pub fn start_selection(
@@ -761,6 +1121,54 @@ fn default_cell() -> SnapshotCell {
     }
 }
 
+fn collect_regex_matches(
+    compiled: &CompiledRegex,
+    cursor: &mut RegexScanCursor,
+    matches: &mut Vec<SearchMatch>,
+    max_matches: usize,
+) -> Result<(), SearchError> {
+    while cursor.match_offset <= cursor.text.len() && matches.len() < max_matches {
+        let input =
+            regex_automata::Input::new(&cursor.text).span(cursor.match_offset..cursor.text.len());
+        let Some(found) = compiled.regex.find(input) else {
+            cursor.matching = false;
+            return Ok(());
+        };
+        if found.start() == found.end() {
+            let Some(next) = cursor.text[found.end()..]
+                .chars()
+                .next()
+                .map(|value| found.end() + value.len_utf8())
+            else {
+                cursor.matching = false;
+                return Ok(());
+            };
+            cursor.match_offset = next;
+            continue;
+        }
+        let start_index = cursor
+            .byte_offsets
+            .binary_search(&found.start())
+            .map_err(|_| SearchError::InvalidCoordinate)?;
+        let end_index = cursor
+            .byte_offsets
+            .partition_point(|offset| *offset < found.end())
+            .checked_sub(1)
+            .ok_or(SearchError::InvalidCoordinate)?;
+        let start = *cursor
+            .anchors
+            .get(start_index)
+            .ok_or(SearchError::InvalidCoordinate)?;
+        let end = *cursor
+            .anchors
+            .get(end_index)
+            .ok_or(SearchError::InvalidCoordinate)?;
+        matches.push(SearchMatch { start, end });
+        cursor.match_offset = found.end();
+    }
+    Ok(())
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum TerminalError {
     #[error("PTY output batch is {0} bytes; the limit is 65536")]
@@ -895,13 +1303,22 @@ mod tests {
         let mut core = TerminalCoreAdapter::new(GridSize::new(8, 2).unwrap(), 0).unwrap();
         core.advance(b"old").unwrap();
         let before = core.snapshot().unwrap();
+        let before_content = core.search_content_id();
         assert!(!core.advance(b"\x1b[?2026hnew").unwrap().dirty);
         assert!(core.pending_sync().is_some());
+        assert_eq!(core.search_content_id(), before_content);
         assert_eq!(core.snapshot().unwrap(), before);
         assert!(!core.advance(b"er").unwrap().dirty);
         assert!(core.advance(b"\x1b[?2026l").unwrap().dirty);
         assert!(core.pending_sync().is_none());
         assert_ne!(core.snapshot().unwrap().cells, before.cells);
+        assert!(core.search_content_id().content_revision > before_content.content_revision);
+
+        let committed = core.search_content_id();
+        core.advance(b"\x1b[?2026hdiscarded").unwrap();
+        let discard_epoch = core.pending_sync().unwrap().epoch;
+        assert!(core.discard_synchronized_update(discard_epoch));
+        assert_eq!(core.search_content_id(), committed);
 
         core.advance(b"\x1b[?2026hfirst").unwrap();
         let first_epoch = core.pending_sync().unwrap().epoch;
@@ -1272,6 +1689,144 @@ mod tests {
         let mut core = TerminalCoreAdapter::new(GridSize::new(4, 2).unwrap(), 10).unwrap();
         core.advance("line\r\n".repeat(100).as_bytes()).unwrap();
         assert_eq!(core.history_size(), 10);
+    }
+
+    fn search_all(core: &TerminalCoreAdapter, query: &str) -> Vec<SearchMatch> {
+        let compiled = core.compile_literal_search(query).unwrap();
+        let mut cursor = Some(core.search_scan_cursor());
+        let mut matches = Vec::new();
+        while let Some(current) = cursor {
+            let step = core
+                .scan_search_slice(
+                    &compiled,
+                    current,
+                    SearchBudget {
+                        deadline: Instant::now() + std::time::Duration::from_secs(1),
+                        max_rows: 256,
+                        max_matches: 10_000,
+                        clock: Instant::now,
+                    },
+                )
+                .unwrap();
+            matches.extend(step.matches);
+            cursor = step.next;
+        }
+        matches
+    }
+
+    fn regex_search_all(core: &TerminalCoreAdapter, query: &str) -> Vec<SearchMatch> {
+        let compiled = core.compile_regex_search(query).unwrap();
+        let mut cursor = Some(core.regex_scan_cursor());
+        let mut matches = Vec::new();
+        while let Some(current) = cursor {
+            let step = core
+                .scan_regex_slice(
+                    &compiled,
+                    current,
+                    SearchBudget {
+                        deadline: Instant::now() + std::time::Duration::from_secs(1),
+                        max_rows: 256,
+                        max_matches: 10_000,
+                        clock: Instant::now,
+                    },
+                )
+                .unwrap();
+            matches.extend(step.matches);
+            cursor = step.next;
+        }
+        matches
+    }
+
+    #[test]
+    fn search_content_revision_excludes_viewport_scrolling() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 2).unwrap(), 10).unwrap();
+        let initial = core.search_content_id();
+        core.advance(b"one\r\ntwo\r\nthree").unwrap();
+        let changed = core.search_content_id();
+        assert!(changed.content_revision > initial.content_revision);
+        core.scroll_display(1).unwrap();
+        assert_eq!(core.search_content_id(), changed);
+        assert!(core.snapshot().unwrap().generation > initial.content_revision);
+    }
+
+    #[test]
+    fn literal_search_handles_overlap_metacharacters_and_case() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(16, 2).unwrap(), 10).unwrap();
+        core.advance(b"aaa .* Aa").unwrap();
+        assert_eq!(search_all(&core, "aa").len(), 2);
+        assert_eq!(search_all(&core, ".*").len(), 1);
+        assert_eq!(search_all(&core, "Aa").len(), 1);
+        assert!(search_all(&core, "aA").is_empty());
+    }
+
+    #[test]
+    fn literal_search_crosses_soft_wrap_but_not_hard_break() {
+        let mut wrapped = TerminalCoreAdapter::new(GridSize::new(4, 2).unwrap(), 10).unwrap();
+        wrapped.advance(b"abcdef").unwrap();
+        let matches = search_all(&wrapped, "cdef");
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].start.column, 2);
+        assert_eq!(matches[0].end.column, 1);
+
+        let mut hard = TerminalCoreAdapter::new(GridSize::new(4, 2).unwrap(), 10).unwrap();
+        hard.advance(b"ab\r\ncd").unwrap();
+        assert!(search_all(&hard, "abcd").is_empty());
+    }
+
+    #[test]
+    fn literal_search_tracks_combining_scalars_and_skips_wide_spacers() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 2).unwrap(), 10).unwrap();
+        core.advance("e\u{301}中x".as_bytes()).unwrap();
+        let combining = search_all(&core, "\u{301}");
+        assert_eq!(combining[0].start.scalar_offset, 1);
+        let wide = search_all(&core, "中x");
+        assert_eq!(wide.len(), 1);
+        assert_eq!(wide[0].start.column, 1);
+        assert_eq!(wide[0].end.column, 3);
+    }
+
+    #[test]
+    fn literal_search_enforces_query_and_slice_limits() {
+        let core = TerminalCoreAdapter::new(GridSize::new(8, 2).unwrap(), 10).unwrap();
+        assert_eq!(
+            core.compile_literal_search("\n").unwrap_err(),
+            SearchError::ControlCharacter
+        );
+        assert_eq!(
+            core.compile_literal_search(&"x".repeat(super::super::MAX_SEARCH_QUERY_SCALARS + 1))
+                .unwrap_err(),
+            SearchError::QueryTooLong
+        );
+        let compiled = core.compile_literal_search(" ").unwrap();
+        let step = core
+            .scan_search_slice(
+                &compiled,
+                core.search_scan_cursor(),
+                SearchBudget {
+                    deadline: Instant::now() + std::time::Duration::from_secs(1),
+                    max_rows: 1,
+                    max_matches: 2,
+                    clock: Instant::now,
+                },
+            )
+            .unwrap();
+        assert!(step.scanned_rows <= 1);
+        assert_eq!(step.matches.len(), 2);
+        assert!(step.next.is_some());
+    }
+
+    #[test]
+    fn regex_search_is_bounded_and_preserves_terminal_line_semantics() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 3).unwrap(), 10).unwrap();
+        core.advance(b"error erring abcdef\r\nghi").unwrap();
+        assert_eq!(regex_search_all(&core, r"err(or|ing)").len(), 2);
+        assert_eq!(regex_search_all(&core, r"cdef").len(), 1);
+        assert!(regex_search_all(&core, r"fg.*hi").is_empty());
+        assert!(matches!(
+            core.compile_regex_search("["),
+            Err(SearchError::InvalidRegex)
+        ));
+        assert!(core.compile_regex_search(&"(".repeat(256)).is_err());
     }
 
     #[test]

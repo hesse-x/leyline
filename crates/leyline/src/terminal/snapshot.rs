@@ -43,6 +43,8 @@ pub enum GridSizeError {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FrameSnapshot {
     pub generation: u64,
+    pub content_revision: u64,
+    pub active_buffer: SearchBuffer,
     pub grid: GridSize,
     pub cells: Arc<[SnapshotCell]>,
     pub cursor: CursorSnapshot,
@@ -51,6 +53,12 @@ pub struct FrameSnapshot {
     pub history_size: usize,
     pub title: Option<Arc<str>>,
     pub hyperlinks: Arc<[SnapshotHyperlink]>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SearchBuffer {
+    Normal,
+    Alternate,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -5,8 +5,9 @@ use std::{
 
 use leyline_gfx::{GlyphPlacement, LinearColor, RectangleInstance, SceneData};
 use leyline_text::{
-    CellMetrics, FontStyle, GlyphAsset, GlyphKey, MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS,
-    MAX_PREPARED_GLYPHS, ShapedRun, TextDirection, TextError, TextSystem,
+    CellMetrics, FaceId, FontStyle, GlyphAsset, GlyphBitmap, GlyphFormat, GlyphKey,
+    GlyphPresentation, MAX_GLYPH_BITMAP_BYTES, MAX_GLYPH_BITMAPS, MAX_PREPARED_GLYPHS, ShapedRun,
+    TextDirection, TextError, TextSystem,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -47,6 +48,19 @@ const TAB_INACTIVE_TEXT: u32 = 0xa8a8_a8ff;
 const TAB_UNREAD_TEXT: u32 = 0xd8d8_d8ff;
 const TAB_CLOSE_MARK: &str = "\u{00d7}";
 const TAB_FONT_KEY_NAMESPACE: u64 = 1 << 63;
+const SEARCH_ICON_FACE: FaceId = FaceId(u32::MAX);
+const SEARCH_UP_ICON: GlyphKey = GlyphKey {
+    font_generation: TAB_FONT_KEY_NAMESPACE,
+    face: SEARCH_ICON_FACE,
+    glyph_id: u32::MAX - 1,
+    synthetic_bold: false,
+    synthetic_italic: false,
+    presentation: GlyphPresentation::Text,
+};
+const SEARCH_DOWN_ICON: GlyphKey = GlyphKey {
+    glyph_id: u32::MAX,
+    ..SEARCH_UP_ICON
+};
 
 type ShapedCache = HashMap<(String, FontStyle), ShapedRun>;
 struct TerminalShape {
@@ -63,6 +77,15 @@ pub struct SelectionOverlay {
     pub ranges: Arc<[CellRange]>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SearchOverlay {
+    pub snapshot_generation: u64,
+    pub content_revision: u64,
+    pub revision: u64,
+    pub current: Arc<[CellRange]>,
+    pub others: Arc<[CellRange]>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CellRange {
     pub start: [u16; 2],
@@ -72,10 +95,12 @@ pub struct CellRange {
 #[derive(Clone, Copy, Debug)]
 pub struct FrameOverlays<'a> {
     pub selection: &'a SelectionOverlay,
+    pub search: Option<&'a SearchOverlay>,
     pub preedit: Option<&'a PreeditOverlay>,
     pub paste_confirmation: Option<&'a PasteConfirmationOverlay>,
     pub scrollbar: Option<&'a ScrollbarPresentation>,
     pub tab_bar: Option<&'a crate::tab::TabBarPresentation>,
+    pub search_dialog: Option<&'a crate::search::SearchDialogPresentation>,
     pub visual_bell: Option<&'a crate::bell::VisualBellPresentation>,
 }
 
@@ -175,6 +200,26 @@ fn compose_active_scene(
                 .iter()
                 .any(|range| point_in_range([column, line], *range))
     };
+    let search_valid = overlays.search.filter(|value| {
+        value.snapshot_generation == snapshot.generation
+            && value.content_revision == snapshot.content_revision
+    });
+    let current_match = |column: u16, line: u16| {
+        search_valid.is_some_and(|search| {
+            search
+                .current
+                .iter()
+                .any(|range| point_in_range([column, line], *range))
+        })
+    };
+    let other_match = |column: u16, line: u16| {
+        search_valid.is_some_and(|search| {
+            search
+                .others
+                .iter()
+                .any(|range| point_in_range([column, line], *range))
+        })
+    };
     let (shaped_cache, terminal_shapes, mut assets) = prepare_glyph_working_set(
         text,
         snapshot,
@@ -183,7 +228,7 @@ fn compose_active_scene(
         visual_map,
     )?;
     let (tab_shaped_cache, tab_assets) =
-        match prepare_tab_glyph_working_set(tab_text, overlays.tab_bar) {
+        match prepare_tab_glyph_working_set(tab_text, overlays.tab_bar, overlays.search_dialog) {
             Ok(prepared) => prepared,
             Err(error) => {
                 tracing::warn!(category = "tab_text", %error, "tab text omitted for this frame");
@@ -191,6 +236,9 @@ fn compose_active_scene(
             }
         };
     assets.extend(tab_assets);
+    if overlays.search_dialog.is_some() {
+        add_search_icon_assets(&mut assets);
+    }
     let tab_metrics = tab_text.metrics();
     let mut rectangles = Vec::new();
     let mut glyphs = Vec::new();
@@ -235,6 +283,8 @@ fn compose_active_scene(
             let index = line * snapshot.grid.columns() + column;
             let cell = &snapshot.cells[index];
             let is_selected = selected(column as u16, line as u16);
+            let is_current_match = current_match(column as u16, line as u16);
+            let is_other_match = other_match(column as u16, line as u16);
             let (mut foreground, mut background) =
                 resolve_cell_colors(cell.foreground, cell.background, colors);
             if cell.flags.inverse {
@@ -243,15 +293,24 @@ fn compose_active_scene(
             if cell.flags.dim {
                 foreground = dim(foreground);
             }
-            if is_selected {
+            if is_current_match {
+                foreground = colors.search_current_foreground.0;
+                background = colors.search_current_background.0;
+            } else if is_selected {
                 foreground = colors.selection_foreground.0;
                 background = colors.selection_background.0;
+            } else if is_other_match {
+                foreground = colors.search_match_foreground.0;
+                background = colors.search_match_background.0;
             }
             // The clear color already supplies the default glass background. Only paint cells
             // that intentionally differ, otherwise alpha would accumulate and look opaque.
-            let painted_background =
-                (cell.background != TerminalColor::Named(257) || cell.flags.inverse || is_selected)
-                    .then_some(background);
+            let painted_background = (cell.background != TerminalColor::Named(257)
+                || cell.flags.inverse
+                || is_selected
+                || is_current_match
+                || is_other_match)
+                .then_some(background);
             if let Some(background) = painted_background {
                 rectangles.push(cell_rectangle(layout, visual_column, line, 1, background));
             }
@@ -665,6 +724,17 @@ fn compose_active_scene(
             color: LinearColor::from_srgba8(colors.foreground.0),
         });
     }
+    if let Some(dialog) = overlays.search_dialog {
+        glyphs.retain(|glyph| !glyph_intersects_rect(glyph, dialog.panel, &assets));
+        compose_search_dialog(
+            dialog,
+            &tab_shaped_cache,
+            &assets,
+            tab_metrics,
+            &mut rectangles,
+            &mut glyphs,
+        );
+    }
     if let Some(scrollbar) = overlays.scrollbar {
         for (rect, color) in [
             (scrollbar.track, scrollbar.track_color),
@@ -694,6 +764,25 @@ fn compose_active_scene(
             unicode_policy_generation: visual_map.policy_generation,
         },
     })
+}
+
+fn glyph_intersects_rect(
+    glyph: &GlyphPlacement,
+    rect: crate::tab::PixelRect,
+    assets: &GlyphAssets,
+) -> bool {
+    let Some(asset) = assets.get(&glyph.key) else {
+        return false;
+    };
+    let left = i64::from(glyph.origin_px[0]);
+    let top = i64::from(glyph.origin_px[1]);
+    let right = left + i64::from(asset.bitmap.size_px[0]);
+    let bottom = top + i64::from(asset.bitmap.size_px[1]);
+    let rect_left = i64::from(rect.x);
+    let rect_top = i64::from(rect.y);
+    let rect_right = rect_left + i64::from(rect.width);
+    let rect_bottom = rect_top + i64::from(rect.height);
+    left < rect_right && right > rect_left && top < rect_bottom && bottom > rect_top
 }
 
 fn prepare_glyph_working_set(
@@ -925,6 +1014,147 @@ fn cell_is_emoji(cell: &SnapshotCell) -> bool {
         })
 }
 
+#[allow(clippy::cast_precision_loss)]
+fn compose_search_dialog(
+    dialog: &crate::search::SearchDialogPresentation,
+    shaped: &ShapedCache,
+    assets: &GlyphAssets,
+    metrics: CellMetrics,
+    rectangles: &mut Vec<RectangleInstance>,
+    glyphs: &mut Vec<GlyphPlacement>,
+) {
+    let panel = dialog.panel;
+    rectangles.push(RectangleInstance {
+        origin_px: [
+            panel.x.saturating_add(2) as f32,
+            panel.y.saturating_add(2) as f32,
+        ],
+        size_px: [panel.width as f32, panel.height as f32],
+        color: LinearColor::from_srgba8(0x0000_0048),
+    });
+    rectangles.push(RectangleInstance {
+        origin_px: [panel.x as f32, panel.y as f32],
+        size_px: [panel.width as f32, panel.height as f32],
+        color: LinearColor::from_srgba8(0x272a_2dff),
+    });
+    for (rect, color) in [
+        (dialog.input, 0x1f21_23ff),
+        (dialog.previous, 0x292c_2fff),
+        (dialog.next, 0x292c_2fff),
+    ] {
+        rectangles.push(RectangleInstance {
+            origin_px: [rect.x as f32, rect.y as f32],
+            size_px: [rect.width as f32, rect.height as f32],
+            color: LinearColor::from_srgba8(color),
+        });
+    }
+    let control_width = dialog
+        .input
+        .width
+        .saturating_add(dialog.previous.width)
+        .saturating_add(dialog.next.width);
+    for (x, y, width, height) in [
+        (dialog.input.x, dialog.input.y, control_width, 1),
+        (
+            dialog.input.x,
+            dialog
+                .input
+                .y
+                .saturating_add(dialog.input.height.saturating_sub(1)),
+            control_width,
+            1,
+        ),
+        (dialog.input.x, dialog.input.y, 1, dialog.input.height),
+        (
+            dialog
+                .next
+                .x
+                .saturating_add(dialog.next.width.saturating_sub(1)),
+            dialog.input.y,
+            1,
+            dialog.input.height,
+        ),
+        (dialog.previous.x, dialog.input.y, 1, dialog.input.height),
+        (dialog.next.x, dialog.input.y, 1, dialog.input.height),
+    ] {
+        rectangles.push(RectangleInstance {
+            origin_px: [x as f32, y as f32],
+            size_px: [width as f32, height as f32],
+            color: LinearColor::from_srgba8(0x4549_4dff),
+        });
+    }
+    draw_chrome_text(
+        &dialog.query_text,
+        dialog.input,
+        shaped,
+        assets,
+        metrics,
+        glyphs,
+    );
+    for (rect, key) in [
+        (dialog.previous, SEARCH_UP_ICON),
+        (dialog.next, SEARCH_DOWN_ICON),
+    ] {
+        if assets.contains_key(&key) {
+            draw_search_icon(rect, key, glyphs);
+        }
+    }
+}
+
+fn draw_search_icon(rect: crate::tab::PixelRect, key: GlyphKey, glyphs: &mut Vec<GlyphPlacement>) {
+    glyphs.push(GlyphPlacement {
+        key,
+        origin_px: [
+            i32::try_from(rect.x.saturating_add(rect.width.saturating_sub(9) / 2))
+                .unwrap_or(i32::MAX),
+            i32::try_from(rect.y.saturating_add(rect.height.saturating_sub(5) / 2))
+                .unwrap_or(i32::MAX),
+        ],
+        clip_px: [rect.x, rect.y, rect.width, rect.height],
+        color: LinearColor::from_srgba8(0xc8cc_d0ff),
+        color_scale: 1.0,
+    });
+}
+
+#[allow(clippy::cast_possible_wrap, clippy::too_many_arguments)]
+fn draw_chrome_text(
+    text: &str,
+    rect: crate::tab::PixelRect,
+    shaped: &ShapedCache,
+    assets: &GlyphAssets,
+    metrics: CellMetrics,
+    glyphs: &mut Vec<GlyphPlacement>,
+) {
+    let Some(run) = shaped.get(&(text.to_owned(), FontStyle::Regular)) else {
+        return;
+    };
+    let inset = 10_i32.min(i32::try_from(rect.width / 3).unwrap_or(0));
+    let mut pen_x = inset.saturating_mul(64);
+    for glyph in &run.glyphs {
+        let Some(bitmap) = assets.get(&glyph.key) else {
+            continue;
+        };
+        if bitmap.bitmap.size_px != [0, 0] {
+            glyphs.push(GlyphPlacement {
+                key: glyph.key,
+                origin_px: [
+                    rect.x as i32
+                        + i32::from(bitmap.bitmap.bearing_px[0])
+                        + (pen_x + glyph.offset_26_6[0]) / 64,
+                    rect.y.saturating_add(rect.height / 2) as i32
+                        + i32::from(metrics.baseline_px / 2)
+                        - i32::from(bitmap.bitmap.bearing_px[1])
+                        - glyph.offset_26_6[1] / 64,
+                ],
+                clip_px: [rect.x, rect.y, rect.width, rect.height],
+                color: LinearColor::from_srgba8(TAB_ACTIVE_TEXT),
+                color_scale: 1.0,
+            });
+        }
+        pen_x = pen_x.saturating_add(glyph.advance_26_6[0]);
+    }
+}
+
 const fn is_bidi_control(ch: char) -> bool {
     matches!(
         ch,
@@ -939,17 +1169,22 @@ const fn is_bidi_control(ch: char) -> bool {
 fn prepare_tab_glyph_working_set(
     text: &mut TextSystem,
     tab_bar: Option<&crate::tab::TabBarPresentation>,
+    search_dialog: Option<&crate::search::SearchDialogPresentation>,
 ) -> Result<(ShapedCache, GlyphAssets), ComposeError> {
-    let Some(tab_bar) = tab_bar else {
+    if tab_bar.is_none() && search_dialog.is_none() {
         return Ok((ShapedCache::new(), GlyphAssets::new()));
-    };
+    }
     let mut requests = tab_bar
-        .items
-        .iter()
-        .map(|item| item.title.clone())
+        .into_iter()
+        .flat_map(|bar| bar.items.iter().map(|item| item.title.clone()))
         .collect::<HashSet<_>>();
-    if tab_bar.items.iter().any(|item| item.close_rect.is_some()) {
+    if tab_bar.is_some_and(|bar| bar.items.iter().any(|item| item.close_rect.is_some())) {
         requests.insert(TAB_CLOSE_MARK.to_owned());
+    }
+    if let Some(dialog) = search_dialog
+        && !dialog.query_text.is_empty()
+    {
+        requests.insert(dialog.query_text.clone());
     }
 
     let mut shaped = ShapedCache::new();
@@ -973,6 +1208,40 @@ fn prepare_tab_glyph_working_set(
         assets.insert(asset.key, asset);
     }
     Ok((shaped, assets))
+}
+
+fn add_search_icon_assets(assets: &mut GlyphAssets) {
+    for asset in [search_icon_asset(false), search_icon_asset(true)] {
+        assets.insert(asset.key, asset);
+    }
+}
+
+fn search_icon_asset(points_down: bool) -> GlyphAsset {
+    const UP: [[u8; 9]; 5] = [
+        [0, 0, 0, 64, 255, 64, 0, 0, 0],
+        [0, 0, 64, 255, 128, 255, 64, 0, 0],
+        [0, 64, 255, 96, 0, 96, 255, 64, 0],
+        [64, 255, 96, 0, 0, 0, 96, 255, 64],
+        [255, 96, 0, 0, 0, 0, 0, 96, 255],
+    ];
+    let mut rows = UP;
+    if points_down {
+        rows.reverse();
+    }
+    GlyphAsset {
+        key: if points_down {
+            SEARCH_DOWN_ICON
+        } else {
+            SEARCH_UP_ICON
+        },
+        bitmap: GlyphBitmap {
+            format: GlyphFormat::Gray8,
+            size_px: [9, 5],
+            bearing_px: [0, 0],
+            advance_26_6: 0,
+            pixels: Arc::from(rows.into_iter().flatten().collect::<Vec<_>>()),
+        },
+    }
 }
 
 fn count_prepared_placements(
@@ -1490,10 +1759,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        cursor_glyph_color, dim, downgrade_color_working_set, effective_underline_style,
-        push_underline_primitives, resolve_color, validate_glyph_budget,
+        SEARCH_DOWN_ICON, SEARCH_UP_ICON, add_search_icon_assets, compose_search_dialog,
+        cursor_glyph_color, dim, downgrade_color_working_set, draw_search_icon,
+        effective_underline_style, glyph_intersects_rect, push_underline_primitives, resolve_color,
+        search_icon_asset, validate_glyph_budget,
     };
     use crate::config::CursorStyle;
+    use crate::tab::PixelRect;
     use crate::terminal::{CellFlags, CellWidth, SnapshotCell, TerminalColor, UnderlineStyle};
     use leyline_text::{
         FaceId, GlyphAsset, GlyphBitmap, GlyphFormat, GlyphKey, GlyphPresentation,
@@ -1532,6 +1804,92 @@ mod tests {
         assert!(validate_glyph_budget(0, MAX_GLYPH_BITMAPS + 1, Some(0)).is_err());
         assert!(validate_glyph_budget(0, 0, Some(MAX_GLYPH_BITMAP_BYTES + 1)).is_err());
         assert!(validate_glyph_budget(0, 0, None).is_err());
+    }
+
+    #[test]
+    fn search_icons_are_matching_centered_line_bitmaps() {
+        let rect = PixelRect {
+            x: 10,
+            y: 20,
+            width: 38,
+            height: 38,
+        };
+        let up = search_icon_asset(false);
+        let down = search_icon_asset(true);
+        assert_eq!(up.bitmap.size_px, [9, 5]);
+        assert_eq!(down.bitmap.size_px, up.bitmap.size_px);
+        for y in 0..5 {
+            for x in 0..9 {
+                assert_eq!(
+                    up.bitmap.pixels[y * 9 + x],
+                    down.bitmap.pixels[(4 - y) * 9 + x]
+                );
+            }
+        }
+        let mut placements = Vec::new();
+        draw_search_icon(rect, SEARCH_UP_ICON, &mut placements);
+        draw_search_icon(rect, SEARCH_DOWN_ICON, &mut placements);
+        assert_eq!(placements.len(), 2);
+        assert_eq!(placements[0].origin_px, placements[1].origin_px);
+        assert_eq!(placements[0].origin_px, [24, 36]);
+
+        let assets = [(up.key, up)].into_iter().collect();
+        assert!(glyph_intersects_rect(
+            &placements[0],
+            PixelRect {
+                x: 20,
+                y: 30,
+                width: 20,
+                height: 20,
+            },
+            &assets,
+        ));
+        assert!(!glyph_intersects_rect(
+            &placements[0],
+            PixelRect {
+                x: 100,
+                y: 100,
+                width: 20,
+                height: 20,
+            },
+            &assets,
+        ));
+    }
+
+    #[test]
+    fn empty_search_dialog_has_assets_for_every_placement() {
+        let dialog =
+            crate::search::SearchDialogPresentation::layout([800, 600], 120, String::new());
+        let metrics = leyline_text::CellMetrics {
+            width_px: std::num::NonZeroU16::new(9).unwrap(),
+            height_px: std::num::NonZeroU16::new(18).unwrap(),
+            baseline_px: 14,
+            underline_y_px: 15,
+            underline_thickness_px: std::num::NonZeroU16::new(1).unwrap(),
+            strike_y_px: 9,
+            strike_thickness_px: std::num::NonZeroU16::new(1).unwrap(),
+        };
+        let shaped = super::ShapedCache::new();
+        let mut assets = super::GlyphAssets::new();
+        add_search_icon_assets(&mut assets);
+        let mut rectangles = Vec::new();
+        let mut placements = Vec::new();
+
+        compose_search_dialog(
+            &dialog,
+            &shaped,
+            &assets,
+            metrics,
+            &mut rectangles,
+            &mut placements,
+        );
+
+        assert_eq!(placements.len(), 2);
+        assert!(
+            placements
+                .iter()
+                .all(|placement| assets.contains_key(&placement.key))
+        );
     }
 
     #[test]

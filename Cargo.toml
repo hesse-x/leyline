@@ -28,6 +28,7 @@ tracing-subscriber = { version = "0.3.20", default-features = false, features = 
 unicode-bidi = "0.3.18"
 unicode-segmentation = "1.12.0"
 rustix = { version = "1.1.4", features = ["event", "fs", "system", "time"] }
+regex-automata = "0.4.18"
 libc = "0.2.175"
 leyline-pty = { version = "0.1.0", path = "crates/leyline-pty" }
 leyline-gfx = { version = "0.1.0", path = "crates/leyline-gfx" }

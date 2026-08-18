@@ -136,6 +136,66 @@ pub struct TextInputRectangle {
     pub height: i32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TextInputPurpose {
+    Terminal,
+    Normal,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TextInputContext {
+    pub(crate) rectangle: TextInputRectangle,
+    pub(crate) purpose: TextInputPurpose,
+    pub(crate) surrounding_text: String,
+    pub(crate) cursor_byte: i32,
+    pub(crate) anchor_byte: i32,
+}
+
+impl TextInputContext {
+    pub const MAX_SURROUNDING_BYTES: usize = 1_024;
+
+    #[must_use]
+    pub const fn terminal(rectangle: TextInputRectangle) -> Self {
+        Self {
+            rectangle,
+            purpose: TextInputPurpose::Terminal,
+            surrounding_text: String::new(),
+            cursor_byte: 0,
+            anchor_byte: 0,
+        }
+    }
+
+    /// Builds a bounded search-field context using UTF-8 byte offsets.
+    ///
+    /// # Errors
+    /// Returns an error when the text exceeds the protocol budget or the cursor is not a valid
+    /// UTF-8 boundary.
+    pub fn search(
+        rectangle: TextInputRectangle,
+        surrounding_text: String,
+        cursor_byte: usize,
+    ) -> Result<Self, TextInputContextError> {
+        if surrounding_text.len() > Self::MAX_SURROUNDING_BYTES
+            || cursor_byte > surrounding_text.len()
+            || !surrounding_text.is_char_boundary(cursor_byte)
+        {
+            return Err(TextInputContextError);
+        }
+        let cursor_byte = i32::try_from(cursor_byte).map_err(|_| TextInputContextError)?;
+        Ok(Self {
+            rectangle,
+            purpose: TextInputPurpose::Normal,
+            surrounding_text,
+            cursor_byte,
+            anchor_byte: cursor_byte,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("text-input surrounding context is invalid or exceeds 1024 bytes")]
+pub struct TextInputContextError;
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct ModifiersState {
@@ -297,9 +357,17 @@ pub enum GlyphRenderMode {
 
 pub enum GfxCommand {
     SetTitle(String),
+    SetPointerCursor(PointerCursor),
     SetDirty,
     SetScene(SceneData),
     RequestClose,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PointerCursor {
+    Text,
+    Grab,
+    Grabbing,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -339,6 +407,32 @@ mod tests {
                 height: 1
             }),
             Err(SizeError::Overflow)
+        );
+    }
+
+    #[test]
+    fn search_text_input_context_is_utf8_bounded() {
+        let rectangle = TextInputRectangle {
+            x: 0,
+            y: 0,
+            width: 10,
+            height: 10,
+        };
+        let context = TextInputContext::search(rectangle, "a中".into(), 1).unwrap();
+        assert_eq!(context.purpose, TextInputPurpose::Normal);
+        assert_eq!(context.surrounding_text, "a中");
+        assert!(TextInputContext::search(rectangle, "中".into(), 1).is_err());
+        assert!(
+            TextInputContext::search(
+                rectangle,
+                "x".repeat(TextInputContext::MAX_SURROUNDING_BYTES + 1),
+                0,
+            )
+            .is_err()
+        );
+        assert_eq!(
+            TextInputContext::terminal(rectangle).purpose,
+            TextInputPurpose::Terminal
         );
     }
 }

@@ -377,7 +377,7 @@ pub struct ImeState {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ImeDone {
     pub commit: Option<Vec<u8>>,
-    pub delete_ignored: bool,
+    pub delete_surrounding: Option<(u32, u32)>,
     pub outbound_resend_required: bool,
 }
 
@@ -395,6 +395,17 @@ impl ImeState {
     #[must_use]
     pub const fn is_active(&self) -> bool {
         self.active
+    }
+    #[must_use]
+    pub fn has_preedit(&self) -> bool {
+        self.pending
+            .preedit
+            .as_ref()
+            .is_some_and(|(text, _)| !text.is_empty())
+            || self
+                .preedit
+                .as_ref()
+                .is_some_and(|preedit| !preedit.text.is_empty())
     }
     pub fn reanchor_preedit(&mut self, generation: u64, anchor: [u16; 2]) {
         if let Some(preedit) = self.preedit.as_mut() {
@@ -477,7 +488,7 @@ impl ImeState {
         }
         Ok(ImeDone {
             commit: pending.commit.map(String::into_bytes),
-            delete_ignored: pending.delete_surrounding.is_some(),
+            delete_surrounding: pending.delete_surrounding,
             outbound_resend_required: mismatch,
         })
     }
@@ -538,10 +549,16 @@ mod tests {
         let mut ime = ImeState::default();
         ime.activate();
         ime.preedit_string("中".into(), Some((0, 3))).unwrap();
+        assert!(ime.has_preedit());
         assert!(ime.preedit.is_none());
         let done = ime.done(0, 4, [1, 1]).unwrap();
         assert!(done.commit.is_none());
+        assert!(ime.has_preedit());
         assert_eq!(ime.preedit.as_ref().unwrap().text.as_ref(), "中");
+
+        ime.preedit_string(String::new(), None).unwrap();
+        ime.done(0, 4, [1, 1]).unwrap();
+        assert!(!ime.has_preedit());
     }
     #[test]
     fn cursor_must_use_utf8_boundaries() {
@@ -663,6 +680,8 @@ mod tests {
         let grid = crate::terminal::GridSize::new(10, 2).unwrap();
         let snapshot = FrameSnapshot {
             generation: 1,
+            content_revision: 1,
+            active_buffer: crate::terminal::SearchBuffer::Normal,
             grid,
             cells: vec![
                 crate::terminal::SnapshotCell {

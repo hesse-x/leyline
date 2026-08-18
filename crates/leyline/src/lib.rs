@@ -13,6 +13,7 @@ pub mod interaction;
 pub mod layout;
 pub mod logging;
 pub mod notification;
+pub mod search;
 pub mod security;
 pub mod selection;
 pub mod session;

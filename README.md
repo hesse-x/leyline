@@ -100,6 +100,10 @@ background = "#2e3436f2"
 cursor = "#d8dcd8"
 selection_foreground = "#f4f6f4"
 selection_background = "#58656dcc"
+search_current_foreground = "#171a1c"
+search_current_background = "#ffb454"
+search_match_foreground = "#f4f6f4"
+search_match_background = "#8a6532cc"
 ansi = [
   "#2e3436", "#cc6666", "#6fa66f", "#c8a85f",
   "#5f87af", "#a27aa8", "#5f9ea0", "#d3d7cf",
@@ -149,14 +153,28 @@ Selecting text publishes the primary selection; paste it with the middle mouse b
 `Shift+Insert`. `Ctrl+Shift+C` explicitly copies the active tab's selection to the Wayland
 Clipboard, and `Ctrl+Shift+V` pastes the Clipboard into the same tab as long as it remains active.
 
+`Ctrl+F` opens a compact, centered, tab-local regular-expression search dialog containing
+only the query field and previous/next buttons. Enter and Shift+Enter also move between matches,
+and Escape closes the dialog whenever it is open. Clicking the terminal returns keyboard and IME
+input to the PTY without closing the search; click the query field or press `Ctrl+F` to focus
+it again. Drag the padding around the query and navigation controls, or the eight-pixel region just
+outside the panel, to reposition it; the pointer changes to grab/grabbing and the position remains
+clamped to the window. Searches are case-sensitive, span soft-wrapped lines, and do not cross hard
+line breaks. Queries are limited to 256 Unicode scalars/1,024 UTF-8 bytes, stored
+matches are capped at 10,000, logical lines are capped at 64 KiB, and the compiled engine has
+fixed resource limits. Search text is never logged or copied into a window title. When an input
+method is active, the query may be shared with the local Wayland input method as surrounding text;
+terminal contents and matching context are not shared.
+
 Tabs are always visible. `Ctrl+Shift+N` creates and activates a tab, `Ctrl+Shift+W` closes it,
 `Ctrl+Shift+Left/Right` cycles, and `Ctrl+Shift+1..9` activates an ordinal tab. Mouse clicks switch
 tabs; a close button or middle click closes one. New tabs repeat the startup launch request and
 use `[tabs].new_tab_cwd`: `inherit` prefers the active tab's last valid OSC 7 directory, `fixed`
 uses `new_tab_fixed_cwd`, and `home` uses the HOME captured at startup. Every unavailable candidate
 falls back to Leyline's startup directory. User `[[keybindings]]` entries can override the actions
-`CopyClipboard`, `PasteClipboard`, `PastePrimary`, `NewTab`, `CloseTab`, `PreviousTab`, `NextTab`,
-and `ActivateTab1` through `ActivateTab9`.
+`CopyClipboard`, `PasteClipboard`, `PastePrimary`, `Search`, `SearchNext`, `SearchPrevious`,
+`CancelSearch`, `NewTab`, `CloseTab`, `PreviousTab`, `NextTab`, and `ActivateTab1` through
+`ActivateTab9`.
 
 Leyline receives current-directory metadata but does not install shell hooks. Configure bash, zsh,
 fish, or a prompt plugin to emit `OSC 7 ; file://host/absolute-path` terminated by BEL or ST, with

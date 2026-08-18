@@ -2,6 +2,7 @@ mod core;
 pub mod cwd;
 mod debug_grid;
 mod input;
+mod search;
 mod snapshot;
 
 pub use core::{
@@ -15,8 +16,14 @@ pub use input::{
     TerminalKey, commit_text, encode_alternate_scroll, encode_focus, encode_key, encode_mouse,
     paste_transaction,
 };
+pub use search::{
+    CompiledLiteral, CompiledRegex, MAX_REGEX_LOGICAL_LINE_BYTES, MAX_SEARCH_MATCHES,
+    MAX_SEARCH_QUERY_BYTES, MAX_SEARCH_QUERY_SCALARS, MAX_SEARCH_SLICE_ROWS, RegexScanCursor,
+    RegexScanStep, SearchAnchor, SearchBudget, SearchContentId, SearchError, SearchMatch,
+    SearchProjection, SearchScanCursor, SearchScanStep,
+};
 pub use snapshot::{
     CellFlags, CellWidth, CursorBlink, CursorShape, CursorSnapshot, FrameSnapshot, GridSize,
-    MouseEncoding, MouseProtocol, ProjectedSelection, SelectionKind, SelectionPoint, SelectionSide,
-    SnapshotCell, SnapshotHyperlink, TerminalColor, TerminalModes, UnderlineStyle,
+    MouseEncoding, MouseProtocol, ProjectedSelection, SearchBuffer, SelectionKind, SelectionPoint,
+    SelectionSide, SnapshotCell, SnapshotHyperlink, TerminalColor, TerminalModes, UnderlineStyle,
 };

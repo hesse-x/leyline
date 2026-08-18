@@ -591,6 +591,7 @@ dependencies = [
  "leyline-pty",
  "leyline-sound",
  "leyline-text",
+ "regex-automata",
  "rustix",
  "serde",
  "tempfile",

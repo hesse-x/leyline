@@ -96,6 +96,7 @@ pub struct TerminalSession {
     shutdown_deadline: Option<Instant>,
     security_audit: ParseAuditDelta,
     audit_log_limiter: MetadataRateLimiter,
+    search: crate::search::SearchController,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -188,6 +189,7 @@ impl TerminalSession {
             shutdown_deadline: None,
             security_audit: ParseAuditDelta::default(),
             audit_log_limiter: MetadataRateLimiter::default(),
+            search: crate::search::SearchController::default(),
         })
     }
 
@@ -207,6 +209,9 @@ impl TerminalSession {
                     self.log_security_audit(delta.audit);
                 }
                 self.dirty |= delta.dirty;
+                if delta.dirty {
+                    self.search.invalidate(Instant::now());
+                }
                 self.flush_actions();
             }
             PtyEvent::Exited(exit) => {
@@ -230,7 +235,10 @@ impl TerminalSession {
     }
 
     pub fn resize(&mut self, size: GridSize) -> Result<(), SessionError> {
-        self.core.resize(size)?;
+        let delta = self.core.resize(size)?;
+        if delta.dirty {
+            self.search.invalidate(Instant::now());
+        }
         self.dirty = true;
         if matches!(
             self.state,
@@ -316,6 +324,9 @@ impl TerminalSession {
     ) -> Result<(), SessionError> {
         let delta = self.core.flush_synchronized_update(epoch, reason)?;
         self.dirty |= delta.dirty;
+        if delta.dirty {
+            self.search.invalidate(Instant::now());
+        }
         self.accumulate_audit(delta.audit);
         self.flush_actions();
         Ok(())
@@ -339,6 +350,55 @@ impl TerminalSession {
 
     pub fn latest_snapshot(&self) -> Option<&FrameSnapshot> {
         self.latest_snapshot.as_ref()
+    }
+
+    #[must_use]
+    pub const fn search(&self) -> &crate::search::SearchController {
+        &self.search
+    }
+
+    pub fn open_search(&mut self) -> crate::search::SearchEffect {
+        self.search.open()
+    }
+
+    pub fn edit_search(
+        &mut self,
+        edit: crate::search::SearchEdit<'_>,
+        now: Instant,
+    ) -> crate::search::SearchEffect {
+        self.search.edit(edit, now)
+    }
+
+    pub fn cancel_search(&mut self) -> crate::search::SearchEffect {
+        self.search.cancel()
+    }
+
+    pub fn navigate_search(
+        &mut self,
+        direction: crate::search::SearchDirection,
+        now: Instant,
+    ) -> Result<crate::search::SearchEffect, SessionError> {
+        let effect = self.search.navigate(direction, &self.core, now);
+        self.apply_search_effect(effect)
+    }
+
+    pub fn advance_search(
+        &mut self,
+        now: Instant,
+    ) -> Result<crate::search::SearchEffect, SessionError> {
+        let effect = self.search.advance(&self.core, now);
+        self.apply_search_effect(effect)
+    }
+
+    fn apply_search_effect(
+        &mut self,
+        effect: crate::search::SearchEffect,
+    ) -> Result<crate::search::SearchEffect, SessionError> {
+        if let Some(offset) = effect.scroll_target {
+            self.core.scroll_to_display_offset(offset)?;
+            self.dirty = true;
+        }
+        Ok(effect)
     }
     pub fn input_modes(&self) -> crate::terminal::TerminalModes {
         self.core.input_modes()
@@ -429,6 +489,47 @@ impl TerminalSession {
             revision: self.core.selection_revision(),
             ranges,
         }
+    }
+
+    pub fn search_overlay(
+        &self,
+        snapshot: &FrameSnapshot,
+    ) -> Option<crate::frame_composer::SearchOverlay> {
+        if !self.search.is_open() {
+            return None;
+        }
+        let project = |value: crate::terminal::SearchMatch| project_search_ranges(snapshot, value);
+        let current_match = self.search.current();
+        let current = current_match.map_or_else(Vec::new, project);
+        let mut others = Vec::<crate::frame_composer::CellRange>::new();
+        for value in self.search.matches().iter().copied() {
+            if Some(value) == current_match {
+                continue;
+            }
+            for range in project(value) {
+                if let Some(last) = others.last_mut()
+                    && last.end[1] == range.start[1]
+                    && u32::from(range.start[0]) <= u32::from(last.end[0]).saturating_add(1)
+                {
+                    last.end[0] = last.end[0].max(range.end[0]);
+                    continue;
+                }
+                if others.len() == 4_096 {
+                    break;
+                }
+                others.push(range);
+            }
+            if others.len() == 4_096 {
+                break;
+            }
+        }
+        Some(crate::frame_composer::SearchOverlay {
+            snapshot_generation: snapshot.generation,
+            content_revision: snapshot.content_revision,
+            revision: self.search.revision(),
+            current: current.into(),
+            others: others.into(),
+        })
     }
     pub fn selected_text(&self) -> Option<String> {
         self.core.selected_text()
@@ -755,6 +856,64 @@ impl TerminalSession {
     }
 }
 
+fn project_search_ranges(
+    snapshot: &FrameSnapshot,
+    value: crate::terminal::SearchMatch,
+) -> Vec<crate::frame_composer::CellRange> {
+    if value.start > value.end || snapshot.grid.columns() == 0 {
+        return Vec::new();
+    }
+    let Ok(offset) = i32::try_from(snapshot.display_offset) else {
+        return Vec::new();
+    };
+    let first = value.start.history_line.max(-offset);
+    let last_visible = (-offset).saturating_add(
+        i32::try_from(snapshot.grid.lines())
+            .unwrap_or(i32::MAX)
+            .saturating_sub(1),
+    );
+    let last = value.end.history_line.min(last_visible);
+    if first > last {
+        return Vec::new();
+    }
+    let mut ranges = Vec::new();
+    for history_line in first..=last {
+        let Ok(line) = u16::try_from(history_line.saturating_add(offset)) else {
+            continue;
+        };
+        let start = if history_line == value.start.history_line {
+            value.start.column
+        } else {
+            0
+        };
+        let mut end = if history_line == value.end.history_line {
+            value.end.column
+        } else {
+            snapshot.grid.columns.get().saturating_sub(1)
+        };
+        if usize::from(start) >= snapshot.grid.columns()
+            || usize::from(end) >= snapshot.grid.columns()
+        {
+            continue;
+        }
+        let index = usize::from(line) * snapshot.grid.columns() + usize::from(end);
+        if snapshot
+            .cells
+            .get(index)
+            .is_some_and(|cell| cell.width == crate::terminal::CellWidth::Wide)
+        {
+            end = end
+                .saturating_add(1)
+                .min(snapshot.grid.columns.get().saturating_sub(1));
+        }
+        ranges.push(crate::frame_composer::CellRange {
+            start: [start, line],
+            end: [end, line],
+        });
+    }
+    ranges
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,6 +941,32 @@ mod tests {
             queue_class_limit(QueueClass::ParserReply),
             queue_class_limit(QueueClass::Bulk)
         );
+    }
+
+    #[test]
+    fn search_projection_uses_the_scrolled_viewport() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(4, 2).unwrap(), 10).unwrap();
+        core.advance("one\r\ntwo\r\n中x".as_bytes()).unwrap();
+        core.scroll_to_display_offset(1).unwrap();
+        let snapshot = core.snapshot().unwrap();
+        let ranges = project_search_ranges(
+            &snapshot,
+            crate::terminal::SearchMatch {
+                start: crate::terminal::SearchAnchor {
+                    history_line: -1,
+                    column: 0,
+                    scalar_offset: 0,
+                },
+                end: crate::terminal::SearchAnchor {
+                    history_line: -1,
+                    column: 0,
+                    scalar_offset: 0,
+                },
+            },
+        );
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].start, [0, 0]);
+        assert_eq!(ranges[0].end, [0, 0]);
     }
 
     #[test]

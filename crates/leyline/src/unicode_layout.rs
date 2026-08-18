@@ -579,6 +579,8 @@ mod tests {
         ];
         let snapshot = FrameSnapshot {
             generation: 1,
+            content_revision: 1,
+            active_buffer: crate::terminal::SearchBuffer::Normal,
             grid: GridSize::new(u16::try_from(sequence.len()).unwrap(), 1).unwrap(),
             cells: sequence
                 .into_iter()
@@ -610,6 +612,8 @@ mod tests {
         };
         let snapshot = FrameSnapshot {
             generation: 7,
+            content_revision: 1,
+            active_buffer: crate::terminal::SearchBuffer::Normal,
             grid: GridSize::new(1, 65).unwrap(),
             cells: (0..65)
                 .map(|_| cell('a', CellWidth::Narrow))

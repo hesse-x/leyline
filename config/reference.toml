@@ -21,6 +21,10 @@ background = "#2e3436e6"
 cursor = "#d8dcd8"
 selection_foreground = "#f4f6f4"
 selection_background = "#58656dcc"
+search_current_foreground = "#171a1c"
+search_current_background = "#ffb454"
+search_match_foreground = "#f4f6f4"
+search_match_background = "#8a6532cc"
 ansi = [
   "#2e3436", "#cc6666", "#6fa66f", "#c8a85f",
   "#5f87af", "#a27aa8", "#5f9ea0", "#d3d7cf",
