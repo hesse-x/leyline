@@ -91,4 +91,68 @@ pub enum ShutdownReason {
     PlatformFailure,
     StartupFailure,
     EventIngressDisconnected,
+    Signal(ProcessSignal),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessSignal {
+    Hangup,
+    Interrupt,
+    Terminate,
+}
+
+impl ProcessSignal {
+    #[must_use]
+    pub const fn number(self) -> i32 {
+        match self {
+            Self::Hangup => signal_hook::consts::signal::SIGHUP,
+            Self::Interrupt => signal_hook::consts::signal::SIGINT,
+            Self::Terminate => signal_hook::consts::signal::SIGTERM,
+        }
+    }
+
+    #[must_use]
+    pub const fn exit_code(self) -> u8 {
+        match self {
+            Self::Hangup => 129,
+            Self::Interrupt => 130,
+            Self::Terminate => 143,
+        }
+    }
+}
+
+impl TryFrom<i32> for ProcessSignal {
+    type Error = UnsupportedProcessSignal;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            signal_hook::consts::signal::SIGHUP => Ok(Self::Hangup),
+            signal_hook::consts::signal::SIGINT => Ok(Self::Interrupt),
+            signal_hook::consts::signal::SIGTERM => Ok(Self::Terminate),
+            signal => Err(UnsupportedProcessSignal(signal)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("unsupported process signal {0}")]
+pub struct UnsupportedProcessSignal(pub i32);
+
+#[cfg(test)]
+mod tests {
+    use super::ProcessSignal;
+
+    #[test]
+    fn process_signals_have_stable_numbers_and_exit_codes() {
+        for (number, signal, exit_code) in [
+            (1, ProcessSignal::Hangup, 129),
+            (2, ProcessSignal::Interrupt, 130),
+            (15, ProcessSignal::Terminate, 143),
+        ] {
+            assert_eq!(ProcessSignal::try_from(number), Ok(signal));
+            assert_eq!(signal.number(), number);
+            assert_eq!(signal.exit_code(), exit_code);
+        }
+        assert!(ProcessSignal::try_from(9).is_err());
+    }
 }

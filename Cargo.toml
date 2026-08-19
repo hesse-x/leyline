@@ -22,6 +22,7 @@ yeslogic-fontconfig-sys = { version = "6.0.1", features = ["dlopen"] }
 clap = { version = "4.5.46", default-features = false, features = ["derive", "help", "std", "usage"] }
 crossbeam-channel = "0.5.15"
 serde = { version = "1.0.219", features = ["derive"] }
+signal-hook = "0.3"
 thiserror = "2.0.16"
 toml = { version = "0.9.5", default-features = false, features = ["parse", "serde"] }
 tracing = "0.1.41"

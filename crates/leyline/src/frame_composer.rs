@@ -433,6 +433,9 @@ fn compose_active_scene(
         && usize::from(snapshot.cursor.column) < snapshot.grid.columns()
         && usize::from(snapshot.cursor.line) < snapshot.grid.lines()
     {
+        let cursor_index = usize::from(snapshot.cursor.line) * snapshot.grid.columns()
+            + usize::from(snapshot.cursor.column);
+        let cursor_span = cursor_cell_span(snapshot.cells[cursor_index].width);
         let origin = cell_origin(
             layout,
             usize::from(
@@ -445,7 +448,7 @@ fn compose_active_scene(
             CursorStyle::Block => (
                 origin,
                 [
-                    u32::from(layout.cell_px[0].get()),
+                    u32::from(layout.cell_px[0].get()) * cursor_span,
                     u32::from(layout.cell_px[1].get()),
                 ],
             ),
@@ -455,7 +458,7 @@ fn compose_active_scene(
                     origin[0],
                     origin[1] + u32::from(layout.cell_px[1].get()) - 1,
                 ],
-                [u32::from(layout.cell_px[0].get()), 1],
+                [u32::from(layout.cell_px[0].get()) * cursor_span, 1],
             ),
         };
         rectangles.push(RectangleInstance {
@@ -1177,6 +1180,7 @@ fn prepare_tab_glyph_working_set(
     let mut requests = tab_bar
         .into_iter()
         .flat_map(|bar| bar.items.iter().map(|item| item.title.clone()))
+        .filter(|title| !title.is_empty())
         .collect::<HashSet<_>>();
     if tab_bar.is_some_and(|bar| bar.items.iter().any(|item| item.close_rect.is_some())) {
         requests.insert(TAB_CLOSE_MARK.to_owned());
@@ -1645,6 +1649,14 @@ const fn cursor_glyph_color(
     }
 }
 
+const fn cursor_cell_span(width: CellWidth) -> u32 {
+    if matches!(width, CellWidth::Wide) {
+        2
+    } else {
+        1
+    }
+}
+
 fn resolve_color(color: TerminalColor, default: u32, colors: &ColorsConfig) -> u32 {
     match color {
         TerminalColor::Rgb(r, g, b) => u32::from_be_bytes([r, g, b, 255]),
@@ -1760,7 +1772,7 @@ mod tests {
 
     use super::{
         SEARCH_DOWN_ICON, SEARCH_UP_ICON, add_search_icon_assets, compose_search_dialog,
-        cursor_glyph_color, dim, downgrade_color_working_set, draw_search_icon,
+        cursor_cell_span, cursor_glyph_color, dim, downgrade_color_working_set, draw_search_icon,
         effective_underline_style, glyph_intersects_rect, push_underline_primitives, resolve_color,
         search_icon_asset, validate_glyph_budget,
     };
@@ -1788,6 +1800,13 @@ mod tests {
             cursor_glyph_color(foreground, background, CursorStyle::Block, false),
             foreground
         );
+    }
+
+    #[test]
+    fn cursor_span_covers_both_halves_of_a_wide_cell() {
+        assert_eq!(cursor_cell_span(CellWidth::Wide), 2);
+        assert_eq!(cursor_cell_span(CellWidth::Narrow), 1);
+        assert_eq!(cursor_cell_span(CellWidth::LeadingSpacer), 1);
     }
 
     #[test]

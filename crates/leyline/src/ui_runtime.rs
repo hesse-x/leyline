@@ -16,7 +16,7 @@ use leyline_text::{AntialiasPreference, FontRequest, HintingPreference, TextSyst
 use crate::{
     app::{
         App, AppAction,
-        event::ShutdownReason,
+        event::{ProcessSignal, ShutdownReason},
         runtime::{AppRuntime, AppRuntimeBuilder, WakeBackend},
     },
     diagnostics::{ClassifiedError, ErrorCategory},
@@ -24,6 +24,7 @@ use crate::{
     interaction::{ClickTracker, ImeState, LinkCandidate, ScrollbarController, ScrollbarGeometry},
     layout::{ContentInsets, GridLayout, TerminalGeometry},
     session::{SessionAction, SessionReplyRequest, ShutdownPoll, TerminalSession},
+    signal::ProcessSignalState,
     tab::TabManager,
     unicode_layout::{
         BuildStep, CaretAffinity, UnicodePolicy, VisualGridMap, VisualHit, VisualMapBuilder,
@@ -219,6 +220,20 @@ pub struct DesktopRuntime {
     windows: HashMap<leyline_gfx::WindowId, WindowRecord>,
     pending_platform_events: VecDeque<leyline_gfx::RoutedPlatformEvent>,
     window_service_cursor: Option<leyline_gfx::WindowId>,
+    signal_state: Arc<ProcessSignalState>,
+    signal_observed: bool,
+    exit_signal: Option<ProcessSignal>,
+}
+
+pub enum DesktopRuntimeStart {
+    Ready(Box<DesktopRuntime>),
+    Signaled(ProcessSignal),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UiExit {
+    Clean,
+    Signaled(ProcessSignal),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -742,10 +757,7 @@ impl DesktopRuntime {
                 .get_mut(id)
                 .expect("drain id exists");
             if let Some(title) = tab.session.take_title() {
-                tab.title = match title {
-                    crate::session::SessionTitleDelta::Set(title) => title.to_string(),
-                    crate::session::SessionTitleDelta::Reset => fallback_title.clone(),
-                };
+                tab.title = resolved_session_title(title, &fallback_title);
             }
             let bell = tab.session.take_bell();
             if bell {
@@ -829,10 +841,7 @@ impl DesktopRuntime {
             self.current_tabs_mut()
                 .active_mut()
                 .expect("active tab")
-                .title = match title {
-                crate::session::SessionTitleDelta::Set(title) => title.to_string(),
-                crate::session::SessionTitleDelta::Reset => fallback,
-            };
+                .title = resolved_session_title(title, &fallback);
         }
         let active = self.current_tabs().active().expect("active tab");
         let ordinal = self
@@ -852,7 +861,12 @@ impl DesktopRuntime {
     /// # Errors
     /// Returns a typed graphics initialization failure.
     #[allow(clippy::too_many_lines)]
-    pub fn new(app: App, app_runtime: AppRuntime, wake: EventWake) -> Result<Self, UiRuntimeError> {
+    pub fn initialize(
+        mut app: App,
+        app_runtime: AppRuntime,
+        wake: EventWake,
+        signal_state: Arc<ProcessSignalState>,
+    ) -> Result<DesktopRuntimeStart, UiRuntimeError> {
         let clear = LinearColor::from_srgba8(app.config().colors.background.0);
         let bootstrap_request = FontRequest::from_points(
             app.config().font.family.clone(),
@@ -938,6 +952,17 @@ impl DesktopRuntime {
         )?;
         let initial_size = layout.grid;
         let text_scale = gfx.scale();
+        if let Some(signal) = signal_state.first_signal() {
+            app.request_shutdown(ShutdownReason::Signal(signal))?;
+            app.stop()?;
+            tracing::info!(
+                category = "application_shutdown_complete",
+                signal = signal.number(),
+                received_count = signal_state.received_count(),
+                "process signal arrived before the first PTY was spawned"
+            );
+            return Ok(DesktopRuntimeStart::Signaled(signal));
+        }
         let initial_cwd = SpawnDirectory::open(&app.launch_context().base_cwd)?;
         let session = TerminalSession::start(
             app.launch(),
@@ -1011,7 +1036,7 @@ impl DesktopRuntime {
                 },
             )]),
         };
-        Ok(Self {
+        Ok(DesktopRuntimeStart::Ready(Box::new(Self {
             state: RuntimeState::Running,
             app,
             gfx,
@@ -1028,14 +1053,17 @@ impl DesktopRuntime {
             windows,
             pending_platform_events: VecDeque::new(),
             window_service_cursor: None,
-        })
+            signal_state,
+            signal_observed: false,
+            exit_signal: None,
+        })))
     }
 
     /// Runs the demand-driven window loop until the compositor requests close.
     ///
     /// # Errors
     /// Returns a typed platform, renderer, or application failure.
-    pub fn run(mut self) -> Result<(), UiRuntimeError> {
+    pub fn run(mut self) -> Result<UiExit, UiRuntimeError> {
         let result = self.run_loop();
         if let Err(error) = &result {
             tracing::error!(
@@ -1050,8 +1078,21 @@ impl DesktopRuntime {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn run_loop(&mut self) -> Result<(), UiRuntimeError> {
+    fn run_loop(&mut self) -> Result<UiExit, UiRuntimeError> {
         loop {
+            self.drain_process_signal()?;
+            if let Some(signal) = self.exit_signal {
+                self.finish_process_shutdown()?;
+                self.app.stop()?;
+                tracing::info!(
+                    category = "application_shutdown_complete",
+                    signal = signal.number(),
+                    received_count = self.signal_state.received_count(),
+                    wake_failed = self.signal_state.wake_failed(),
+                    "signal-triggered application shutdown completed"
+                );
+                return Ok(UiExit::Signaled(signal));
+            }
             let round_deadline = Instant::now() + PROCESS_UI_TIME_BUDGET;
             if self.pending_platform_events.is_empty() {
                 let mut events = Vec::new();
@@ -1250,7 +1291,90 @@ impl DesktopRuntime {
             }
         }
         self.app.stop()?;
+        Ok(UiExit::Clean)
+    }
+
+    fn drain_process_signal(&mut self) -> Result<(), UiRuntimeError> {
+        if self.signal_observed {
+            return Ok(());
+        }
+        let Some(signal) = self.signal_state.first_signal() else {
+            return Ok(());
+        };
+        self.signal_observed = true;
+        tracing::info!(
+            category = "process_signal_received",
+            signal = signal.number(),
+            "process signal relayed to the UI lifecycle"
+        );
+        let transition = self.app.request_shutdown(ShutdownReason::Signal(signal))?;
+        if transition == crate::app::ShutdownTransition::Started
+            || matches!(
+                self.app.lifecycle(),
+                crate::app::Lifecycle::ShuttingDown(ShutdownReason::Signal(existing))
+                    if *existing == signal
+            )
+        {
+            self.exit_signal = Some(signal);
+            self.begin_all_session_shutdown("signal");
+        }
         Ok(())
+    }
+
+    fn begin_all_session_shutdown(&mut self, reason: &'static str) {
+        for tabs in self.sessions.windows.values_mut() {
+            for tab in tabs.tabs_mut() {
+                tab.runtime.fast_cancel();
+                tab.session.begin_shutdown();
+            }
+        }
+        tracing::info!(
+            category = "application_shutdown_started",
+            reason,
+            sessions = self.process_session_count(),
+            "all terminal sessions entered shutdown"
+        );
+    }
+
+    fn finish_process_shutdown(&mut self) -> Result<(), UiRuntimeError> {
+        loop {
+            let now = Instant::now();
+            let mut pending = false;
+            let mut timed_out = false;
+            for tabs in self.sessions.windows.values_mut() {
+                tabs.poll_closing(now)?;
+                pending |= !tabs.closing_is_empty();
+                for tab in tabs.tabs_mut() {
+                    if tab.session.shutdown_deadline().is_none() {
+                        continue;
+                    }
+                    match tab.session.poll_shutdown(now)? {
+                        ShutdownPoll::Pending => pending = true,
+                        ShutdownPoll::TimedOut => timed_out = true,
+                        ShutdownPoll::Complete => {}
+                    }
+                }
+            }
+            if timed_out {
+                tracing::warn!(
+                    category = "pty",
+                    module = "ui_runtime",
+                    "PTY shutdown exceeded the 2 second completion deadline; detached owned workers"
+                );
+            }
+            if !pending {
+                return Ok(());
+            }
+            if let Err(error) = self
+                .gfx
+                .poll_wait(Some(self.wake.as_fd()), Some(SHUTDOWN_POLL_INTERVAL))
+            {
+                tracing::warn!(category = "shutdown_poll", %error, "platform poll failed during bounded shutdown");
+                std::thread::sleep(SHUTDOWN_POLL_INTERVAL);
+            } else if let Err(error) = self.wake.drain() {
+                tracing::warn!(category = "shutdown_poll", %error, "event wake drain failed during bounded shutdown");
+            }
+        }
     }
 
     /// Routes one event for the bootstrap window through the same tagged host stream as every
@@ -1328,36 +1452,9 @@ impl DesktopRuntime {
             error_category = ?category,
             "runtime entered fatal shutdown"
         );
-        for tab in self.current_tabs_mut().tabs_mut() {
-            tab.runtime.fast_cancel();
-        }
         let _ = self.app.request_shutdown(ShutdownReason::PlatformFailure);
-        for tab in self.current_tabs_mut().tabs_mut() {
-            tab.session.begin_shutdown();
-        }
-
-        while let Some(deadline) = self
-            .current_tabs_mut()
-            .tabs()
-            .iter()
-            .filter_map(|tab| tab.session.shutdown_deadline())
-            .max()
-        {
-            let pending = self.current_tabs_mut().tabs_mut().iter_mut().any(|tab| {
-                matches!(
-                    tab.session.poll_shutdown(Instant::now()),
-                    Ok(ShutdownPoll::Pending)
-                )
-            });
-            if !pending {
-                break;
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                continue;
-            }
-            std::thread::sleep(remaining.min(SHUTDOWN_POLL_INTERVAL));
-        }
+        self.begin_all_session_shutdown("platform_failure");
+        let _ = self.finish_process_shutdown();
         let _ = self.app.stop();
     }
 
@@ -4309,6 +4406,15 @@ fn launch_title(launch: &crate::cli::LaunchRequest) -> String {
     }
 }
 
+fn resolved_session_title(title: crate::session::SessionTitleDelta, fallback: &str) -> String {
+    match title {
+        crate::session::SessionTitleDelta::Set(title) if !title.is_empty() => title.to_string(),
+        crate::session::SessionTitleDelta::Set(_) | crate::session::SessionTitleDelta::Reset => {
+            fallback.to_owned()
+        }
+    }
+}
+
 fn window_title(ordinal: usize, count: usize, title: &str) -> String {
     let prefix = format!("[{ordinal}/{count}] ");
     let suffix = " — Leyline";
@@ -4325,11 +4431,31 @@ mod tests {
     use super::{
         accumulate_wheel_steps, format_terminal_query, ignores_key_repeat,
         keep_selection_after_release, key_text, renderer_fault_is_process_fatal,
-        rotate_window_service_order, search_query_capacity, select_new_tab_cwd,
-        should_cancel_search, starts_terminal_control_gesture, tab_drag_edge_direction,
-        take_matching_pending, take_priority_close_event, terminal_key_owner_changed,
-        terminal_modifiers, visible_search_query, visual_mapping_changed, xkb_text_allowed,
+        resolved_session_title, rotate_window_service_order, search_query_capacity,
+        select_new_tab_cwd, should_cancel_search, starts_terminal_control_gesture,
+        tab_drag_edge_direction, take_matching_pending, take_priority_close_event,
+        terminal_key_owner_changed, terminal_modifiers, visible_search_query,
+        visual_mapping_changed, xkb_text_allowed,
     };
+
+    #[test]
+    fn empty_session_title_uses_launch_fallback() {
+        assert_eq!(
+            resolved_session_title(crate::session::SessionTitleDelta::Set("".into()), "Shell"),
+            "Shell"
+        );
+        assert_eq!(
+            resolved_session_title(crate::session::SessionTitleDelta::Reset, "Shell"),
+            "Shell"
+        );
+        assert_eq!(
+            resolved_session_title(
+                crate::session::SessionTitleDelta::Set("Editor".into()),
+                "Shell"
+            ),
+            "Editor"
+        );
+    }
 
     fn registry_tab_manager(id: crate::tab::SessionId) -> crate::tab::TabManager {
         let runtime = crate::app::runtime::AppRuntimeBuilder::new(std::sync::Arc::new(

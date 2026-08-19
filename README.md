@@ -224,6 +224,13 @@ have been observed, so trailing output is parsed first; the last completed tab c
 terminal snapshot while releasing the PTY worker and file descriptor.
 Closing a running session targets the child through a Linux pidfd, requests `SIGTERM`, and escalates
 after a short grace period, so an uncooperative child cannot indefinitely block window shutdown.
+Leyline handles `SIGHUP`, `SIGINT`, and `SIGTERM` through the same bounded shutdown path and exits
+with status 129, 130, or 143 respectively after closing every window's sessions. Closing the PTY
+uses traditional Unix terminal hangup semantics: interactive jobs that remain attached to the
+controlling terminal are expected to exit, while programs deliberately detached with mechanisms
+such as `nohup`, `disown`, `setsid`, daemonization, or a separate supervisor are allowed to survive.
+`SIGKILL` and synchronous process crashes cannot run user-space cleanup; in those cases Leyline can
+only rely on the kernel closing its file descriptors and producing the normal PTY hangup.
 
 ## Current limitations
 

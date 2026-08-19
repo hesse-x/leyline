@@ -722,10 +722,13 @@ impl Drop for ChildOwner {
 
 fn wait_worker(mut owner: ChildOwner, shutdown: &AtomicBool, sinks: &PtySinks) {
     const TERM_GRACE: Duration = Duration::from_secs(1);
+    let operation_id = owner.child.id();
+    let started = Instant::now();
     let mut term_sent: Option<Instant> = None;
     loop {
         match owner.child.try_wait() {
             Ok(Some(status)) => {
+                log_child_reaped(operation_id, started, status);
                 (sinks.exited)(owner.finish(status));
                 return;
             }
@@ -738,16 +741,33 @@ fn wait_worker(mut owner: ChildOwner, shutdown: &AtomicBool, sinks: &PtySinks) {
         if shutdown.load(Ordering::Acquire) {
             if let Some(sent) = term_sent {
                 if sent.elapsed() >= TERM_GRACE {
+                    tracing::info!(
+                        category = "pty_shutdown",
+                        operation_id,
+                        stage = "kill_requested",
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "PTY child shutdown escalated"
+                    );
                     if let Err(error) = signal_pidfd(owner.pidfd.as_raw_fd(), libc::SIGKILL) {
                         (sinks.failed)(format!("pidfd SIGKILL: {error}"));
                     }
                     match owner.child.wait() {
-                        Ok(status) => (sinks.exited)(owner.finish(status)),
+                        Ok(status) => {
+                            log_child_reaped(operation_id, started, status);
+                            (sinks.exited)(owner.finish(status));
+                        }
                         Err(error) => (sinks.failed)(format!("wait after SIGKILL: {error}")),
                     }
                     return;
                 }
             } else {
+                tracing::info!(
+                    category = "pty_shutdown",
+                    operation_id,
+                    stage = "term_requested",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "PTY child shutdown requested"
+                );
                 if let Err(error) = signal_pidfd(owner.pidfd.as_raw_fd(), libc::SIGTERM) {
                     (sinks.failed)(format!("pidfd SIGTERM: {error}"));
                 }
@@ -756,6 +776,26 @@ fn wait_worker(mut owner: ChildOwner, shutdown: &AtomicBool, sinks: &PtySinks) {
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn log_child_reaped(operation_id: u32, started: Instant, status: std::process::ExitStatus) {
+    use std::os::unix::process::ExitStatusExt;
+
+    let exit_kind = if status.code().is_some() {
+        "code"
+    } else if status.signal().is_some() {
+        "signal"
+    } else {
+        "other"
+    };
+    tracing::info!(
+        category = "pty_shutdown",
+        operation_id,
+        stage = "reaped",
+        elapsed_ms = started.elapsed().as_millis(),
+        exit_kind,
+        "PTY child reaped"
+    );
 }
 
 fn map_exit(status: std::process::ExitStatus) -> ChildExit {

@@ -17,6 +17,7 @@ pub mod search;
 pub mod security;
 pub mod selection;
 pub mod session;
+pub mod signal;
 pub mod sound;
 pub mod tab;
 pub mod terminal;
@@ -88,7 +89,10 @@ pub fn run(
         return run_management(&cli, io);
     }
     match startup(&cli, environment, io) {
-        Ok(()) => RunOutcome { exit_code: 0 },
+        Ok(ui_runtime::UiExit::Clean) => RunOutcome { exit_code: 0 },
+        Ok(ui_runtime::UiExit::Signaled(signal)) => RunOutcome {
+            exit_code: signal.exit_code(),
+        },
         Err(error) => {
             io.stderr(&render_error(&error, error.verbose));
             RunOutcome {
@@ -136,7 +140,7 @@ fn startup(
     cli: &cli::Cli,
     environment: impl ConfigEnvironment,
     io: &mut impl ProcessIo,
-) -> Result<(), StartupError> {
+) -> Result<ui_runtime::UiExit, StartupError> {
     let source = FileConfigSource::new(environment);
     let location = source.locate().map_err(|source| StartupError {
         source: StartupErrorSource::Config(source),
@@ -194,11 +198,10 @@ fn startup(
             source: StartupErrorSource::Graphics(source.into()),
             verbose: cli.verbosity != Verbosity::Warn,
         })?;
-    let wake_backend: Arc<dyn app::runtime::WakeBackend> = event_wake.as_ref().map_or_else(
-        || Arc::new(CountingWake::default()) as Arc<dyn app::runtime::WakeBackend>,
-        |wake| Arc::new(wake.clone()) as Arc<dyn app::runtime::WakeBackend>,
-    );
-    let runtime = AppRuntimeBuilder::new(wake_backend)
+    if let Some(wake) = event_wake {
+        return startup_graphical(app, wake, cli.verbosity != Verbosity::Warn);
+    }
+    let _runtime = AppRuntimeBuilder::new(Arc::new(CountingWake::default()))
         .build()
         .map_err(|source| StartupError {
             source: StartupErrorSource::Runtime(source),
@@ -208,22 +211,6 @@ fn startup(
         source: StartupErrorSource::App(source),
         verbose: cli.verbosity != Verbosity::Warn,
     })?;
-    if io.graphical_session() {
-        return ui_runtime::DesktopRuntime::new(
-            app,
-            runtime,
-            event_wake.expect("graphical wake exists"),
-        )
-        .map_err(|source| StartupError {
-            source: StartupErrorSource::Graphics(source),
-            verbose: cli.verbosity != Verbosity::Warn,
-        })?
-        .run()
-        .map_err(|source| StartupError {
-            source: StartupErrorSource::Graphics(source),
-            verbose: cli.verbosity != Verbosity::Warn,
-        });
-    }
     tracing::info!(
         category = "application",
         module = "startup",
@@ -238,7 +225,56 @@ fn startup(
         source: StartupErrorSource::App(source),
         verbose: cli.verbosity != Verbosity::Warn,
     })?;
-    Ok(())
+    Ok(ui_runtime::UiExit::Clean)
+}
+
+fn startup_graphical(
+    mut app: app::App,
+    wake: leyline_gfx::EventWake,
+    verbose: bool,
+) -> Result<ui_runtime::UiExit, StartupError> {
+    let mut relay = signal::SignalRelay::install(wake.clone()).map_err(|source| StartupError {
+        source: StartupErrorSource::Signal(source),
+        verbose,
+    })?;
+    let state = relay.state();
+    let result = (|| {
+        let wake_backend: Arc<dyn app::runtime::WakeBackend> = Arc::new(wake.clone());
+        let runtime = AppRuntimeBuilder::new(wake_backend)
+            .build()
+            .map_err(|source| StartupError {
+                source: StartupErrorSource::Runtime(source),
+                verbose,
+            })?;
+        app.start().map_err(|source| StartupError {
+            source: StartupErrorSource::App(source),
+            verbose,
+        })?;
+        let start = ui_runtime::DesktopRuntime::initialize(app, runtime, wake, state).map_err(
+            |source| StartupError {
+                source: StartupErrorSource::Graphics(source),
+                verbose,
+            },
+        )?;
+        match start {
+            ui_runtime::DesktopRuntimeStart::Ready(runtime) => {
+                (*runtime).run().map_err(|source| StartupError {
+                    source: StartupErrorSource::Graphics(source),
+                    verbose,
+                })
+            }
+            ui_runtime::DesktopRuntimeStart::Signaled(signal) => {
+                Ok(ui_runtime::UiExit::Signaled(signal))
+            }
+        }
+    })();
+    if let Err(source) = relay.close_and_join() {
+        return Err(StartupError {
+            source: StartupErrorSource::Signal(source),
+            verbose,
+        });
+    }
+    result
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -262,6 +298,8 @@ enum StartupErrorSource {
     #[error(transparent)]
     Runtime(#[from] app::runtime::RuntimeBuildError),
     #[error(transparent)]
+    Signal(#[from] signal::SignalRelayError),
+    #[error(transparent)]
     Graphics(#[from] ui_runtime::UiRuntimeError),
     #[error(transparent)]
     Terminfo(#[from] terminfo::TerminfoError),
@@ -275,7 +313,8 @@ impl ClassifiedError for StartupError {
             StartupErrorSource::Logging(_)
             | StartupErrorSource::Launch(_)
             | StartupErrorSource::App(_)
-            | StartupErrorSource::Runtime(_) => ErrorCategory::Internal,
+            | StartupErrorSource::Runtime(_)
+            | StartupErrorSource::Signal(_) => ErrorCategory::Internal,
             StartupErrorSource::Terminfo(error) => error.category(),
         }
     }

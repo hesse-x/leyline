@@ -594,6 +594,7 @@ dependencies = [
  "regex-automata",
  "rustix",
  "serde",
+ "signal-hook",
  "tempfile",
  "thiserror",
  "toml",
@@ -643,6 +644,7 @@ dependencies = [
  "libc",
  "tempfile",
  "thiserror",
+ "tracing",
 ]
 
 [[package]]

@@ -252,4 +252,32 @@ mod tests {
         );
         app.stop().expect("stop");
     }
+
+    #[test]
+    fn first_signal_shutdown_reason_is_preserved() {
+        let mut app = AppBuilder::new(
+            Arc::new(EffectiveConfig::default()),
+            LaunchContext::for_test(LaunchRequest::DefaultShell),
+        )
+        .build();
+        app.start().expect("start");
+        assert_eq!(
+            app.request_shutdown(ShutdownReason::Signal(
+                crate::app::event::ProcessSignal::Terminate
+            ))
+            .expect("shutdown"),
+            ShutdownTransition::Started
+        );
+        assert_eq!(
+            app.request_shutdown(ShutdownReason::UserRequested)
+                .expect("repeat shutdown"),
+            ShutdownTransition::AlreadyShuttingDown
+        );
+        assert_eq!(
+            app.lifecycle(),
+            &Lifecycle::ShuttingDown(ShutdownReason::Signal(
+                crate::app::event::ProcessSignal::Terminate
+            ))
+        );
+    }
 }
