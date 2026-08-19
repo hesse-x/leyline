@@ -28,6 +28,8 @@ use crate::{
     },
 };
 
+const ADDITIONAL_SEMANTIC_ESCAPE_CHARS: &str = ";，。：；";
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TerminalAction {
     SetTitle(Arc<str>),
@@ -162,6 +164,11 @@ impl TerminalCoreAdapter {
                 shape: map_cursor_shape_to_ansi(config.default_cursor_shape),
                 blinking: false,
             },
+            semantic_escape_chars: format!(
+                "{}{}",
+                alacritty_terminal::term::SEMANTIC_ESCAPE_CHARS,
+                ADDITIONAL_SEMANTIC_ESCAPE_CHARS
+            ),
             osc52: alacritty_terminal::term::Osc52::Disabled,
             ..Config::default()
         };
@@ -1619,6 +1626,43 @@ mod tests {
         core.update_selection(SelectionPoint { column: 2, line: 1 }, SelectionSide::Right)
             .unwrap();
         assert_eq!(core.selected_text().as_deref(), Some("second\n"));
+    }
+
+    #[test]
+    fn semantic_selection_treats_ascii_and_cjk_punctuation_as_boundaries() {
+        for (separator, right_column) in [
+            (",", 5),
+            ("，", 6),
+            ("。", 6),
+            (":", 5),
+            ("：", 6),
+            (";", 5),
+            ("；", 6),
+        ] {
+            let mut core = TerminalCoreAdapter::new(GridSize::new(16, 2).unwrap(), 0).unwrap();
+            core.advance(format!("left{separator}right").as_bytes())
+                .unwrap();
+
+            for (column, expected) in [(1, "left"), (right_column, "right")] {
+                let point = SelectionPoint { column, line: 0 };
+                core.start_selection(SelectionKind::Semantic, point, SelectionSide::Left)
+                    .unwrap();
+                core.update_selection(point, SelectionSide::Right).unwrap();
+                assert_eq!(
+                    core.selected_text().as_deref(),
+                    Some(expected),
+                    "separator {separator:?} did not terminate semantic selection"
+                );
+            }
+        }
+
+        let mut core = TerminalCoreAdapter::new(GridSize::new(16, 2).unwrap(), 0).unwrap();
+        core.advance(b"left.right").unwrap();
+        let point = SelectionPoint { column: 1, line: 0 };
+        core.start_selection(SelectionKind::Semantic, point, SelectionSide::Left)
+            .unwrap();
+        core.update_selection(point, SelectionSide::Right).unwrap();
+        assert_eq!(core.selected_text().as_deref(), Some("left.right"));
     }
 
     #[test]
