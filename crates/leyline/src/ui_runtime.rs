@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     num::{NonZeroU8, NonZeroU64},
-    ops::{Deref, DerefMut},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -24,6 +23,7 @@ use crate::{
     interaction::{ClickTracker, ImeState, LinkCandidate, ScrollbarController, ScrollbarGeometry},
     layout::{ContentInsets, GridLayout, TerminalGeometry},
     session::{SessionAction, SessionReplyRequest, ShutdownPoll, TerminalSession},
+    session_pump::{WINDOW_BYTE_BUDGET, WINDOW_EVENT_BUDGET, WINDOW_TIME_BUDGET},
     signal::ProcessSignalState,
     tab::TabManager,
     unicode_layout::{
@@ -440,8 +440,7 @@ pub struct WindowRuntime {
     search_dialog_origin: Option<[u32; 2]>,
     search_dialog_drag: Option<SearchDialogDrag>,
     visual_build: Option<PendingVisualBuild>,
-    pending_visual_map: Option<(leyline_gfx::FrameKey, Arc<VisualGridMap>)>,
-    published_visual_map: Option<Arc<VisualGridMap>>,
+    presentation: crate::presentation::PresentationPipeline,
     visual_bell: crate::bell::VisualBellState,
 }
 
@@ -492,26 +491,21 @@ impl WindowRuntime {
             search_dialog_origin: None,
             search_dialog_drag: None,
             visual_build: None,
-            pending_visual_map: None,
-            published_visual_map: None,
+            presentation: crate::presentation::PresentationPipeline::default(),
             visual_bell: crate::bell::VisualBellState::default(),
         }
     }
 }
 
-impl Deref for DesktopRuntime {
-    type Target = WindowRuntime;
-
-    fn deref(&self) -> &Self::Target {
+impl DesktopRuntime {
+    fn current_window(&self) -> &WindowRuntime {
         match self.windows.get(&self.current_window_id) {
             Some(WindowRecord::Ready(window)) => window,
             _ => panic!("current window is not ready"),
         }
     }
-}
 
-impl DerefMut for DesktopRuntime {
-    fn deref_mut(&mut self) -> &mut Self::Target {
+    fn current_window_mut(&mut self) -> &mut WindowRuntime {
         match self.windows.get_mut(&self.current_window_id) {
             Some(WindowRecord::Ready(window)) => window,
             _ => panic!("current window is not ready"),
@@ -536,6 +530,20 @@ const PROCESS_UI_TIME_BUDGET: Duration = Duration::from_millis(8);
 const PROCESS_PLATFORM_EVENT_BUDGET: usize = 256;
 
 impl DesktopRuntime {
+    fn window_context(
+        &mut self,
+        id: leyline_gfx::WindowId,
+    ) -> Option<crate::window_controller::WindowContext<'_, WindowRuntime, TabManager>> {
+        let window = match self.windows.get_mut(&id)? {
+            WindowRecord::Ready(window) => window.as_mut(),
+            _ => return None,
+        };
+        let tabs = self.sessions.get_mut(id)?;
+        Some(crate::window_controller::WindowContext::new(
+            id, window, tabs,
+        ))
+    }
+
     fn current_tabs(&self) -> &TabManager {
         self.sessions
             .get(self.current_window_id)
@@ -642,9 +650,6 @@ impl DesktopRuntime {
 
     #[allow(clippy::too_many_lines)]
     fn drain_sessions(&mut self, process_deadline: Instant) -> Result<(), UiRuntimeError> {
-        const WINDOW_EVENT_BUDGET: usize = 64;
-        const WINDOW_BYTE_BUDGET: usize = 1024 * 1024;
-        const WINDOW_TIME_BUDGET: Duration = Duration::from_millis(2);
         let started = Instant::now();
         let drain_deadline = (started + WINDOW_TIME_BUDGET).min(process_deadline);
         let mut events = 0_usize;
@@ -653,7 +658,8 @@ impl DesktopRuntime {
         let mut tab_presentation_changed = false;
         let fallback_title = launch_title(self.app.launch());
         let local_identity = self.app.launch_context().local_identity.clone();
-        let geometry = self.layout.terminal_geometry(self.layout_generation);
+        let window = self.current_window();
+        let geometry = window.layout.terminal_geometry(window.layout_generation);
         let foreground = self.app.config().colors.foreground.0;
         let background = self.app.config().colors.background.0;
         for id in self.current_tabs_mut().drain_order() {
@@ -707,7 +713,7 @@ impl DesktopRuntime {
                     completed.push(id);
                 }
             }
-            let window_focused = self.keyboard_focused;
+            let window_focused = self.current_window_mut().keyboard_focused;
             let visual_duration = self.app.config().bell.visual_duration;
             let bell_config = self.app.config().bell.clone();
             let tab = self
@@ -789,8 +795,11 @@ impl DesktopRuntime {
                     None
                 };
                 if effects.schedule_visual {
-                    self.visual_bell
-                        .schedule(id, Instant::now(), visual_duration);
+                    self.current_window_mut().visual_bell.schedule(
+                        id,
+                        Instant::now(),
+                        visual_duration,
+                    );
                     tab_presentation_changed = true;
                 }
                 if effects.enqueue_notification {
@@ -1024,8 +1033,7 @@ impl DesktopRuntime {
             search_dialog_origin: None,
             search_dialog_drag: None,
             visual_build: None,
-            pending_visual_map: None,
-            published_visual_map: None,
+            presentation: crate::presentation::PresentationPipeline::default(),
             visual_bell: crate::bell::VisualBellState::default(),
         };
         let windows = HashMap::from([(
@@ -1149,10 +1157,14 @@ impl DesktopRuntime {
                 continue;
             }
             self.apply_settled_resize()?;
-            if self.window_state.expire(Instant::now()) {
+            if self
+                .current_window_mut()
+                .window_state
+                .expire(Instant::now())
+            {
                 tracing::debug!(
                     category = "window_state_configured",
-                    effective = ?self.window_state.effective(),
+                    effective = ?self.current_window_mut().window_state.effective(),
                     "window state request stabilized at compositor state"
                 );
             }
@@ -1172,10 +1184,10 @@ impl DesktopRuntime {
             self.drain_clipboard_results()?;
             self.process_drag_scroll()?;
             self.process_tab_drag_scroll()?;
-            if self.scrollbar.expire(Instant::now()) {
+            if self.current_window_mut().scrollbar.expire(Instant::now()) {
                 self.compose_latest()?;
             }
-            if self.visual_bell.expire(Instant::now()) {
+            if self.current_window_mut().visual_bell.expire(Instant::now()) {
                 self.compose_latest()?;
             }
             let search_effect = self.active_session_mut().advance_search(Instant::now())?;
@@ -1191,19 +1203,20 @@ impl DesktopRuntime {
             if self.poll_shutdown()? {
                 break;
             }
-            let resize_preview = self.resize_settle_deadline.is_some();
+            let resize_preview = self.current_window_mut().resize_settle_deadline.is_some();
             let Some(render_outcome) = self.try_render_current_isolated(resize_preview)? else {
                 continue;
             };
             let render_timeout = match render_outcome {
                 RenderOutcome::Deferred => Some(GfxRuntime::retry_delay()),
                 RenderOutcome::Rendered { committed } => {
-                    if let Some(map) =
-                        take_matching_pending(&mut self.pending_visual_map, committed)
-                    {
-                        let mapping_changed =
-                            visual_mapping_changed(self.published_visual_map.as_deref(), &map);
-                        self.published_visual_map = Some(map);
+                    let previous = self
+                        .current_window_mut()
+                        .presentation
+                        .published_visual_map()
+                        .cloned();
+                    if let Some(map) = self.current_window_mut().presentation.commit(committed) {
+                        let mapping_changed = visual_mapping_changed(previous.as_deref(), &map);
                         if mapping_changed {
                             self.cancel_pointer_gesture();
                         }
@@ -1229,21 +1242,36 @@ impl DesktopRuntime {
                 .min();
             let timeout = earliest_timeout(
                 earliest_timeout(
-                    earliest_timeout(render_timeout, self.drag_scroll.map(|drag| drag.deadline)),
-                    self.resize_settle_deadline,
+                    earliest_timeout(
+                        render_timeout,
+                        self.current_window_mut()
+                            .drag_scroll
+                            .map(|drag| drag.deadline),
+                    ),
+                    self.current_window_mut().resize_settle_deadline,
                 ),
                 shutdown_poll,
             );
+            let timeout = earliest_timeout(
+                timeout,
+                self.current_window_mut()
+                    .tab_drag_scroll
+                    .map(|scroll| scroll.deadline),
+            );
             let timeout =
-                earliest_timeout(timeout, self.tab_drag_scroll.map(|scroll| scroll.deadline));
-            let timeout = earliest_timeout(timeout, self.scrollbar.next_deadline());
+                earliest_timeout(timeout, self.current_window_mut().scrollbar.next_deadline());
             let timeout = earliest_timeout(timeout, sync_deadline);
-            let timeout = earliest_timeout(timeout, self.cursor_blink_deadline);
-            let timeout = earliest_timeout(timeout, self.visual_bell.deadline());
+            let timeout =
+                earliest_timeout(timeout, self.current_window_mut().cursor_blink_deadline);
+            let timeout =
+                earliest_timeout(timeout, self.current_window_mut().visual_bell.deadline());
             let timeout = earliest_timeout(timeout, self.active_session().search().next_deadline());
             let timeout = earliest_timeout(
                 timeout,
-                self.window_state.pending().map(|pending| pending.deadline),
+                self.current_window_mut()
+                    .window_state
+                    .pending()
+                    .map(|pending| pending.deadline),
             );
             let timeout = earliest_timeout(timeout, self.gfx.next_creation_deadline());
             let window_shutdown = self
@@ -1280,7 +1308,7 @@ impl DesktopRuntime {
                 })
                 .min();
             let timeout = earliest_timeout(timeout, window_tab_drag_scroll);
-            let timeout = if self.visual_build.is_some() {
+            let timeout = if self.current_window_mut().visual_build.is_some() {
                 Some(Duration::ZERO)
             } else {
                 timeout
@@ -1391,19 +1419,21 @@ impl DesktopRuntime {
                 return Ok(true);
             }
             PlatformEvent::Configured { state, .. } => {
-                self.window_state.configured(state);
+                self.current_window_mut().window_state.configured(state);
                 self.cancel_pointer_gesture();
-                self.resize_settle_deadline = Some(Instant::now() + RESIZE_SETTLE_INTERVAL);
+                self.current_window_mut().resize_settle_deadline =
+                    Some(Instant::now() + RESIZE_SETTLE_INTERVAL);
                 self.gfx.acknowledge_resize()?;
             }
             PlatformEvent::ScaleChanged { .. } => {
                 self.cancel_pointer_gesture();
-                self.resize_settle_deadline = Some(Instant::now() + RESIZE_SETTLE_INTERVAL);
+                self.current_window_mut().resize_settle_deadline =
+                    Some(Instant::now() + RESIZE_SETTLE_INTERVAL);
                 self.gfx.acknowledge_resize()?;
             }
             PlatformEvent::KeyboardFocus { focused, .. } => {
-                self.keyboard_focused = focused;
-                self.visual_bell.cancel();
+                self.current_window_mut().keyboard_focused = focused;
+                self.current_window_mut().visual_bell.cancel();
                 if focused
                     && let Some(id) = self.current_tabs().active_id()
                     && let Some(generation) = self.current_tabs_mut().acknowledge(id)
@@ -1412,16 +1442,16 @@ impl DesktopRuntime {
                 }
                 self.active_session_mut().focus_changed(focused)?;
                 if !focused {
-                    self.local_pressed_keys.clear();
-                    self.terminal_pressed_keys.clear();
-                    self.terminal_control_gesture = false;
+                    self.current_window_mut().local_pressed_keys.clear();
+                    self.current_window_mut().terminal_pressed_keys.clear();
+                    self.current_window_mut().terminal_control_gesture = false;
                     self.cancel_paste_confirmation()?;
                     self.cancel_pointer_gesture();
                     if let Some(serial) = self.gfx.disable_text_input()? {
-                        self.ime.record_commit_serial(serial);
+                        self.current_window_mut().ime.record_commit_serial(serial);
                     }
-                    self.ime.deactivate();
-                    self.ime_context = None;
+                    self.current_window_mut().ime.deactivate();
+                    self.current_window_mut().ime_context = None;
                 }
                 self.compose_latest()?;
             }
@@ -1512,7 +1542,9 @@ impl DesktopRuntime {
         scale: leyline_gfx::Scale120,
         font_size: f64,
     ) -> Result<(), UiRuntimeError> {
-        if scale == self.text_scale && font_size.to_bits() == self.font_size.to_bits() {
+        if scale == self.current_window().text_scale
+            && font_size.to_bits() == self.current_window().font_size.to_bits()
+        {
             return self.resize_layout_without_font_rebuild(logical, scale);
         }
         let request = FontRequest::from_points(
@@ -1528,8 +1560,9 @@ impl DesktopRuntime {
         .with_color_glyphs(
             self.app.config().unicode.color_glyphs && self.gfx.color_glyphs_supported(),
         );
-        let prepared = self.text.prepare_configure(request)?;
+        let prepared = self.current_window_mut().text.prepare_configure(request)?;
         let prepared_tab = self
+            .current_window_mut()
             .tab_text
             .prepare_configure(tab_font_request(font_size, scale.0)?)?;
         let layout = GridLayout::calculate_with_style(
@@ -1540,13 +1573,13 @@ impl DesktopRuntime {
             self.app.config().font.line_spacing,
             prepared.generation(),
         )?;
-        let grid_changed = self.layout.grid != layout.grid;
+        let grid_changed = self.current_window().layout.grid != layout.grid;
         let tab_bar = crate::tab::TabBarPresentation::layout(
             self.current_tabs(),
             layout.viewport_px.width,
             scale.0,
             &self.app.config().tabs,
-            self.tab_bar.offset,
+            self.current_window().tab_bar.offset,
         );
         if grid_changed {
             for tab in self.current_tabs_mut().tabs_mut() {
@@ -1557,20 +1590,23 @@ impl DesktopRuntime {
                 }
             }
         }
-        self.text.commit_configure(prepared)?;
-        self.tab_text.commit_configure(prepared_tab)?;
-        self.text_scale = scale;
-        self.font_size = font_size;
-        self.layout = layout;
-        self.visual_build = None;
-        self.pending_visual_map = None;
-        self.published_visual_map = None;
+        self.current_window_mut().text.commit_configure(prepared)?;
+        self.current_window_mut()
+            .tab_text
+            .commit_configure(prepared_tab)?;
+        self.current_window_mut().text_scale = scale;
+        self.current_window_mut().font_size = font_size;
+        self.current_window_mut().layout = layout;
+        self.current_window_mut().visual_build = None;
+        self.current_window_mut().presentation.reset();
         self.cancel_pointer_gesture();
-        self.layout_generation = self
+        let layout_generation = self
+            .current_window()
             .layout_generation
             .checked_add(1)
             .ok_or_else(|| UiRuntimeError::Grid("layout generation overflow".into()))?;
-        self.tab_bar = tab_bar;
+        self.current_window_mut().layout_generation = layout_generation;
+        self.current_window_mut().tab_bar = tab_bar;
         self.refresh_text_input_rectangle()?;
         if !grid_changed {
             self.compose_latest()?;
@@ -1587,11 +1623,11 @@ impl DesktopRuntime {
             logical,
             scale,
             content_insets(self.app.config(), self.current_tabs().len()),
-            self.text.metrics(),
+            self.current_window().text.metrics(),
             self.app.config().font.line_spacing,
-            self.text.generation(),
+            self.current_window().text.generation(),
         )?;
-        let grid_changed = self.layout.grid != layout.grid;
+        let grid_changed = self.current_window().layout.grid != layout.grid;
         if grid_changed {
             for tab in self.current_tabs_mut().tabs_mut() {
                 if let Err(error) = tab.session.resize(layout.grid) {
@@ -1601,15 +1637,16 @@ impl DesktopRuntime {
                 }
             }
         }
-        self.layout = layout;
-        self.visual_build = None;
-        self.pending_visual_map = None;
-        self.published_visual_map = None;
+        self.current_window_mut().layout = layout;
+        self.current_window_mut().visual_build = None;
+        self.current_window_mut().presentation.reset();
         self.cancel_pointer_gesture();
-        self.layout_generation = self
+        let layout_generation = self
+            .current_window()
             .layout_generation
             .checked_add(1)
             .ok_or_else(|| UiRuntimeError::Grid("layout generation overflow".into()))?;
+        self.current_window_mut().layout_generation = layout_generation;
         self.refresh_text_input_rectangle()?;
         if grid_changed {
             Ok(())
@@ -1619,14 +1656,15 @@ impl DesktopRuntime {
     }
 
     fn apply_settled_resize(&mut self) -> Result<(), UiRuntimeError> {
-        let Some(deadline) = self.resize_settle_deadline else {
+        let Some(deadline) = self.current_window().resize_settle_deadline else {
             return Ok(());
         };
         if Instant::now() < deadline {
             return Ok(());
         }
-        self.resize_settle_deadline = None;
-        self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), self.font_size)
+        self.current_window_mut().resize_settle_deadline = None;
+        let font_size = self.current_window().font_size;
+        self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), font_size)
     }
 
     fn flush_expired_sync(&mut self, now: Instant) -> Result<(), UiRuntimeError> {
@@ -1644,7 +1682,7 @@ impl DesktopRuntime {
     }
 
     fn advance_cursor_blink(&mut self, now: Instant) -> Result<(), UiRuntimeError> {
-        let blinking = self.keyboard_focused
+        let blinking = self.current_window_mut().keyboard_focused
             && self
                 .active_session()
                 .latest_snapshot()
@@ -1653,22 +1691,25 @@ impl DesktopRuntime {
                         && snapshot.cursor.blink == crate::terminal::CursorBlink::Blinking
                 });
         if !blinking {
-            let changed = !self.cursor_blink_visible;
-            self.cursor_blink_visible = true;
-            self.cursor_blink_deadline = None;
+            let changed = !self.current_window_mut().cursor_blink_visible;
+            self.current_window_mut().cursor_blink_visible = true;
+            self.current_window_mut().cursor_blink_deadline = None;
             if changed {
                 self.compose_latest()?;
             }
             return Ok(());
         }
-        let Some(deadline) = self.cursor_blink_deadline else {
-            self.cursor_blink_visible = true;
-            self.cursor_blink_deadline = Some(now + Duration::from_millis(500));
+        let Some(deadline) = self.current_window_mut().cursor_blink_deadline else {
+            self.current_window_mut().cursor_blink_visible = true;
+            self.current_window_mut().cursor_blink_deadline =
+                Some(now + Duration::from_millis(500));
             return Ok(());
         };
         if now >= deadline {
-            self.cursor_blink_visible = !self.cursor_blink_visible;
-            self.cursor_blink_deadline = Some(now + Duration::from_millis(500));
+            self.current_window_mut().cursor_blink_visible =
+                !self.current_window_mut().cursor_blink_visible;
+            self.current_window_mut().cursor_blink_deadline =
+                Some(now + Duration::from_millis(500));
             self.compose_latest()?;
         }
         Ok(())
@@ -1713,10 +1754,18 @@ impl DesktopRuntime {
     fn handle_key(&mut self, key: &leyline_gfx::KeyInput) -> Result<(), UiRuntimeError> {
         let physical = (key.serial.seat, key.physical_keycode);
         if key.state == leyline_gfx::KeyState::Released {
-            if self.local_pressed_keys.remove(&physical) {
+            if self
+                .current_window_mut()
+                .local_pressed_keys
+                .remove(&physical)
+            {
                 return Ok(());
             }
-            if let Some(pressed) = self.terminal_pressed_keys.remove(&physical) {
+            if let Some(pressed) = self
+                .current_window_mut()
+                .terminal_pressed_keys
+                .remove(&physical)
+            {
                 return self.send_terminal_keyboard_event(
                     key,
                     pressed,
@@ -1726,7 +1775,11 @@ impl DesktopRuntime {
             return Ok(());
         }
         if key.repeat
-            && let Some(pressed) = self.terminal_pressed_keys.get(&physical).copied()
+            && let Some(pressed) = self
+                .current_window_mut()
+                .terminal_pressed_keys
+                .get(&physical)
+                .copied()
         {
             return self.send_terminal_keyboard_event(
                 key,
@@ -1738,13 +1791,13 @@ impl DesktopRuntime {
             self.remember_local_key(physical);
             return Ok(());
         }
-        self.last_input_serial = Some(key.serial);
+        self.current_window_mut().last_input_serial = Some(key.serial);
         if should_cancel_search(self.active_session().search().is_open(), key.logical_key) {
             self.execute_action(crate::config::Action::CancelSearch)?;
             self.remember_local_key(physical);
             return Ok(());
         }
-        if self.search_focused
+        if self.current_window_mut().search_focused
             && self.active_session().search().is_open()
             && self.handle_search_key(key)?
         {
@@ -1763,17 +1816,17 @@ impl DesktopRuntime {
             self.remember_local_key(physical);
             return Ok(());
         }
-        if key.repeat && self.local_pressed_keys.contains(&physical) {
+        if key.repeat
+            && self
+                .current_window_mut()
+                .local_pressed_keys
+                .contains(&physical)
+        {
             return Ok(());
         }
-        if self
-            .local_pressed_keys
-            .len()
-            .saturating_add(self.terminal_pressed_keys.len())
-            >= MAX_PRESSED_KEYS
-        {
-            self.local_pressed_keys.clear();
-            self.terminal_pressed_keys.clear();
+        if self.pressed_key_capacity_reached() {
+            self.current_window_mut().local_pressed_keys.clear();
+            self.current_window_mut().terminal_pressed_keys.clear();
             self.remember_local_key(physical);
             tracing::warn!(
                 category = "pressed_key_overflow",
@@ -1789,29 +1842,38 @@ impl DesktopRuntime {
             identity: key.identity,
             // Text-input focus is normally active for the whole terminal focus lifetime.
             // Only an actual preedit proves that the IME currently owns text composition.
-            associated_text_allowed: xkb_text_allowed(&self.ime),
+            associated_text_allowed: xkb_text_allowed(&self.current_window().ime),
             foreground_process_group: self.active_session().foreground_process_group(),
         };
-        self.terminal_pressed_keys.insert(physical, pressed);
+        self.current_window_mut()
+            .terminal_pressed_keys
+            .insert(physical, pressed);
         self.send_terminal_keyboard_event(key, pressed, crate::terminal::KeyboardEventKind::Press)
     }
 
     fn remember_local_key(&mut self, physical: (leyline_gfx::SeatToken, u32)) {
-        if !self.local_pressed_keys.contains(&physical)
-            && self
-                .local_pressed_keys
-                .len()
-                .saturating_add(self.terminal_pressed_keys.len())
-                >= MAX_PRESSED_KEYS
+        if !self.current_window().local_pressed_keys.contains(&physical)
+            && self.pressed_key_capacity_reached()
         {
-            self.local_pressed_keys.clear();
-            self.terminal_pressed_keys.clear();
+            self.current_window_mut().local_pressed_keys.clear();
+            self.current_window_mut().terminal_pressed_keys.clear();
             tracing::warn!(
                 category = "pressed_key_overflow",
                 "pressed-key ownership table reset"
             );
         }
-        self.local_pressed_keys.insert(physical);
+        self.current_window_mut()
+            .local_pressed_keys
+            .insert(physical);
+    }
+
+    fn pressed_key_capacity_reached(&self) -> bool {
+        let window = self.current_window();
+        window
+            .local_pressed_keys
+            .len()
+            .saturating_add(window.terminal_pressed_keys.len())
+            >= MAX_PRESSED_KEYS
     }
 
     fn send_terminal_keyboard_event(
@@ -1861,7 +1923,7 @@ impl DesktopRuntime {
             owner.session.commit_text(&text)?;
         }
         if starts_terminal_control_gesture(pressed.identity.logical, modifiers, kind) {
-            self.terminal_control_gesture = true;
+            self.current_window_mut().terminal_control_gesture = true;
         }
         Ok(())
     }
@@ -1953,9 +2015,9 @@ impl DesktopRuntime {
     }
 
     fn modifiers_changed(&mut self, modifiers: leyline_gfx::ModifiersState) {
-        self.modifiers = modifiers;
+        self.current_window_mut().modifiers = modifiers;
         if !modifiers.control {
-            self.terminal_control_gesture = false;
+            self.current_window_mut().terminal_control_gesture = false;
         }
     }
 
@@ -1970,7 +2032,8 @@ impl DesktopRuntime {
         ) {
             return Ok(());
         }
-        if !self.ime.is_active() && !matches!(&event, TextInputEvent::Enter | TextInputEvent::Leave)
+        if !self.current_window_mut().ime.is_active()
+            && !matches!(&event, TextInputEvent::Enter | TextInputEvent::Leave)
         {
             // Compositors may leave already-queued text-input events behind a focus/leave event.
             tracing::debug!(
@@ -1981,22 +2044,23 @@ impl DesktopRuntime {
         }
         match event {
             TextInputEvent::Enter => {
-                self.ime.activate();
-                self.ime_context = None;
+                self.current_window_mut().ime.activate();
+                self.current_window_mut().ime_context = None;
                 self.enable_text_input()?;
             }
             TextInputEvent::Leave => {
-                self.ime.deactivate();
-                self.ime_context = None;
+                self.current_window_mut().ime.deactivate();
+                self.current_window_mut().ime_context = None;
             }
             TextInputEvent::Preedit { text, cursor } => {
-                self.ime.preedit_string(text, cursor)?;
+                self.current_window_mut().ime.preedit_string(text, cursor)?;
             }
-            TextInputEvent::Commit(text) => self.ime.commit_string(text)?,
+            TextInputEvent::Commit(text) => self.current_window_mut().ime.commit_string(text)?,
             TextInputEvent::DeleteSurrounding {
                 before_bytes,
                 after_bytes,
             } => self
+                .current_window_mut()
                 .ime
                 .delete_surrounding_text(before_bytes, after_bytes)?,
             TextInputEvent::Done { serial } => {
@@ -2004,9 +2068,12 @@ impl DesktopRuntime {
                     return Ok(());
                 };
                 let anchor = [snapshot.cursor.column, snapshot.cursor.line];
-                let done = self.ime.done(serial, snapshot.generation, anchor)?;
-                let search_focused =
-                    self.search_focused && self.active_session().search().is_open();
+                let done =
+                    self.current_window_mut()
+                        .ime
+                        .done(serial, snapshot.generation, anchor)?;
+                let search_focused = self.current_window_mut().search_focused
+                    && self.active_session().search().is_open();
                 if let Some((before_bytes, after_bytes)) = done.delete_surrounding {
                     if search_focused {
                         self.active_session_mut().edit_search(
@@ -2040,33 +2107,35 @@ impl DesktopRuntime {
     }
 
     fn refresh_text_input_rectangle(&mut self) -> Result<(), UiRuntimeError> {
-        if !self.ime.is_active() || !self.gfx.text_input_available() {
+        if !self.current_window_mut().ime.is_active() || !self.gfx.text_input_available() {
             return Ok(());
         }
         let Some(context) = self.text_input_context() else {
             return Ok(());
         };
-        if self.ime_context.as_ref() == Some(&context) && !self.ime.outbound.dirty {
+        if self.current_window_mut().ime_context.as_ref() == Some(&context)
+            && !self.current_window_mut().ime.outbound.dirty
+        {
             return Ok(());
         }
         let serial = self.gfx.update_text_input(context.clone())?;
         if let Some(serial) = serial {
-            self.ime.record_commit_serial(serial);
-            self.ime_context = Some(context);
+            self.current_window_mut().ime.record_commit_serial(serial);
+            self.current_window_mut().ime_context = Some(context);
         }
         Ok(())
     }
 
     fn enable_text_input(&mut self) -> Result<(), UiRuntimeError> {
-        if !self.ime.is_active() || !self.gfx.text_input_available() {
+        if !self.current_window_mut().ime.is_active() || !self.gfx.text_input_available() {
             return Ok(());
         }
         let Some(context) = self.text_input_context() else {
             return Ok(());
         };
         if let Some(serial) = self.gfx.enable_text_input(context.clone())? {
-            self.ime.record_commit_serial(serial);
-            self.ime_context = Some(context);
+            self.current_window_mut().ime.record_commit_serial(serial);
+            self.current_window_mut().ime_context = Some(context);
         }
         Ok(())
     }
@@ -2076,22 +2145,26 @@ impl DesktopRuntime {
         let logical = |value: u32| {
             i32::try_from(u64::from(value) * 120 / u64::from(scale)).unwrap_or(i32::MAX)
         };
-        if self.search_focused && self.active_session().search().is_open() {
-            let dialog = self.search_dialog.clone().unwrap_or_else(|| {
-                let viewport = [
-                    self.layout.viewport_px.width,
-                    self.layout.viewport_px.height,
-                ];
-                let mut dialog = crate::search::SearchDialogPresentation::layout(
-                    viewport,
-                    self.gfx.scale().0,
-                    self.active_session().search().query().to_owned(),
-                );
-                if let Some(origin) = self.search_dialog_origin {
-                    dialog.move_to(origin, viewport);
-                }
-                dialog
-            });
+        if self.current_window().search_focused && self.active_session().search().is_open() {
+            let dialog = self
+                .current_window()
+                .search_dialog
+                .clone()
+                .unwrap_or_else(|| {
+                    let viewport = [
+                        self.current_window().layout.viewport_px.width,
+                        self.current_window().layout.viewport_px.height,
+                    ];
+                    let mut dialog = crate::search::SearchDialogPresentation::layout(
+                        viewport,
+                        self.gfx.scale().0,
+                        self.active_session().search().query().to_owned(),
+                    );
+                    if let Some(origin) = self.current_window().search_dialog_origin {
+                        dialog.move_to(origin, viewport);
+                    }
+                    dialog
+                });
             let input = dialog.input;
             return Some(leyline_gfx::TextInputRectangle {
                 x: logical(input.x),
@@ -2101,36 +2174,40 @@ impl DesktopRuntime {
             });
         }
         let snapshot = self.active_session().latest_snapshot()?;
-        let visual_column = self.published_visual_map.as_ref().map_or_else(
-            || (!self.app.config().unicode.bidi).then_some(snapshot.cursor.column),
-            |map| {
-                (map.snapshot_generation == snapshot.generation)
-                    .then(|| {
-                        map.lines
-                            .get(usize::from(snapshot.cursor.line))?
-                            .logical_to_visual_cell
-                            .get(usize::from(snapshot.cursor.column))
-                            .copied()
-                    })
-                    .flatten()
-            },
-        )?;
-        let physical_x = self.layout.content_origin_px[0]
-            .saturating_add(u32::from(visual_column) * u32::from(self.layout.cell_px[0].get()));
-        let physical_y = self.layout.content_origin_px[1].saturating_add(
-            u32::from(snapshot.cursor.line) * u32::from(self.layout.cell_px[1].get()),
-        );
+        let visual_column = self
+            .current_window()
+            .presentation
+            .published_visual_map()
+            .map_or_else(
+                || (!self.app.config().unicode.bidi).then_some(snapshot.cursor.column),
+                |map| {
+                    (map.snapshot_generation == snapshot.generation)
+                        .then(|| {
+                            map.lines
+                                .get(usize::from(snapshot.cursor.line))?
+                                .logical_to_visual_cell
+                                .get(usize::from(snapshot.cursor.column))
+                                .copied()
+                        })
+                        .flatten()
+                },
+            )?;
+        let layout = self.current_window().layout;
+        let physical_x = layout.content_origin_px[0]
+            .saturating_add(u32::from(visual_column) * u32::from(layout.cell_px[0].get()));
+        let physical_y = layout.content_origin_px[1]
+            .saturating_add(u32::from(snapshot.cursor.line) * u32::from(layout.cell_px[1].get()));
         Some(leyline_gfx::TextInputRectangle {
             x: logical(physical_x),
             y: logical(physical_y),
-            width: logical(u32::from(self.layout.cell_px[0].get())).max(1),
-            height: logical(u32::from(self.layout.cell_px[1].get())).max(1),
+            width: logical(u32::from(layout.cell_px[0].get())).max(1),
+            height: logical(u32::from(layout.cell_px[1].get())).max(1),
         })
     }
 
     fn text_input_context(&self) -> Option<leyline_gfx::TextInputContext> {
         let rectangle = self.text_input_rectangle()?;
-        if self.search_focused && self.active_session().search().is_open() {
+        if self.current_window().search_focused && self.active_session().search().is_open() {
             let search = self.active_session().search();
             leyline_gfx::TextInputContext::search(
                 rectangle,
@@ -2158,10 +2235,10 @@ impl DesktopRuntime {
             snapshot,
             UnicodePolicy {
                 bidi: self.app.config().unicode.bidi,
-                generation: self.layout_generation,
+                generation: self.current_window_mut().layout_generation,
             },
         )?;
-        self.visual_build = Some(PendingVisualBuild {
+        self.current_window_mut().visual_build = Some(PendingVisualBuild {
             snapshot: snapshot.clone(),
             builder,
         });
@@ -2169,14 +2246,14 @@ impl DesktopRuntime {
     }
 
     fn advance_visual_build(&mut self) -> Result<(), UiRuntimeError> {
-        let Some(mut pending) = self.visual_build.take() else {
+        let Some(mut pending) = self.current_window_mut().visual_build.take() else {
             return Ok(());
         };
         match pending
             .builder
             .step(Instant::now() + Duration::from_millis(2))?
         {
-            BuildStep::Pending => self.visual_build = Some(pending),
+            BuildStep::Pending => self.current_window_mut().visual_build = Some(pending),
             BuildStep::Ready(map) => {
                 self.compose_with_visual_map(&pending.snapshot, Arc::new(map))?;
             }
@@ -2191,8 +2268,10 @@ impl DesktopRuntime {
     ) -> Result<(), UiRuntimeError> {
         self.update_tab_bar();
         let search_dialog = self.search_dialog_presentation();
-        self.search_dialog.clone_from(&search_dialog);
-        self.ime.reanchor_preedit(
+        self.current_window_mut()
+            .search_dialog
+            .clone_from(&search_dialog);
+        self.current_window_mut().ime.reanchor_preedit(
             snapshot.generation,
             [snapshot.cursor.column, snapshot.cursor.line],
         );
@@ -2200,25 +2279,29 @@ impl DesktopRuntime {
         let paste_confirmation = self.paste_confirmation_overlay().copied();
         let selection = self.active_session().selection_overlay(snapshot.generation);
         let search = self.active_session().search_overlay(snapshot);
-        let search_focused = self.search_focused && self.active_session().search().is_open();
+        let search_focused =
+            self.current_window().search_focused && self.active_session().search().is_open();
+        let scrollbar_config = self.app.config().scrollbar.clone();
+        let scale = self.gfx.scale().0;
         let geometry = ScrollbarGeometry::calculate(
             snapshot,
-            &self.layout,
-            &self.app.config().scrollbar,
-            self.gfx.scale().0,
+            &self.current_window().layout,
+            &scrollbar_config,
+            scale,
         );
         let scrollbar = geometry.and_then(|geometry| {
-            self.scrollbar.presentation(
+            self.current_window_mut().scrollbar.presentation(
                 geometry,
                 snapshot,
-                &self.app.config().scrollbar,
+                &scrollbar_config,
                 Instant::now(),
             )
         });
-        let visual_bell_active = self
-            .current_tabs_mut()
-            .active_id()
-            .is_some_and(|id| self.visual_bell.active_for(id, Instant::now()));
+        let visual_bell_active = self.current_tabs_mut().active_id().is_some_and(|id| {
+            self.current_window_mut()
+                .visual_bell
+                .active_for(id, Instant::now())
+        });
         let colors = self.app.config().colors.clone();
         let current = self.current_window_id;
         let Some(WindowRecord::Ready(window)) = self.windows.get_mut(&current) else {
@@ -2278,18 +2361,23 @@ impl DesktopRuntime {
         let key = prepared.frame_key();
         self.gfx
             .apply(leyline_gfx::GfxCommand::SetPreparedScene(prepared))?;
-        self.pending_visual_map = Some((key, visual_map));
+        self.current_window_mut()
+            .presentation
+            .stage(key, visual_map);
         Ok(())
     }
 
     fn update_tab_bar(&mut self) {
-        self.tab_bar = crate::tab::TabBarPresentation::layout(
+        let viewport_width = self.current_window().layout.viewport_px.width;
+        let offset = self.current_window().tab_bar.offset;
+        let tab_bar = crate::tab::TabBarPresentation::layout(
             self.current_tabs(),
-            self.layout.viewport_px.width,
+            viewport_width,
             self.gfx.scale().0,
             &self.app.config().tabs,
-            self.tab_bar.offset,
+            offset,
         );
+        self.current_window_mut().tab_bar = tab_bar;
     }
 
     fn search_dialog_presentation(&self) -> Option<crate::search::SearchDialogPresentation> {
@@ -2299,8 +2387,8 @@ impl DesktopRuntime {
         }
         let mut query = search.query().to_owned();
         let mut cursor = search.cursor_byte();
-        if self.search_focused
-            && let Some(preedit) = &self.ime.preedit
+        if self.current_window().search_focused
+            && let Some(preedit) = &self.current_window().ime.preedit
             && query.is_char_boundary(cursor)
         {
             query.insert_str(cursor, &preedit.text);
@@ -2308,38 +2396,46 @@ impl DesktopRuntime {
         }
         if query.is_char_boundary(cursor) {
             let viewport = [
-                self.layout.viewport_px.width,
-                self.layout.viewport_px.height,
+                self.current_window().layout.viewport_px.width,
+                self.current_window().layout.viewport_px.height,
             ];
             let mut layout = crate::search::SearchDialogPresentation::layout(
                 viewport,
                 self.gfx.scale().0,
                 String::new(),
             );
-            if let Some(origin) = self.search_dialog_origin {
+            if let Some(origin) = self.current_window().search_dialog_origin {
                 layout.move_to(origin, viewport);
             }
-            let visible_chars =
-                search_query_capacity(layout.input.width, self.text.metrics().width_px.get());
-            layout.query_text =
-                visible_search_query(&query, cursor, visible_chars, self.search_focused);
+            let visible_chars = search_query_capacity(
+                layout.input.width,
+                self.current_window().text.metrics().width_px.get(),
+            );
+            layout.query_text = visible_search_query(
+                &query,
+                cursor,
+                visible_chars,
+                self.current_window().search_focused,
+            );
             return Some(layout);
         }
         None
     }
 
     fn set_search_focus(&mut self, focused: bool) -> Result<(), UiRuntimeError> {
-        if self.search_focused == focused || !self.active_session().search().is_open() {
+        if self.current_window_mut().search_focused == focused
+            || !self.active_session().search().is_open()
+        {
             return Ok(());
         }
-        self.search_focused = focused;
+        self.current_window_mut().search_focused = focused;
         if !focused {
-            self.pending_search_paste = None;
+            self.current_window_mut().pending_search_paste = None;
         }
-        if self.ime.is_active() {
-            self.ime.deactivate();
-            self.ime.activate();
-            self.ime_context = None;
+        if self.current_window_mut().ime.is_active() {
+            self.current_window_mut().ime.deactivate();
+            self.current_window_mut().ime.activate();
+            self.current_window_mut().ime_context = None;
         }
         self.compose_latest()?;
         self.refresh_text_input_rectangle()
@@ -2359,7 +2455,7 @@ impl DesktopRuntime {
     }
 
     fn enter_paste_confirmation(&mut self) -> Result<(), UiRuntimeError> {
-        let suspended = self.ime.is_active();
+        let suspended = self.current_window_mut().ime.is_active();
         self.selection.set_modal_ime_suspended(suspended);
         if suspended {
             let serial = match self.gfx.disable_text_input() {
@@ -2370,10 +2466,10 @@ impl DesktopRuntime {
                 }
             };
             if let Some(serial) = serial {
-                self.ime.record_commit_serial(serial);
+                self.current_window_mut().ime.record_commit_serial(serial);
             }
-            self.ime.deactivate();
-            self.ime_context = None;
+            self.current_window_mut().ime.deactivate();
+            self.current_window_mut().ime_context = None;
         }
         if let Some(overlay) = self.selection.overlay() {
             tracing::warn!(
@@ -2400,7 +2496,7 @@ impl DesktopRuntime {
         suspended: bool,
     ) -> Result<(), UiRuntimeError> {
         if suspended {
-            self.ime.activate();
+            self.current_window_mut().ime.activate();
             self.enable_text_input()?;
         }
         Ok(())
@@ -2440,7 +2536,7 @@ impl DesktopRuntime {
         match crate::input::shortcut::resolve_with_terminal_gesture(
             &self.app.config().keybindings,
             key,
-            self.terminal_control_gesture,
+            self.current_window().terminal_control_gesture,
         ) {
             crate::input::shortcut::ShortcutResult::Matched(action) => Some(action),
             crate::input::shortcut::ShortcutResult::NotMatched => None,
@@ -2455,42 +2551,61 @@ impl DesktopRuntime {
                 self.copy_selection(leyline_gfx::SelectionTarget::Clipboard)?;
             }
             Action::PasteClipboard => {
-                if self.search_focused && self.active_session().search().is_open() {
-                    self.pending_search_paste = Some((
+                if self.current_window_mut().search_focused
+                    && self.active_session().search().is_open()
+                {
+                    self.current_window_mut().pending_search_paste = Some((
                         self.current_tabs().active_id().expect("active tab"),
                         self.active_session().search().revision(),
                     ));
                 } else {
-                    self.pending_search_paste = None;
+                    self.current_window_mut().pending_search_paste = None;
                 }
                 self.request_paste(leyline_gfx::SelectionTarget::Clipboard)?;
             }
             Action::IncreaseFontSize => {
-                let font_size = (self.font_size + 1.0).min(72.0);
+                let font_size = (self.current_window_mut().font_size + 1.0).min(72.0);
                 self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), font_size)?;
             }
             Action::DecreaseFontSize => {
-                let font_size = (self.font_size - 1.0).max(6.0);
+                let font_size = (self.current_window_mut().font_size - 1.0).max(6.0);
                 self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), font_size)?;
             }
             Action::ResetFontSize => {
+                let reset_font_size = self.current_window().reset_font_size;
                 self.reconfigure_layout(
                     self.gfx.logical_size(),
                     self.gfx.scale(),
-                    self.reset_font_size,
+                    reset_font_size,
                 )?;
             }
             Action::ScrollPageUp => {
-                let lines =
-                    i32::try_from(self.layout.grid.lines().saturating_sub(1)).unwrap_or(i32::MAX);
+                let lines = i32::try_from(
+                    self.current_window_mut()
+                        .layout
+                        .grid
+                        .lines()
+                        .saturating_sub(1),
+                )
+                .unwrap_or(i32::MAX);
                 self.active_session_mut().scroll(lines)?;
-                self.scrollbar.note_scroll(Instant::now());
+                self.current_window_mut()
+                    .scrollbar
+                    .note_scroll(Instant::now());
             }
             Action::ScrollPageDown => {
-                let lines =
-                    -i32::try_from(self.layout.grid.lines().saturating_sub(1)).unwrap_or(i32::MAX);
+                let lines = -i32::try_from(
+                    self.current_window_mut()
+                        .layout
+                        .grid
+                        .lines()
+                        .saturating_sub(1),
+                )
+                .unwrap_or(i32::MAX);
                 self.active_session_mut().scroll(lines)?;
-                self.scrollbar.note_scroll(Instant::now());
+                self.current_window_mut()
+                    .scrollbar
+                    .note_scroll(Instant::now());
             }
             Action::PastePrimary => {
                 self.request_paste(leyline_gfx::SelectionTarget::Primary)?;
@@ -2517,8 +2632,8 @@ impl DesktopRuntime {
                 }
             }
             Action::ToggleFullscreen => {
-                let target = !self.window_state.desired().fullscreen;
-                self.window_state.request(
+                let target = !self.current_window_mut().window_state.desired().fullscreen;
+                self.current_window_mut().window_state.request(
                     crate::window::WindowStateRequest::SetFullscreen(target),
                     Instant::now(),
                     WINDOW_STATE_STABILIZATION,
@@ -2527,8 +2642,8 @@ impl DesktopRuntime {
                     .apply(leyline_gfx::GfxCommand::RequestFullscreen(target))?;
             }
             Action::ToggleMaximized => {
-                let target = !self.window_state.desired().maximized;
-                self.window_state.request(
+                let target = !self.current_window_mut().window_state.desired().maximized;
+                self.current_window_mut().window_state.request(
                     crate::window::WindowStateRequest::SetMaximized(target),
                     Instant::now(),
                     WINDOW_STATE_STABILIZATION,
@@ -2537,7 +2652,7 @@ impl DesktopRuntime {
                     .apply(leyline_gfx::GfxCommand::RequestMaximized(target))?;
             }
             Action::RestoreWindow => {
-                self.window_state.request(
+                self.current_window_mut().window_state.request(
                     crate::window::WindowStateRequest::Restore,
                     Instant::now(),
                     WINDOW_STATE_STABILIZATION,
@@ -2549,7 +2664,7 @@ impl DesktopRuntime {
                 let id = self.current_tabs().active_id().expect("active tab");
                 let (muted, invalidated) = self.current_tabs_mut().toggle_bell_mute(id)?;
                 if muted {
-                    self.visual_bell.cancel();
+                    self.current_window_mut().visual_bell.cancel();
                 }
                 if let Some(generation) = invalidated {
                     self.notifications.acknowledge(id, generation);
@@ -2564,7 +2679,7 @@ impl DesktopRuntime {
             }
             Action::Search => {
                 self.active_session_mut().open_search();
-                if self.search_focused {
+                if self.current_window_mut().search_focused {
                     self.compose_latest()?;
                     self.refresh_text_input_rectangle()?;
                 } else {
@@ -2582,9 +2697,9 @@ impl DesktopRuntime {
                 self.compose_latest()?;
             }
             Action::CancelSearch => {
-                self.pending_search_paste = None;
-                self.search_dialog_drag = None;
-                self.search_dialog_origin = None;
+                self.current_window_mut().pending_search_paste = None;
+                self.current_window_mut().search_dialog_drag = None;
+                self.current_window_mut().search_dialog_origin = None;
                 self.set_pointer_cursor(leyline_gfx::PointerCursor::Text)?;
                 self.set_search_focus(false)?;
                 self.active_session_mut().cancel_search();
@@ -2659,19 +2774,16 @@ impl DesktopRuntime {
             }
         };
         let runtime = AppRuntimeBuilder::new(self.wake_backend.clone()).build()?;
-        let session = match TerminalSession::start(
-            self.app.launch(),
-            cwd,
-            self.app.config(),
-            self.layout.grid,
-            &runtime,
-        ) {
-            Ok(session) => session,
-            Err(error) => {
-                tracing::warn!(category = "tab_create_failed", %error, "could not create tab");
-                return Ok(());
-            }
-        };
+        let grid = self.current_window().layout.grid;
+        let session =
+            match TerminalSession::start(self.app.launch(), cwd, self.app.config(), grid, &runtime)
+            {
+                Ok(session) => session,
+                Err(error) => {
+                    tracing::warn!(category = "tab_create_failed", %error, "could not create tab");
+                    return Ok(());
+                }
+            };
         let tab_bar_was_visible = tab_bar_visible(self.app.config(), self.current_tabs().len());
         self.quiesce_active_interaction()?;
         let id = self.session_ids.allocate()?;
@@ -2694,7 +2806,8 @@ impl DesktopRuntime {
             }
         }
         if tab_bar_was_visible != tab_bar_visible(self.app.config(), self.current_tabs().len()) {
-            self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), self.font_size)?;
+            let font_size = self.current_window().font_size;
+            self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), font_size)?;
         }
         self.restore_active_interaction()?;
         let snapshot = self.active_session_mut().end_drain_round()?;
@@ -3177,7 +3290,9 @@ impl DesktopRuntime {
             }
             self.process_drag_scroll()?;
             self.process_tab_drag_scroll()?;
-            if self.scrollbar.expire(Instant::now()) || self.visual_bell.expire(Instant::now()) {
+            if self.current_window_mut().scrollbar.expire(Instant::now())
+                || self.current_window_mut().visual_bell.expire(Instant::now())
+            {
                 self.compose_latest()?;
             }
             let search_effect = self.active_session_mut().advance_search(Instant::now())?;
@@ -3190,7 +3305,7 @@ impl DesktopRuntime {
             self.advance_visual_build()?;
             self.advance_cursor_blink(Instant::now())?;
             self.refresh_active_title()?;
-            let resize_preview = self.resize_settle_deadline.is_some();
+            let resize_preview = self.current_window_mut().resize_settle_deadline.is_some();
             let _ = self.try_render_current_isolated(resize_preview)?;
         }
         let closing = self
@@ -3251,7 +3366,8 @@ impl DesktopRuntime {
             return Ok(());
         }
         if tab_bar_was_visible != tab_bar_visible(self.app.config(), self.current_tabs().len()) {
-            self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), self.font_size)?;
+            let font_size = self.current_window().font_size;
+            self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), font_size)?;
         }
         self.restore_active_interaction()?;
         if let Some(snapshot) = self.active_session_mut().end_drain_round()? {
@@ -3310,30 +3426,29 @@ impl DesktopRuntime {
     fn quiesce_active_interaction(&mut self) -> Result<(), UiRuntimeError> {
         self.cancel_paste_confirmation()?;
         self.cancel_pointer_gesture();
-        self.visual_build = None;
-        self.pending_visual_map = None;
-        self.published_visual_map = None;
-        self.visual_bell.cancel();
+        self.current_window_mut().visual_build = None;
+        self.current_window_mut().presentation.reset();
+        self.current_window_mut().visual_bell.cancel();
         if let Some(serial) = self.gfx.disable_text_input()? {
-            self.ime.record_commit_serial(serial);
+            self.current_window_mut().ime.record_commit_serial(serial);
         }
-        self.ime.deactivate();
-        self.ime_context = None;
-        if self.keyboard_focused {
+        self.current_window_mut().ime.deactivate();
+        self.current_window_mut().ime_context = None;
+        if self.current_window_mut().keyboard_focused {
             self.active_session_mut().focus_changed(false)?;
         }
         Ok(())
     }
 
     fn restore_active_interaction(&mut self) -> Result<(), UiRuntimeError> {
-        if self.keyboard_focused {
+        if self.current_window_mut().keyboard_focused {
             if let Some(id) = self.current_tabs().active_id()
                 && let Some(generation) = self.current_tabs_mut().acknowledge(id)
             {
                 self.notifications.acknowledge(id, generation);
             }
             self.active_session_mut().focus_changed(true)?;
-            self.ime.activate();
+            self.current_window_mut().ime.activate();
             self.enable_text_input()?;
         }
         Ok(())
@@ -3348,12 +3463,12 @@ impl DesktopRuntime {
             return Ok(());
         }
         if let leyline_gfx::PointerKind::Release { serial, .. } = event.kind {
-            self.last_input_serial = Some(serial);
+            self.current_window_mut().last_input_serial = Some(serial);
         }
         if matches!(event.kind, leyline_gfx::PointerKind::Leave { .. })
-            && self.tab_drag.take().is_some()
+            && self.current_window_mut().tab_drag.take().is_some()
         {
-            self.tab_drag_scroll = None;
+            self.current_window_mut().tab_drag_scroll = None;
             self.set_pointer_cursor(leyline_gfx::PointerCursor::Text)?;
             self.compose_latest()?;
             return Ok(());
@@ -3364,7 +3479,7 @@ impl DesktopRuntime {
         }
         if event.position.0 < 0.0
             && !matches!(
-                self.scrollbar.interaction(),
+                self.current_window_mut().scrollbar.interaction(),
                 crate::interaction::ScrollbarInteraction::Dragging { .. }
             )
         {
@@ -3376,21 +3491,25 @@ impl DesktopRuntime {
             (event.position.1 * scale).max(0.0).floor() as u32,
         ];
         let viewport = [
-            self.layout.viewport_px.width,
-            self.layout.viewport_px.height,
+            self.current_window().layout.viewport_px.width,
+            self.current_window().layout.viewport_px.height,
         ];
         let drag_outset = 8_u32.saturating_mul(self.gfx.scale().0).saturating_add(119) / 120;
-        let drag_hit = self.search_dialog.as_ref().is_some_and(|dialog| {
-            self.active_session().search().is_open()
-                && dialog.drag_hit_test(pixel, viewport, drag_outset)
-        });
-        if let Some(drag) = self.search_dialog_drag {
+        let search_open = self.active_session().search().is_open();
+        let drag_hit = self
+            .current_window()
+            .search_dialog
+            .as_ref()
+            .is_some_and(|dialog| {
+                search_open && dialog.drag_hit_test(pixel, viewport, drag_outset)
+            });
+        if let Some(drag) = self.current_window_mut().search_dialog_drag {
             self.gfx.apply(leyline_gfx::GfxCommand::SetPointerCursor(
                 leyline_gfx::PointerCursor::Grabbing,
             ))?;
             match event.kind {
                 leyline_gfx::PointerKind::Motion { .. } => {
-                    self.search_dialog_origin = Some([
+                    self.current_window_mut().search_dialog_origin = Some([
                         u32::try_from(
                             (i64::from(pixel[0]) - drag.grab_offset[0])
                                 .clamp(0, i64::from(u32::MAX)),
@@ -3406,7 +3525,7 @@ impl DesktopRuntime {
                     return Ok(());
                 }
                 leyline_gfx::PointerKind::Release { button: 0x110, .. } => {
-                    self.search_dialog_drag = None;
+                    self.current_window_mut().search_dialog_drag = None;
                     self.gfx
                         .apply(leyline_gfx::GfxCommand::SetPointerCursor(if drag_hit {
                             leyline_gfx::PointerCursor::Grab
@@ -3425,7 +3544,7 @@ impl DesktopRuntime {
                 leyline_gfx::PointerCursor::Text
             }))?;
         if self.active_session().search().is_open()
-            && let Some(dialog) = self.search_dialog.clone()
+            && let Some(dialog) = self.current_window_mut().search_dialog.clone()
         {
             let primary_press = matches!(
                 event.kind,
@@ -3445,7 +3564,7 @@ impl DesktopRuntime {
                         .navigate_search(crate::search::SearchDirection::Next, Instant::now())?;
                     self.compose_latest()?;
                 } else if primary_press {
-                    self.search_dialog_drag = Some(SearchDialogDrag {
+                    self.current_window_mut().search_dialog_drag = Some(SearchDialogDrag {
                         grab_offset: [
                             i64::from(pixel[0]) - i64::from(dialog.panel.x),
                             i64::from(pixel[1]) - i64::from(dialog.panel.y),
@@ -3458,7 +3577,7 @@ impl DesktopRuntime {
                 return Ok(());
             }
             if primary_press && drag_hit {
-                self.search_dialog_drag = Some(SearchDialogDrag {
+                self.current_window_mut().search_dialog_drag = Some(SearchDialogDrag {
                     grab_offset: [
                         i64::from(pixel[0]) - i64::from(dialog.panel.x),
                         i64::from(pixel[1]) - i64::from(dialog.panel.y),
@@ -3473,7 +3592,7 @@ impl DesktopRuntime {
                 self.set_search_focus(false)?;
             }
         }
-        if let Some(mut drag) = self.tab_drag.take() {
+        if let Some(mut drag) = self.current_window_mut().tab_drag.take() {
             match event.kind {
                 leyline_gfx::PointerKind::Motion { .. } => {
                     drag.current = [f64::from(pixel[0]), f64::from(pixel[1])];
@@ -3484,34 +3603,42 @@ impl DesktopRuntime {
                         drag.phase = crate::tab::TabDragPhase::Dragging;
                     }
                     if drag.phase == crate::tab::TabDragPhase::Dragging {
-                        if let Some(index) =
-                            self.tab_bar.proposed_index(self.current_tabs(), pixel[0])
-                        {
+                        let mut context = self
+                            .window_context(self.current_window_id)
+                            .expect("current window and sessions are ready");
+                        let proposed = crate::window_controller::WindowController::apply(
+                            &mut context,
+                            |window, tabs| window.tab_bar.proposed_index(tabs, pixel[0]),
+                        );
+                        if let Some(index) = proposed {
                             drag.proposed_index = index;
                         }
                         let edge_direction = self
+                            .current_window_mut()
                             .tab_bar
                             .bar
                             .and_then(|bar| {
                                 tab_drag_edge_direction(bar, pixel[0], self.gfx.scale().0)
                             })
-                            .filter(|_| self.tab_bar.max_offset > 0);
-                        self.tab_drag_scroll = edge_direction.map(|direction| {
-                            self.tab_drag_scroll
-                                .filter(|scroll| scroll.direction == direction)
-                                .unwrap_or(TabDragScroll {
-                                    direction,
-                                    deadline: Instant::now() + DRAG_SCROLL_INTERVAL,
-                                })
-                        });
+                            .filter(|_| self.current_window_mut().tab_bar.max_offset > 0);
+                        self.current_window_mut().tab_drag_scroll =
+                            edge_direction.map(|direction| {
+                                self.current_window_mut()
+                                    .tab_drag_scroll
+                                    .filter(|scroll| scroll.direction == direction)
+                                    .unwrap_or(TabDragScroll {
+                                        direction,
+                                        deadline: Instant::now() + DRAG_SCROLL_INTERVAL,
+                                    })
+                            });
                         self.set_pointer_cursor(leyline_gfx::PointerCursor::Grabbing)?;
                     }
-                    self.tab_drag = Some(drag);
+                    self.current_window_mut().tab_drag = Some(drag);
                     self.compose_latest()?;
                     return Ok(());
                 }
                 leyline_gfx::PointerKind::Release { button: 0x110, .. } => {
-                    self.tab_drag_scroll = None;
+                    self.current_window_mut().tab_drag_scroll = None;
                     if drag.phase == crate::tab::TabDragPhase::Dragging
                         && let crate::tab::ReorderOutcome::Changed { from, to } = self
                             .current_tabs_mut()
@@ -3531,21 +3658,26 @@ impl DesktopRuntime {
                     return Ok(());
                 }
                 leyline_gfx::PointerKind::Leave { .. } => {
-                    self.tab_drag_scroll = None;
+                    self.current_window_mut().tab_drag_scroll = None;
                     self.set_pointer_cursor(leyline_gfx::PointerCursor::Text)?;
                     return Ok(());
                 }
-                _ => self.tab_drag = Some(drag),
+                _ => self.current_window_mut().tab_drag = Some(drag),
             }
         }
-        if self.tab_bar.bar.is_some_and(|bar| bar.contains(pixel)) {
+        if self
+            .current_window_mut()
+            .tab_bar
+            .bar
+            .is_some_and(|bar| bar.contains(pixel))
+        {
             match event.kind {
                 leyline_gfx::PointerKind::Press {
                     button: 0x110,
                     serial,
                     ..
                 } => {
-                    if let Some((id, close)) = self.tab_bar.hit(pixel) {
+                    if let Some((id, close)) = self.current_window_mut().tab_bar.hit(pixel) {
                         self.switch_to(id)?;
                         if close {
                             self.close_active_tab(ShutdownReason::UserRequested)?;
@@ -3556,7 +3688,7 @@ impl DesktopRuntime {
                                 .iter()
                                 .position(|tab| tab.id == id)
                                 .unwrap_or(0);
-                            self.tab_drag = Some(crate::tab::TabDrag {
+                            self.current_window_mut().tab_drag = Some(crate::tab::TabDrag {
                                 session: id,
                                 press_serial: serial,
                                 origin: [f64::from(pixel[0]), f64::from(pixel[1])],
@@ -3564,12 +3696,12 @@ impl DesktopRuntime {
                                 proposed_index,
                                 phase: crate::tab::TabDragPhase::Armed,
                             });
-                            self.tab_drag_scroll = None;
+                            self.current_window_mut().tab_drag_scroll = None;
                         }
                     }
                 }
                 leyline_gfx::PointerKind::Press { button: 0x112, .. } => {
-                    if let Some((id, _)) = self.tab_bar.hit(pixel) {
+                    if let Some((id, _)) = self.current_window_mut().tab_bar.hit(pixel) {
                         self.switch_to(id)?;
                         self.close_active_tab(ShutdownReason::UserRequested)?;
                     }
@@ -3587,13 +3719,17 @@ impl DesktopRuntime {
                     let step = u32::from(self.app.config().tabs.min_width)
                         .saturating_mul(self.gfx.scale().0)
                         / 120;
-                    self.tab_bar.offset = if delta > 0 {
-                        self.tab_bar
+                    self.current_window_mut().tab_bar.offset = if delta > 0 {
+                        self.current_window_mut()
+                            .tab_bar
                             .offset
                             .saturating_add(step)
-                            .min(self.tab_bar.max_offset)
+                            .min(self.current_window_mut().tab_bar.max_offset)
                     } else {
-                        self.tab_bar.offset.saturating_sub(step)
+                        self.current_window_mut()
+                            .tab_bar
+                            .offset
+                            .saturating_sub(step)
                     };
                     self.compose_latest()?;
                 }
@@ -3601,50 +3737,55 @@ impl DesktopRuntime {
             }
             return Ok(());
         }
-        let above_grid = event.position.1 * scale < f64::from(self.layout.content_origin_px[1]);
-        let (point, owner_point, selection_endpoint) =
-            self.published_visual_map.as_ref().map_or_else(
-                || (None, None, None),
-                |map| match crate::unicode_layout::hit_test(map, &self.layout, pixel) {
-                    VisualHit::Cell {
-                        physical_point,
-                        owner_point,
-                        caret,
-                    } => {
-                        let columns = map.grid.columns.get();
-                        let endpoint = if caret.logical_boundary >= columns {
-                            (
-                                crate::terminal::SelectionPoint {
-                                    column: columns - 1,
-                                    line: physical_point.line,
-                                },
-                                crate::terminal::SelectionSide::Right,
-                            )
-                        } else {
-                            (
-                                crate::terminal::SelectionPoint {
-                                    column: caret.logical_boundary,
-                                    line: physical_point.line,
-                                },
-                                match caret.affinity {
-                                    CaretAffinity::Before => crate::terminal::SelectionSide::Left,
-                                    CaretAffinity::After => crate::terminal::SelectionSide::Right,
-                                },
-                            )
-                        };
-                        (Some(physical_point), Some(owner_point), Some(endpoint))
-                    }
-                    VisualHit::Outside => (None, None, None),
-                },
-            );
+        let layout = self.current_window().layout;
+        let visual_map = self
+            .current_window()
+            .presentation
+            .published_visual_map()
+            .cloned();
+        let above_grid = event.position.1 * scale < f64::from(layout.content_origin_px[1]);
+        let (point, owner_point, selection_endpoint) = visual_map.as_ref().map_or_else(
+            || (None, None, None),
+            |map| match crate::unicode_layout::hit_test(map, &layout, pixel) {
+                VisualHit::Cell {
+                    physical_point,
+                    owner_point,
+                    caret,
+                } => {
+                    let columns = map.grid.columns.get();
+                    let endpoint = if caret.logical_boundary >= columns {
+                        (
+                            crate::terminal::SelectionPoint {
+                                column: columns - 1,
+                                line: physical_point.line,
+                            },
+                            crate::terminal::SelectionSide::Right,
+                        )
+                    } else {
+                        (
+                            crate::terminal::SelectionPoint {
+                                column: caret.logical_boundary,
+                                line: physical_point.line,
+                            },
+                            match caret.affinity {
+                                CaretAffinity::Before => crate::terminal::SelectionSide::Left,
+                                CaretAffinity::After => crate::terminal::SelectionSide::Right,
+                            },
+                        )
+                    };
+                    (Some(physical_point), Some(owner_point), Some(endpoint))
+                }
+                VisualHit::Outside => (None, None, None),
+            },
+        );
         if self.handle_scrollbar_pointer(&event, [f64::from(pixel[0]), f64::from(pixel[1])])? {
             return Ok(());
         }
         let modifiers = crate::terminal::Modifiers {
-            shift: self.modifiers.shift,
-            control: self.modifiers.control,
-            alt: self.modifiers.alt,
-            super_key: self.modifiers.super_key,
+            shift: self.current_window_mut().modifiers.shift,
+            control: self.current_window_mut().modifiers.control,
+            alt: self.current_window_mut().modifiers.alt,
+            super_key: self.current_window_mut().modifiers.super_key,
         };
         match event.kind {
             leyline_gfx::PointerKind::Press {
@@ -3655,15 +3796,16 @@ impl DesktopRuntime {
                 let point = point.expect("guarded pointer cell");
                 if modifiers.control && !modifiers.shift && !modifiers.alt && !modifiers.super_key {
                     let link_point = owner_point.unwrap_or(point);
-                    self.link_candidate = self.active_session().hyperlink_at(link_point).map(
-                        |(snapshot_generation, hyperlink, _)| LinkCandidate {
+                    self.current_window_mut().link_candidate = self
+                        .active_session()
+                        .hyperlink_at(link_point)
+                        .map(|(snapshot_generation, hyperlink, _)| LinkCandidate {
                             snapshot_generation,
                             hyperlink,
                             point: link_point,
-                            modifiers: self.modifiers,
-                        },
-                    );
-                    if self.link_candidate.is_some() {
+                            modifiers: self.current_window_mut().modifiers,
+                        });
+                    if self.current_window_mut().link_candidate.is_some() {
                         return Ok(());
                     }
                 }
@@ -3674,7 +3816,11 @@ impl DesktopRuntime {
                     modifiers,
                 )? {
                     let selection_point = selection_endpoint.map_or(point, |endpoint| endpoint.0);
-                    let kind = self.click_tracker.register(0x110, selection_point, time_ms);
+                    let kind = self.current_window_mut().click_tracker.register(
+                        0x110,
+                        selection_point,
+                        time_ms,
+                    );
                     if let Some((point, side)) = selection_endpoint {
                         self.active_session_mut()
                             .start_selection_kind_with_side(kind, point, side)?;
@@ -3682,14 +3828,14 @@ impl DesktopRuntime {
                         self.active_session_mut()
                             .start_selection_kind(kind, selection_point)?;
                     }
-                    self.selecting = true;
-                    self.selection_point = Some(selection_point);
-                    self.selection_kind = Some(kind);
-                    self.selection_dragged = false;
+                    self.current_window_mut().selecting = true;
+                    self.current_window_mut().selection_point = Some(selection_point);
+                    self.current_window_mut().selection_kind = Some(kind);
+                    self.current_window_mut().selection_dragged = false;
                 }
             }
             leyline_gfx::PointerKind::Release { button: 0x110, .. } => {
-                if let Some(candidate) = self.link_candidate.take() {
+                if let Some(candidate) = self.current_window_mut().link_candidate.take() {
                     if let Some(point) = point
                         && let Some((generation, hyperlink, uri)) = self
                             .active_session()
@@ -3698,7 +3844,7 @@ impl DesktopRuntime {
                             generation,
                             hyperlink,
                             owner_point.unwrap_or(point),
-                            self.modifiers,
+                            self.current_window_mut().modifiers,
                         )
                         && let Err(error) = self.desktop_launcher.open(&uri)
                     {
@@ -3706,18 +3852,19 @@ impl DesktopRuntime {
                     }
                     return Ok(());
                 }
-                let point = point.or(self.selection_point);
+                let point = point.or(self.current_window_mut().selection_point);
                 let Some(point) = point else {
                     self.cancel_pointer_gesture();
                     return Ok(());
                 };
-                self.selection_dragged |= self.selection_point != Some(point);
+                self.current_window_mut().selection_dragged |=
+                    self.current_window_mut().selection_point != Some(point);
                 if !self.active_session_mut().pointer_report(
                     crate::terminal::MouseButton::Left,
                     crate::terminal::ButtonState::Released,
                     point,
                     modifiers,
-                )? && self.selecting
+                )? && self.current_window_mut().selecting
                 {
                     if let Some((selection_point, side)) = selection_endpoint {
                         self.active_session_mut()
@@ -3726,52 +3873,59 @@ impl DesktopRuntime {
                         self.active_session_mut().update_selection(point)?;
                     }
                 }
-                if self.selecting
-                    && keep_selection_after_release(self.selection_kind, self.selection_dragged)
+                if self.current_window_mut().selecting
+                    && keep_selection_after_release(
+                        self.current_window_mut().selection_kind,
+                        self.current_window_mut().selection_dragged,
+                    )
                 {
                     self.copy_selection(leyline_gfx::SelectionTarget::Primary)?;
-                } else if self.selecting {
+                } else if self.current_window_mut().selecting {
                     self.active_session_mut().clear_selection()?;
                 }
-                self.selecting = false;
-                self.selection_point = None;
-                self.selection_kind = None;
-                self.selection_dragged = false;
-                self.drag_scroll = None;
+                self.current_window_mut().selecting = false;
+                self.current_window_mut().selection_point = None;
+                self.current_window_mut().selection_kind = None;
+                self.current_window_mut().selection_dragged = false;
+                self.current_window_mut().drag_scroll = None;
             }
             leyline_gfx::PointerKind::Press { button: 0x112, .. } if point.is_some() => {
                 self.request_paste(leyline_gfx::SelectionTarget::Primary)?;
             }
-            leyline_gfx::PointerKind::Motion { .. } if self.selecting => {
+            leyline_gfx::PointerKind::Motion { .. } if self.current_window_mut().selecting => {
                 if let Some(point) = point {
                     let endpoint = selection_endpoint.map_or(point, |endpoint| endpoint.0);
-                    self.selection_dragged |= self.selection_point != Some(endpoint);
+                    self.current_window_mut().selection_dragged |=
+                        self.current_window_mut().selection_point != Some(endpoint);
                     if let Some((endpoint, side)) = selection_endpoint {
                         self.active_session_mut()
                             .update_selection_with_side(endpoint, side)?;
                     } else {
                         self.active_session_mut().update_selection(endpoint)?;
                     }
-                    self.selection_point = Some(endpoint);
-                    self.drag_scroll = None;
+                    self.current_window_mut().selection_point = Some(endpoint);
+                    self.current_window_mut().drag_scroll = None;
                 } else if let Some((direction, point)) = self.drag_scroll_target(pixel, above_grid)
                 {
-                    self.selection_dragged = true;
-                    self.selection_point = Some(point);
-                    self.drag_scroll = Some(DragScroll {
+                    self.current_window_mut().selection_dragged = true;
+                    self.current_window_mut().selection_point = Some(point);
+                    self.current_window_mut().drag_scroll = Some(DragScroll {
                         direction,
                         point,
                         deadline: Instant::now() + DRAG_SCROLL_INTERVAL,
                     });
                 } else {
-                    self.drag_scroll = None;
+                    self.current_window_mut().drag_scroll = None;
                 }
             }
             leyline_gfx::PointerKind::Axis { vertical_120, .. }
                 if vertical_120 != 0 && point.is_some() =>
             {
                 let point = point.expect("guarded pointer cell");
-                let steps = accumulate_wheel_steps(&mut self.wheel_remainder_120, vertical_120);
+                let steps = accumulate_wheel_steps(
+                    &mut self.current_window_mut().wheel_remainder_120,
+                    vertical_120,
+                );
                 if steps == 0 {
                     return Ok(());
                 }
@@ -3793,7 +3947,9 @@ impl DesktopRuntime {
                     let lines = -steps * 3;
                     if modifiers.shift || !self.active_session_mut().alternate_scroll(lines)? {
                         self.active_session_mut().scroll(lines)?;
-                        self.scrollbar.note_scroll(Instant::now());
+                        self.current_window_mut()
+                            .scrollbar
+                            .note_scroll(Instant::now());
                     }
                 }
             }
@@ -3811,28 +3967,28 @@ impl DesktopRuntime {
         let Some(snapshot) = self.active_session().latest_snapshot().cloned() else {
             return Ok(false);
         };
-        let Some(geometry) = ScrollbarGeometry::calculate(
-            &snapshot,
-            &self.layout,
-            &self.app.config().scrollbar,
-            self.gfx.scale().0,
-        ) else {
+        let layout = self.current_window().layout;
+        let scrollbar_config = self.app.config().scrollbar.clone();
+        let scale = self.gfx.scale().0;
+        let Some(geometry) =
+            ScrollbarGeometry::calculate(&snapshot, &layout, &scrollbar_config, scale)
+        else {
             return Ok(false);
         };
         let now = Instant::now();
-        let previous = self.scrollbar.interaction();
+        let previous = self.current_window_mut().scrollbar.interaction();
         match event.kind {
             leyline_gfx::PointerKind::Press { button: 0x110, .. }
                 if geometry.hit.contains(point) =>
             {
-                self.selecting = false;
-                self.selection_point = None;
-                self.selection_kind = None;
-                self.selection_dragged = false;
-                self.drag_scroll = None;
-                self.link_candidate = None;
-                self.click_tracker.reset();
-                if let Some(offset) = self.scrollbar.press(
+                self.current_window_mut().selecting = false;
+                self.current_window_mut().selection_point = None;
+                self.current_window_mut().selection_kind = None;
+                self.current_window_mut().selection_dragged = false;
+                self.current_window_mut().drag_scroll = None;
+                self.current_window_mut().link_candidate = None;
+                self.current_window_mut().click_tracker.reset();
+                if let Some(offset) = self.current_window_mut().scrollbar.press(
                     point,
                     geometry,
                     snapshot.grid.lines(),
@@ -3845,14 +4001,18 @@ impl DesktopRuntime {
                 return Ok(true);
             }
             leyline_gfx::PointerKind::Motion { .. } | leyline_gfx::PointerKind::Enter { .. } => {
-                if let Some(offset) = self.scrollbar.pointer_motion(point, geometry, now) {
+                if let Some(offset) = self
+                    .current_window_mut()
+                    .scrollbar
+                    .pointer_motion(point, geometry, now)
+                {
                     self.active_session_mut().scroll_to_display_offset(offset)?;
                 }
-                if previous != self.scrollbar.interaction() {
+                if previous != self.current_window_mut().scrollbar.interaction() {
                     self.compose_latest()?;
                 }
                 if matches!(
-                    self.scrollbar.interaction(),
+                    self.current_window_mut().scrollbar.interaction(),
                     crate::interaction::ScrollbarInteraction::Dragging { .. }
                 ) || geometry.hit.contains(point)
                 {
@@ -3865,17 +4025,20 @@ impl DesktopRuntime {
                     crate::interaction::ScrollbarInteraction::Dragging { .. }
                 ) =>
             {
-                self.scrollbar.release();
+                self.current_window_mut().scrollbar.release();
                 self.compose_latest()?;
                 return Ok(true);
             }
             leyline_gfx::PointerKind::Axis { vertical_120, .. }
                 if geometry.hit.contains(point) && vertical_120 != 0 =>
             {
-                let steps = accumulate_wheel_steps(&mut self.wheel_remainder_120, vertical_120);
+                let steps = accumulate_wheel_steps(
+                    &mut self.current_window_mut().wheel_remainder_120,
+                    vertical_120,
+                );
                 if steps != 0 {
                     self.active_session_mut().scroll(-steps * 3)?;
-                    self.scrollbar.note_scroll(now);
+                    self.current_window_mut().scrollbar.note_scroll(now);
                 }
                 return Ok(true);
             }
@@ -3897,16 +4060,17 @@ impl DesktopRuntime {
         pixel: [u32; 2],
         above_grid: bool,
     ) -> Option<(i32, crate::terminal::SelectionPoint)> {
-        let origin = self.layout.content_origin_px;
-        let width = u32::from(self.layout.grid.columns.get())
-            .checked_mul(u32::from(self.layout.cell_px[0].get()))?;
-        let height = u32::from(self.layout.grid.lines.get())
-            .checked_mul(u32::from(self.layout.cell_px[1].get()))?;
+        let layout = self.current_window().layout;
+        let origin = layout.content_origin_px;
+        let width =
+            u32::from(layout.grid.columns.get()).checked_mul(u32::from(layout.cell_px[0].get()))?;
+        let height =
+            u32::from(layout.grid.lines.get()).checked_mul(u32::from(layout.cell_px[1].get()))?;
         if pixel[0] < origin[0] || pixel[0] >= origin[0].checked_add(width)? {
             return None;
         }
         let column =
-            u16::try_from((pixel[0] - origin[0]) / u32::from(self.layout.cell_px[0].get())).ok()?;
+            u16::try_from((pixel[0] - origin[0]) / u32::from(layout.cell_px[0].get())).ok()?;
         if above_grid {
             Some((1, crate::terminal::SelectionPoint { column, line: 0 }))
         } else if pixel[1] >= origin[1].checked_add(height)? {
@@ -3914,7 +4078,7 @@ impl DesktopRuntime {
                 -1,
                 crate::terminal::SelectionPoint {
                     column,
-                    line: self.layout.grid.lines.get() - 1,
+                    line: layout.grid.lines.get() - 1,
                 },
             ))
         } else {
@@ -3923,7 +4087,7 @@ impl DesktopRuntime {
     }
 
     fn process_drag_scroll(&mut self) -> Result<(), UiRuntimeError> {
-        let Some(mut drag) = self.drag_scroll else {
+        let Some(mut drag) = self.current_window_mut().drag_scroll else {
             return Ok(());
         };
         let now = Instant::now();
@@ -3933,12 +4097,12 @@ impl DesktopRuntime {
         self.active_session_mut().scroll(drag.direction)?;
         self.active_session_mut().update_selection(drag.point)?;
         drag.deadline = now + DRAG_SCROLL_INTERVAL;
-        self.drag_scroll = Some(drag);
+        self.current_window_mut().drag_scroll = Some(drag);
         Ok(())
     }
 
     fn process_tab_drag_scroll(&mut self) -> Result<(), UiRuntimeError> {
-        let Some(mut scroll) = self.tab_drag_scroll else {
+        let Some(mut scroll) = self.current_window_mut().tab_drag_scroll else {
             return Ok(());
         };
         let now = Instant::now();
@@ -3946,40 +4110,49 @@ impl DesktopRuntime {
             return Ok(());
         }
         let step = 16_u32.saturating_mul(self.gfx.scale().0).div_ceil(120);
-        let previous = self.tab_bar.offset;
-        self.tab_bar.offset = if scroll.direction < 0 {
+        let previous = self.current_window_mut().tab_bar.offset;
+        self.current_window_mut().tab_bar.offset = if scroll.direction < 0 {
             previous.saturating_sub(step)
         } else {
-            previous.saturating_add(step).min(self.tab_bar.max_offset)
+            previous
+                .saturating_add(step)
+                .min(self.current_window_mut().tab_bar.max_offset)
         };
         scroll.deadline = now + DRAG_SCROLL_INTERVAL;
-        self.tab_drag_scroll = Some(scroll);
-        if self.tab_bar.offset == previous {
+        self.current_window_mut().tab_drag_scroll = Some(scroll);
+        if self.current_window_mut().tab_bar.offset == previous {
             return Ok(());
         }
         self.update_tab_bar();
-        if let Some(mut drag) = self.tab_drag.take() {
+        if let Some(mut drag) = self.current_window_mut().tab_drag.take() {
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let x = drag.current[0].max(0.0).floor() as u32;
-            if let Some(index) = self.tab_bar.proposed_index(self.current_tabs(), x) {
+            let mut context = self
+                .window_context(self.current_window_id)
+                .expect("current window and sessions are ready");
+            let proposed =
+                crate::window_controller::WindowController::apply(&mut context, |window, tabs| {
+                    window.tab_bar.proposed_index(tabs, x)
+                });
+            if let Some(index) = proposed {
                 drag.proposed_index = index;
             }
-            self.tab_drag = Some(drag);
+            self.current_window_mut().tab_drag = Some(drag);
         }
         self.compose_latest()
     }
 
     fn cancel_pointer_gesture(&mut self) {
-        self.selecting = false;
-        self.selection_point = None;
-        self.selection_kind = None;
-        self.selection_dragged = false;
-        self.drag_scroll = None;
-        self.link_candidate = None;
-        self.click_tracker.reset();
-        self.scrollbar.cancel();
-        self.tab_drag = None;
-        self.tab_drag_scroll = None;
+        self.current_window_mut().selecting = false;
+        self.current_window_mut().selection_point = None;
+        self.current_window_mut().selection_kind = None;
+        self.current_window_mut().selection_dragged = false;
+        self.current_window_mut().drag_scroll = None;
+        self.current_window_mut().link_candidate = None;
+        self.current_window_mut().click_tracker.reset();
+        self.current_window_mut().scrollbar.cancel();
+        self.current_window_mut().tab_drag = None;
+        self.current_window_mut().tab_drag_scroll = None;
     }
 
     fn copy_selection(
@@ -3987,7 +4160,7 @@ impl DesktopRuntime {
         target: leyline_gfx::SelectionTarget,
     ) -> Result<(), UiRuntimeError> {
         let (Some(serial), Some(text)) = (
-            self.last_input_serial,
+            self.current_window_mut().last_input_serial,
             self.active_session().selected_text(),
         ) else {
             tracing::debug!(
@@ -4166,7 +4339,7 @@ impl DesktopRuntime {
                         .current_tabs_mut()
                         .active_id()
                         .expect("runtime always has an active tab");
-                    let search_target = self.pending_search_paste.take();
+                    let search_target = self.current_window_mut().pending_search_paste.take();
                     match self.selection.transfer_completed(
                         crate::selection::RequestToken::from_raw(request),
                         target,
@@ -4179,7 +4352,7 @@ impl DesktopRuntime {
                             if let Some((search_owner, revision)) = search_target {
                                 if owner == search_owner
                                     && self.current_tabs().active_id() == Some(owner)
-                                    && self.search_focused
+                                    && self.current_window_mut().search_focused
                                     && self.active_session().search().is_open()
                                     && self.active_session().search().revision() == revision
                                 {
@@ -4465,9 +4638,9 @@ mod tests {
         keep_selection_after_release, key_text, renderer_fault_is_process_fatal,
         resolved_session_title, rotate_window_service_order, search_query_capacity,
         select_new_tab_cwd, should_cancel_search, starts_terminal_control_gesture,
-        tab_drag_edge_direction, take_matching_pending, take_priority_close_event,
-        terminal_key_owner_changed, terminal_modifiers, update_session_title, visible_search_query,
-        visual_mapping_changed, xkb_text_allowed,
+        tab_drag_edge_direction, take_priority_close_event, terminal_key_owner_changed,
+        terminal_modifiers, update_session_title, visible_search_query, visual_mapping_changed,
+        xkb_text_allowed,
     };
 
     #[test]
@@ -4925,34 +5098,6 @@ mod tests {
     }
 
     #[test]
-    fn visual_map_publication_requires_the_exact_committed_frame_key() {
-        let key = leyline_gfx::FrameKey {
-            snapshot_generation: 4,
-            layout_generation: 5,
-            font_generation: 6,
-            unicode_policy_generation: 7,
-        };
-        let mut pending = Some((key, "map"));
-        let stale = leyline_gfx::CommittedFrameKey {
-            frame: leyline_gfx::FrameKey {
-                snapshot_generation: 3,
-                ..key
-            },
-            atlas_epoch: 9,
-        };
-        assert_eq!(take_matching_pending(&mut pending, stale), None);
-        assert!(pending.is_none());
-
-        pending = Some((key, "map"));
-        let matching = leyline_gfx::CommittedFrameKey {
-            frame: key,
-            atlas_epoch: 10,
-        };
-        assert_eq!(take_matching_pending(&mut pending, matching), Some("map"));
-        assert!(pending.is_none());
-    }
-
-    #[test]
     fn selection_repaint_does_not_invalidate_the_pointer_mapping() {
         let current = crate::unicode_layout::VisualGridMap {
             snapshot_generation: 4,
@@ -5227,15 +5372,6 @@ fn requested_normal_size(
         .checked_add(chrome)
         .ok_or_else(|| UiRuntimeError::Grid("requested window height overflow".into()))?;
     Ok(leyline_gfx::LogicalSize { width, height })
-}
-
-fn take_matching_pending<T>(
-    pending: &mut Option<(leyline_gfx::FrameKey, T)>,
-    committed: leyline_gfx::CommittedFrameKey,
-) -> Option<T> {
-    pending
-        .take()
-        .and_then(|(key, value)| (key == committed.frame).then_some(value))
 }
 
 fn visual_mapping_changed(current: Option<&VisualGridMap>, next: &VisualGridMap) -> bool {

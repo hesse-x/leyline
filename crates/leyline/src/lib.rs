@@ -14,10 +14,12 @@ pub mod layout;
 pub mod logging;
 pub mod notification;
 pub mod perf;
+pub mod presentation;
 pub mod search;
 pub mod security;
 pub mod selection;
 pub mod session;
+pub mod session_pump;
 pub mod signal;
 pub mod sound;
 pub mod tab;
@@ -26,6 +28,7 @@ pub mod terminfo;
 pub mod ui_runtime;
 pub mod unicode_layout;
 pub mod window;
+pub mod window_controller;
 
 use std::{ffi::OsString, sync::Arc};
 
