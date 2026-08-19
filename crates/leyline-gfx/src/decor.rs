@@ -1,6 +1,9 @@
 #![allow(unsafe_code)]
 
-use std::ffi::{CStr, CString, c_char, c_int, c_void};
+use std::{
+    ffi::{CStr, CString, c_char, c_int, c_void},
+    rc::Rc,
+};
 
 use wayland_client::{
     Connection, Proxy,
@@ -77,6 +80,10 @@ unsafe extern "C" {
     fn libdecor_frame_set_min_content_size(frame: *mut Frame, width: c_int, height: c_int);
     fn libdecor_frame_resize(frame: *mut Frame, seat: *mut c_void, serial: u32, edge: ResizeEdge);
     fn libdecor_frame_map(frame: *mut Frame);
+    fn libdecor_frame_set_maximized(frame: *mut Frame);
+    fn libdecor_frame_unset_maximized(frame: *mut Frame);
+    fn libdecor_frame_set_fullscreen(frame: *mut Frame, output: *mut c_void);
+    fn libdecor_frame_unset_fullscreen(frame: *mut Frame);
     fn libdecor_configuration_get_content_size(
         configuration: *mut Configuration,
         frame: *mut Frame,
@@ -214,9 +221,19 @@ static FRAME_INTERFACE: FrameInterface = FrameInterface {
 };
 
 pub(crate) struct Libdecor {
-    context: *mut Context,
+    context: Rc<LibdecorContext>,
     frame: *mut Frame,
     callbacks: Box<CallbackState>,
+}
+
+pub(crate) struct LibdecorContext {
+    raw: *mut Context,
+}
+
+impl Drop for LibdecorContext {
+    fn drop(&mut self) {
+        unsafe { libdecor_unref(self.raw) };
+    }
 }
 
 impl Libdecor {
@@ -224,25 +241,44 @@ impl Libdecor {
         connection: &Connection,
         surface: &wl_surface::WlSurface,
         title: &str,
+        default_size: LogicalSize,
     ) -> Result<Self, String> {
-        let mut callbacks = Box::<CallbackState>::default();
-        // SAFETY: callbacks has a stable Box address and outlives frame/context; native objects are UI-thread-only.
-        unsafe {
-            let context = libdecor_new(
+        let context = unsafe {
+            libdecor_new(
                 connection.backend().display_ptr().cast(),
                 &raw const CONTEXT_INTERFACE,
-            );
-            if context.is_null() {
-                return Err("libdecor_new returned null".into());
-            }
+            )
+        };
+        if context.is_null() {
+            return Err("libdecor_new returned null".into());
+        }
+        Self::new_on(
+            Rc::new(LibdecorContext { raw: context }),
+            surface,
+            title,
+            default_size,
+        )
+    }
+
+    pub(crate) fn new_on(
+        context: Rc<LibdecorContext>,
+        surface: &wl_surface::WlSurface,
+        title: &str,
+        default_size: LogicalSize,
+    ) -> Result<Self, String> {
+        let mut callbacks = Box::new(CallbackState {
+            size: Some(default_size),
+            ..CallbackState::default()
+        });
+        // SAFETY: callbacks has a stable Box address and outlives frame/context; native objects are UI-thread-only.
+        unsafe {
             let frame = libdecor_decorate(
-                context,
+                context.raw,
                 surface.id().as_ptr().cast(),
                 &raw const FRAME_INTERFACE,
                 (&raw mut *callbacks).cast(),
             );
             if frame.is_null() {
-                libdecor_unref(context);
                 return Err("libdecor_decorate returned null".into());
             }
             let mut result = Self {
@@ -261,13 +297,17 @@ impl Libdecor {
     }
 
     pub(crate) fn dispatch(&mut self, timeout_ms: i32) -> Result<(), String> {
-        if unsafe { libdecor_dispatch(self.context, timeout_ms) } < 0 {
+        if unsafe { libdecor_dispatch(self.context.raw, timeout_ms) } < 0 {
             return Err("libdecor dispatch failed".into());
         }
         if let Some(error) = self.callbacks.fatal.take() {
             return Err(error);
         }
         Ok(())
+    }
+
+    pub(crate) fn context(&self) -> Rc<LibdecorContext> {
+        Rc::clone(&self.context)
     }
     pub(crate) fn take_configured(&mut self) -> Option<(LogicalSize, WindowState)> {
         self.callbacks.pending_configure.take()
@@ -284,6 +324,26 @@ impl Libdecor {
         Ok(())
     }
 
+    pub(crate) fn set_maximized(&mut self, maximized: bool) {
+        unsafe {
+            if maximized {
+                libdecor_frame_set_maximized(self.frame);
+            } else {
+                libdecor_frame_unset_maximized(self.frame);
+            }
+        }
+    }
+
+    pub(crate) fn set_fullscreen(&mut self, fullscreen: bool) {
+        unsafe {
+            if fullscreen {
+                libdecor_frame_set_fullscreen(self.frame, std::ptr::null_mut());
+            } else {
+                libdecor_frame_unset_fullscreen(self.frame);
+            }
+        }
+    }
+
     pub(crate) fn resize(&mut self, seat: &wl_seat::WlSeat, serial: u32, edge: ResizeEdge) {
         // SAFETY: the seat belongs to the same display and the serial comes from its pointer press.
         unsafe { libdecor_frame_resize(self.frame, seat.id().as_ptr().cast(), serial, edge) };
@@ -295,7 +355,6 @@ impl Drop for Libdecor {
         // SAFETY: frame belongs to context and both are destroyed on their owning UI thread.
         unsafe {
             libdecor_frame_unref(self.frame);
-            libdecor_unref(self.context);
         }
     }
 }

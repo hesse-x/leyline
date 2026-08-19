@@ -23,6 +23,7 @@ pub mod terminal;
 pub mod terminfo;
 pub mod ui_runtime;
 pub mod unicode_layout;
+pub mod window;
 
 use std::{ffi::OsString, sync::Arc};
 
@@ -130,6 +131,7 @@ fn run_management(cli: &cli::Cli, io: &mut impl ProcessIo) -> RunOutcome {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn startup(
     cli: &cli::Cli,
     environment: impl ConfigEnvironment,
@@ -146,6 +148,13 @@ fn startup(
     })?;
     if let Some(identity) = cli.terminal_identity {
         loaded.effective.terminal.identity = identity;
+    }
+    if let Some(geometry) = cli.window.geometry {
+        loaded.effective.window.columns = geometry.columns;
+        loaded.effective.window.lines = geometry.lines;
+    }
+    if let Some(state) = cli.window.startup_state {
+        loaded.effective.window.startup_state = state;
     }
     terminfo::preflight(loaded.effective.terminal.identity).map_err(|source| StartupError {
         source: StartupErrorSource::Terminfo(source),
@@ -200,7 +209,7 @@ fn startup(
         verbose: cli.verbosity != Verbosity::Warn,
     })?;
     if io.graphical_session() {
-        return ui_runtime::UiRuntime::new(
+        return ui_runtime::DesktopRuntime::new(
             app,
             runtime,
             event_wake.expect("graphical wake exists"),

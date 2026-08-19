@@ -2,6 +2,7 @@
 
 mod atlas;
 mod decor;
+mod host;
 mod input;
 mod model;
 mod runtime;
@@ -12,6 +13,7 @@ mod wayland;
 
 pub use atlas::AtlasStats;
 
+pub use host::{GfxHost, RoutedPlatformEvent, SurfaceKey, WindowId};
 pub use input::{
     InputSerial, KeyIdentity, KeyLocation, KeySide, KeypadKey, LogicalKey, ModifierKind,
     ModifierMask, SeatToken, SerialKind, key_identity_from_keysym, keypad_key_from_keysym,

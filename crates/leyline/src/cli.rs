@@ -10,6 +10,60 @@ pub struct Cli {
     pub verbosity: Verbosity,
     pub terminal_identity: Option<TerminalIdentity>,
     pub operation: Operation,
+    pub window: WindowOverrides,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WindowOverrides {
+    pub geometry: Option<WindowGeometry>,
+    pub startup_state: Option<crate::config::StartupWindowState>,
+    pub new_window: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WindowGeometry {
+    pub columns: u16,
+    pub lines: u16,
+}
+
+fn parse_geometry(value: &str) -> Result<WindowGeometry, String> {
+    if value.is_empty() || !value.is_ascii() || value.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err("geometry must use ASCII COLUMNSxLINES without whitespace".into());
+    }
+    let (columns, lines) = value
+        .split_once('x')
+        .ok_or_else(|| "geometry must use COLUMNSxLINES".to_string())?;
+    if columns.is_empty() || lines.is_empty() || lines.contains('x') {
+        return Err("geometry must use COLUMNSxLINES".into());
+    }
+    let columns = columns
+        .parse::<u32>()
+        .map_err(|_| "columns must be an unsigned decimal integer".to_string())?;
+    let lines = lines
+        .parse::<u32>()
+        .map_err(|_| "lines must be an unsigned decimal integer".to_string())?;
+    if !(u32::from(crate::config::MIN_COLUMNS)..=u32::from(crate::config::MAX_COLUMNS))
+        .contains(&columns)
+    {
+        return Err(format!(
+            "columns must be in {}..={}",
+            crate::config::MIN_COLUMNS,
+            crate::config::MAX_COLUMNS
+        ));
+    }
+    if !(u32::from(crate::config::MIN_LINES)..=u32::from(crate::config::MAX_LINES)).contains(&lines)
+    {
+        return Err(format!(
+            "lines must be in {}..={}",
+            crate::config::MIN_LINES,
+            crate::config::MAX_LINES
+        ));
+    }
+    Ok(WindowGeometry {
+        columns: u16::try_from(columns).expect("validated columns fit u16"),
+        lines: u16::try_from(lines).expect("validated lines fit u16"),
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,6 +141,33 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> ParseOutcome {
                 .short('v')
                 .action(ArgAction::Count)
                 .help("Increase logging verbosity (repeat up to three times)"),
+        )
+        .arg(
+            Arg::new("geometry")
+                .long("geometry")
+                .value_name("COLUMNSxLINES")
+                .value_parser(parse_geometry)
+                .help("Request the initial terminal grid (20..500 columns, 5..300 lines)"),
+        )
+        .arg(
+            Arg::new("maximized")
+                .long("maximized")
+                .conflicts_with("fullscreen")
+                .action(ArgAction::SetTrue)
+                .help("Request an initially maximized window"),
+        )
+        .arg(
+            Arg::new("fullscreen")
+                .long("fullscreen")
+                .conflicts_with("maximized")
+                .action(ArgAction::SetTrue)
+                .help("Request an initially fullscreen window"),
+        )
+        .arg(
+            Arg::new("new-window")
+                .long("new-window")
+                .action(ArgAction::SetTrue)
+                .help("Launch this process with a new terminal window"),
         )
         .arg(
             Arg::new("execute")
@@ -169,17 +250,34 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> ParseOutcome {
                 .get_one::<String>("term")
                 .and_then(|value| TerminalIdentity::parse(value));
             let operation = parse_operation(&matches);
-            if operation != Operation::Launch && command.is_some() {
+            let has_launch_window_option = matches.contains_id("geometry")
+                || matches.get_flag("maximized")
+                || matches.get_flag("fullscreen")
+                || matches.get_flag("new-window");
+            if operation != Operation::Launch && (command.is_some() || has_launch_window_option) {
                 return ParseOutcome::Print {
                     success: false,
-                    text: "error: '-e' cannot be combined with a management subcommand\n".into(),
+                    text: "error: launch options cannot be combined with a management subcommand\n"
+                        .into(),
                 };
             }
+            let startup_state = if matches.get_flag("fullscreen") {
+                Some(crate::config::StartupWindowState::Fullscreen)
+            } else if matches.get_flag("maximized") {
+                Some(crate::config::StartupWindowState::Maximized)
+            } else {
+                None
+            };
             ParseOutcome::Run(Cli {
                 command,
                 verbosity,
                 terminal_identity,
                 operation,
+                window: WindowOverrides {
+                    geometry: matches.get_one::<WindowGeometry>("geometry").copied(),
+                    startup_state,
+                    new_window: matches.get_flag("new-window"),
+                },
             })
         }
         Err(error) => ParseOutcome::Print {
@@ -295,6 +393,38 @@ mod tests {
     fn separator_without_program_is_an_error() {
         assert!(matches!(
             parse(["leyline", "-e", "--"].map(OsString::from)),
+            ParseOutcome::Print { success: false, .. }
+        ));
+    }
+
+    #[test]
+    fn parses_strict_geometry_and_window_state_overrides() {
+        let cli = run(&[
+            "leyline",
+            "--geometry",
+            "120x36",
+            "--fullscreen",
+            "--new-window",
+        ]);
+        assert_eq!(
+            cli.window,
+            WindowOverrides {
+                geometry: Some(WindowGeometry {
+                    columns: 120,
+                    lines: 36,
+                }),
+                startup_state: Some(crate::config::StartupWindowState::Fullscreen),
+                new_window: true,
+            }
+        );
+        for geometry in ["0x24", "80x0", "80X24", " 80x24", "80x24+0+0", "501x24"] {
+            assert!(matches!(
+                parse(["leyline", "--geometry", geometry].map(OsString::from)),
+                ParseOutcome::Print { success: false, .. }
+            ));
+        }
+        assert!(matches!(
+            parse(["leyline", "--maximized", "--fullscreen"].map(OsString::from)),
             ParseOutcome::Print { success: false, .. }
         ));
     }

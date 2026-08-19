@@ -6,10 +6,12 @@
 )]
 
 use std::{
+    cell::{RefCell, RefMut},
     collections::HashSet,
     ffi::{CStr, CString},
     io::Cursor,
     mem::size_of,
+    rc::Rc,
     time::Duration,
 };
 
@@ -171,14 +173,13 @@ struct RetiredSwapchain {
 }
 
 pub(crate) struct VulkanRenderer {
-    _entry: Entry,
+    context: Rc<VulkanDeviceContext>,
     instance: ash::Instance,
     surface_loader: ash::khr::surface::Instance,
     surface: vk::SurfaceKHR,
     physical: vk::PhysicalDevice,
     color_glyphs_supported: bool,
     device: ash::Device,
-    allocator: Option<Allocator>,
     instances: Option<InstanceBuffer>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
@@ -198,6 +199,69 @@ pub(crate) struct VulkanRenderer {
     acquired: Option<AcquiredImage>,
     retired: Vec<RetiredSwapchain>,
     health: RendererHealth,
+}
+
+pub(crate) struct VulkanDeviceContext {
+    _entry: Entry,
+    instance: ash::Instance,
+    surface_loader: ash::khr::surface::Instance,
+    wayland_loader: ash::khr::wayland_surface::Instance,
+    physical: vk::PhysicalDevice,
+    color_glyphs_supported: bool,
+    device: ash::Device,
+    allocator: RefCell<Option<Allocator>>,
+    queue: vk::Queue,
+    queue_family: u32,
+    swapchain_loader: ash::khr::swapchain::Device,
+}
+
+impl VulkanDeviceContext {
+    fn allocator_mut(&self) -> RefMut<'_, Allocator> {
+        RefMut::map(self.allocator.borrow_mut(), |allocator| {
+            allocator.as_mut().expect("shared allocator initialized")
+        })
+    }
+
+    fn create_surface(&self, window: &WaylandWindow) -> Result<vk::SurfaceKHR, GfxInitError> {
+        let create = vk::WaylandSurfaceCreateInfoKHR::default()
+            .display(window.display_ptr().cast())
+            .surface(window.surface_ptr().cast());
+        // SAFETY: Wayland display and surface are UI-thread-owned and outlive the renderer.
+        let surface = unsafe { self.wayland_loader.create_wayland_surface(&create, None) }
+            .map_err(|error| {
+                GfxInitError::Device(format!("cannot create Vulkan Wayland surface: {error:?}"))
+            })?;
+        let supported = unsafe {
+            self.surface_loader.get_physical_device_surface_support(
+                self.physical,
+                self.queue_family,
+                surface,
+            )
+        }
+        .map_err(|error| {
+            unsafe { self.surface_loader.destroy_surface(surface, None) };
+            GfxInitError::Device(format!(
+                "cannot query shared device surface support: {error:?}"
+            ))
+        })?;
+        if !supported {
+            unsafe { self.surface_loader.destroy_surface(surface, None) };
+            return Err(GfxInitError::Device(
+                "shared Vulkan queue cannot present to the new Wayland surface".into(),
+            ));
+        }
+        Ok(surface)
+    }
+}
+
+impl Drop for VulkanDeviceContext {
+    fn drop(&mut self) {
+        self.allocator.get_mut().take();
+        unsafe {
+            self.device.destroy_device(None);
+            self.instance.destroy_instance(None);
+        }
+    }
 }
 
 impl VulkanRenderer {
@@ -284,22 +348,70 @@ impl VulkanRenderer {
             })?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         let swapchain_loader = ash::khr::swapchain::Device::new(&instance, &device);
-        let mut renderer = Self {
+        let allocator = match Allocator::new(&AllocatorCreateDesc {
+            instance: instance.clone(),
+            device: device.clone(),
+            physical_device: physical,
+            debug_settings: AllocatorDebugSettings::default(),
+            buffer_device_address: false,
+            allocation_sizes: AllocationSizes::default(),
+        }) {
+            Ok(allocator) => allocator,
+            Err(error) => {
+                unsafe {
+                    device.destroy_device(None);
+                    surface_loader.destroy_surface(surface, None);
+                    instance.destroy_instance(None);
+                }
+                return Err(GfxInitError::Device(format!(
+                    "create GPU allocator: {error}"
+                )));
+            }
+        };
+        let context = Rc::new(VulkanDeviceContext {
             _entry: entry,
-            instance,
-            surface_loader,
-            surface,
+            instance: instance.clone(),
+            surface_loader: surface_loader.clone(),
+            wayland_loader,
             physical,
             color_glyphs_supported,
-            device,
-            allocator: None,
+            device: device.clone(),
+            allocator: RefCell::new(Some(allocator)),
+            queue,
+            queue_family,
+            swapchain_loader: swapchain_loader.clone(),
+        });
+        Self::from_context(context, surface, target)
+    }
+
+    pub(crate) fn new_on(
+        context: Rc<VulkanDeviceContext>,
+        window: &WaylandWindow,
+        target: PixelSize,
+    ) -> Result<Self, GfxInitError> {
+        let surface = context.create_surface(window)?;
+        Self::from_context(context, surface, target)
+    }
+
+    fn from_context(
+        context: Rc<VulkanDeviceContext>,
+        surface: vk::SurfaceKHR,
+        target: PixelSize,
+    ) -> Result<Self, GfxInitError> {
+        let mut renderer = Self {
+            instance: context.instance.clone(),
+            surface_loader: context.surface_loader.clone(),
+            surface,
+            physical: context.physical,
+            color_glyphs_supported: context.color_glyphs_supported,
+            device: context.device.clone(),
             instances: None,
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
             glyph: None,
-            queue,
-            queue_family,
-            swapchain_loader,
+            queue: context.queue,
+            queue_family: context.queue_family,
+            swapchain_loader: context.swapchain_loader.clone(),
             swapchain: vk::SwapchainKHR::null(),
             composite_alpha: vk::CompositeAlphaFlagsKHR::OPAQUE,
             format: vk::Format::UNDEFINED,
@@ -312,18 +424,8 @@ impl VulkanRenderer {
             acquired: None,
             retired: Vec::new(),
             health: RendererHealth::default(),
+            context,
         };
-        renderer.allocator = Some(
-            Allocator::new(&AllocatorCreateDesc {
-                instance: renderer.instance.clone(),
-                device: renderer.device.clone(),
-                physical_device: renderer.physical,
-                debug_settings: AllocatorDebugSettings::default(),
-                buffer_device_address: false,
-                allocation_sizes: AllocationSizes::default(),
-            })
-            .map_err(|error| GfxInitError::Device(format!("create GPU allocator: {error}")))?,
-        );
         renderer.instances = Some(
             renderer
                 .create_instance_buffer()
@@ -344,6 +446,10 @@ impl VulkanRenderer {
                 .map_err(GfxInitError::Device)?,
         );
         Ok(renderer)
+    }
+
+    pub(crate) fn device_context(&self) -> Rc<VulkanDeviceContext> {
+        Rc::clone(&self.context)
     }
 
     pub(crate) const fn color_glyphs_supported(&self) -> bool {
@@ -433,9 +539,8 @@ impl VulkanRenderer {
                 self.device.destroy_image_view(old.view, None);
                 self.device.destroy_image(old.image, None);
             }
-            self.allocator
-                .as_mut()
-                .expect("allocator initialized")
+            self.context
+                .allocator_mut()
                 .free(old.allocation)
                 .map_err(|error| {
                     RendererFault::Invariant(format!("free old atlas page: {error}"))
@@ -514,9 +619,8 @@ impl VulkanRenderer {
         .map_err(vk_error("create rectangle instance buffer"))?;
         let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
         let allocation = self
-            .allocator
-            .as_mut()
-            .expect("allocator initialized")
+            .context
+            .allocator_mut()
             .allocate(&AllocationCreateDesc {
                 name: "rectangle instances",
                 requirements,
@@ -551,9 +655,8 @@ impl VulkanRenderer {
         .map_err(vk_error("create buffer"))?;
         let requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
         let allocation = self
-            .allocator
-            .as_mut()
-            .expect("allocator initialized")
+            .context
+            .allocator_mut()
             .allocate(&AllocationCreateDesc {
                 name,
                 requirements,
@@ -602,9 +705,8 @@ impl VulkanRenderer {
         .map_err(vk_error("create glyph atlas image"))?;
         let requirements = unsafe { self.device.get_image_memory_requirements(image) };
         let allocation = self
-            .allocator
-            .as_mut()
-            .expect("allocator initialized")
+            .context
+            .allocator_mut()
             .allocate(&AllocationCreateDesc {
                 name: "glyph atlas",
                 requirements,
@@ -1724,22 +1826,18 @@ impl Drop for VulkanRenderer {
                     self.device.destroy_image(page.image, None);
                 }
             }
-            if let Some(allocator) = self.allocator.as_mut() {
-                let _ = allocator.free(glyph.instances.allocation);
-                let _ = allocator.free(glyph.staging.allocation);
-                for page in glyph.pages {
-                    let _ = allocator.free(page.allocation);
-                }
+            let mut allocator = self.context.allocator_mut();
+            let _ = allocator.free(glyph.instances.allocation);
+            let _ = allocator.free(glyph.staging.allocation);
+            for page in glyph.pages {
+                let _ = allocator.free(page.allocation);
             }
         }
         self.destroy_pipeline();
         if let Some(instances) = self.instances.take() {
             unsafe { self.device.destroy_buffer(instances.buffer, None) };
-            if let Some(allocator) = self.allocator.as_mut() {
-                let _ = allocator.free(instances.allocation);
-            }
+            let _ = self.context.allocator_mut().free(instances.allocation);
         }
-        self.allocator.take();
         unsafe {
             if self.swapchain != vk::SwapchainKHR::null() {
                 self.swapchain_loader
@@ -1751,9 +1849,7 @@ impl Drop for VulkanRenderer {
                 self.device.destroy_semaphore(slot.available, None);
                 self.device.destroy_command_pool(slot.pool, None);
             }
-            self.device.destroy_device(None);
             self.surface_loader.destroy_surface(self.surface, None);
-            self.instance.destroy_instance(None);
         }
     }
 }

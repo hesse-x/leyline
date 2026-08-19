@@ -1,8 +1,10 @@
 use std::{
+    cell::RefCell,
     collections::{HashMap, VecDeque},
     env,
     ffi::c_void,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
+    rc::Rc,
     time::{Duration, Instant},
 };
 
@@ -53,8 +55,9 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     Connection, Dispatch, EventQueue, Proxy, QueueHandle,
+    backend::ObjectId,
     backend::WaylandError,
-    globals::{GlobalListContents, registry_queue_init},
+    globals::{GlobalList, GlobalListContents, registry_queue_init},
     protocol::{
         wl_data_device, wl_data_device_manager::DndAction, wl_data_source, wl_keyboard, wl_output,
         wl_pointer, wl_registry, wl_seat, wl_surface,
@@ -76,7 +79,7 @@ use wayland_protocols::wp::{
 };
 use xkbcommon::xkb;
 
-use crate::decor::{Libdecor, ResizeEdge};
+use crate::decor::{Libdecor, LibdecorContext, ResizeEdge};
 use crate::{
     ClipboardEvent, GfxInitError, InputSerial, KeyInput, KeyState, LogicalSize, ModifierMask,
     ModifiersState, PlatformEvent, PointerCursor, PointerInput, PointerKind, Scale120, SeatToken,
@@ -84,10 +87,6 @@ use crate::{
     key_identity_from_keysym, logical_key_from_keysym,
 };
 
-const DEFAULT_SIZE: LogicalSize = LogicalSize {
-    width: 800,
-    height: 500,
-};
 const CONTENT_RESIZE_MARGIN: f64 = 6.0;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -302,16 +301,22 @@ fn min_timeout(timeout: Option<Duration>, deadline: Option<Instant>) -> Option<D
     }
 }
 
+pub(crate) struct WaylandConnectionHost {
+    connection: Connection,
+    globals: Rc<GlobalList>,
+    event_queue: Option<EventQueue<WaylandState>>,
+    state: WaylandState,
+    flush_blocked: bool,
+}
+
 pub(crate) struct WaylandWindow {
-    pub(crate) connection: Connection,
-    event_queue: EventQueue<WaylandState>,
-    pub(crate) state: WaylandState,
+    host: Rc<RefCell<WaylandConnectionHost>>,
+    state: Rc<RefCell<WindowEventState>>,
     window: Option<Window>,
     surface: wl_surface::WlSurface,
     libdecor: Option<Libdecor>,
     _fractional_scale: Option<WpFractionalScaleV1>,
     viewport: Option<WpViewport>,
-    flush_blocked: bool,
 }
 
 impl Drop for WaylandWindow {
@@ -319,25 +324,34 @@ impl Drop for WaylandWindow {
         // libdecor keeps raw references to the display and surface, so release it before Rust
         // drops the Wayland objects declared earlier in this struct.
         drop(self.libdecor.take());
+        let mut host = self.host.borrow_mut();
+        let surface = self.surface.id();
+        host.state.windows.remove(&surface);
+        host.state
+            .fractional_windows
+            .retain(|_, target| *target != surface);
+        if host.state.keyboard_focus.as_ref() == Some(&surface) {
+            host.state.keyboard_focus = None;
+            host.state.key_repeat.cancel();
+        }
+        if host.state.pointer_focus.as_ref() == Some(&surface) {
+            host.state.pointer_focus = None;
+        }
+        if host.state.text_input_focus.as_ref() == Some(&surface) {
+            host.state.text_input_focus = None;
+        }
+        host.trace_snapshot();
     }
 }
 
-impl WaylandWindow {
+impl WaylandConnectionHost {
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn connect(title: &str) -> Result<Self, GfxInitError> {
-        if env::var_os("WAYLAND_DISPLAY").is_none() {
-            return Err(GfxInitError::Environment(
-                "WAYLAND_DISPLAY is unset; run Leyline inside a GNOME Wayland session".into(),
-            ));
-        }
-        let connection = Connection::connect_to_env().map_err(|error| {
-            GfxInitError::Environment(format!(
-                "cannot connect to the Wayland compositor: {error}; verify WAYLAND_DISPLAY and socket access"
-            ))
-        })?;
+    fn connect() -> Result<Rc<RefCell<Self>>, GfxInitError> {
+        let connection = connect_to_env()?;
         let (globals, event_queue) = registry_queue_init(&connection).map_err(|error| {
             GfxInitError::Platform(format!("cannot read Wayland globals: {error}"))
         })?;
+        let globals = Rc::new(globals);
         let advertised = globals.contents().clone_list();
         for required in ["wl_compositor", "xdg_wm_base"] {
             if !advertised.iter().any(|global| global.interface == required) {
@@ -354,8 +368,205 @@ impl WaylandWindow {
             .map_err(|error| GfxInitError::Platform(format!("cannot bind wl_shm: {error}")))?;
         let shell = XdgShell::bind(&globals, &qh)
             .map_err(|error| GfxInitError::Platform(format!("cannot bind xdg-shell: {error}")))?;
-        let surface = compositor.create_surface(&qh);
         let cursor_surface = compositor.create_surface(&qh);
+        let data_device_manager = DataDeviceManagerState::bind(&globals, &qh).map_err(|error| {
+            GfxInitError::Platform(format!(
+                "cannot bind required wl_data_device_manager: {error}"
+            ))
+        })?;
+        let state = WaylandState {
+            compositor,
+            shell,
+            outputs: OutputState::new(&globals, &qh),
+            seats: SeatState::new(&globals, &qh),
+            shm,
+            keyboard: None,
+            keyboard_focus: None,
+            pointer: None,
+            pointer_seat: None,
+            cursor_surface,
+            pointer_icon: None,
+            pointer_focus: None,
+            data_device_manager: Some(data_device_manager),
+            data_device: None,
+            clipboard_offer: None,
+            clipboard_source: None,
+            primary_selection_manager: PrimarySelectionManagerState::bind(&globals, &qh).ok(),
+            primary_device: None,
+            primary_offer: None,
+            primary_source: None,
+            text_input_manager: globals
+                .bind::<ZwpTextInputManagerV3, _, _>(&qh, 1..=2, ())
+                .ok(),
+            text_input: None,
+            text_input_focus: None,
+            text_input_commits: 0,
+            modifiers: ModifiersState::default(),
+            pressed_modifiers: PressedModifiers::default(),
+            key_repeat: KeyRepeatState::default(),
+            shortcut_digit_rows: HashMap::new(),
+            keymap_generation: 0,
+            xkb_keymap: None,
+            xkb_state: None,
+            windows: HashMap::new(),
+            fractional_windows: HashMap::new(),
+            seat_token: SeatToken::new(0, 1),
+        };
+        Ok(Rc::new(RefCell::new(Self {
+            connection,
+            globals,
+            event_queue: Some(event_queue),
+            state,
+            flush_blocked: false,
+        })))
+    }
+
+    fn dispatch_pending(&mut self) -> Result<(), String> {
+        if self
+            .state
+            .windows
+            .values()
+            .any(|window| !window.borrow().pending.can_dispatch_callbacks())
+        {
+            return Ok(());
+        }
+        let mut queue = self
+            .event_queue
+            .take()
+            .expect("Wayland event queue installed");
+        let result = queue
+            .dispatch_pending(&mut self.state)
+            .map_err(|error| format!("Wayland dispatch failed: {error}"));
+        self.event_queue = Some(queue);
+        self.state.emit_due_key_repeat(Instant::now());
+        result.map(|_| ())
+    }
+
+    fn queue_handle(&self) -> QueueHandle<WaylandState> {
+        self.event_queue
+            .as_ref()
+            .expect("Wayland event queue installed")
+            .handle()
+    }
+
+    fn trace_snapshot(&self) {
+        tracing::debug!(
+            category = "wayland_host_snapshot",
+            registries = 1,
+            event_queues = 1,
+            seat_states = 1,
+            surfaces = self.state.windows.len(),
+            clipboard_device = self.state.data_device.is_some(),
+            primary_device = self.state.primary_device.is_some(),
+            "Wayland connection host resource snapshot"
+        );
+    }
+
+    fn roundtrip(&mut self) -> Result<(), String> {
+        let mut queue = self
+            .event_queue
+            .take()
+            .expect("Wayland event queue installed");
+        let result = queue
+            .roundtrip(&mut self.state)
+            .map_err(|error| format!("Wayland roundtrip failed: {error}"));
+        self.event_queue = Some(queue);
+        result.map(|_| ())
+    }
+
+    fn flush(&mut self) -> Result<(), String> {
+        match self.connection.flush() {
+            Ok(()) => self.flush_blocked = false,
+            Err(WaylandError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                self.flush_blocked = true;
+            }
+            Err(error) => return Err(format!("Wayland flush failed: {error}")),
+        }
+        Ok(())
+    }
+
+    fn poll_read(
+        &mut self,
+        wake: Option<BorrowedFd<'_>>,
+        timeout: Option<Duration>,
+    ) -> Result<(), String> {
+        if self
+            .state
+            .windows
+            .values()
+            .any(|window| !window.borrow().pending.input.is_empty())
+        {
+            return Ok(());
+        }
+        self.flush()?;
+        let timeout = min_timeout(timeout, self.state.key_repeat.deadline());
+        let queue = self
+            .event_queue
+            .as_mut()
+            .expect("Wayland event queue installed");
+        let Some(read_guard) = queue.prepare_read() else {
+            return self.dispatch_pending();
+        };
+        let mut interest = PollFlags::IN | PollFlags::ERR | PollFlags::HUP;
+        if self.flush_blocked {
+            interest |= PollFlags::OUT;
+        }
+        let mut descriptors = vec![PollFd::from_borrowed_fd(self.connection.as_fd(), interest)];
+        if let Some(wake) = wake {
+            descriptors.push(PollFd::from_borrowed_fd(
+                wake,
+                PollFlags::IN | PollFlags::ERR,
+            ));
+        }
+        let timeout = timeout.map(|value| Timespec {
+            tv_sec: i64::try_from(value.as_secs()).unwrap_or(i64::MAX),
+            tv_nsec: i64::from(value.subsec_nanos()),
+        });
+        loop {
+            match poll(&mut descriptors, timeout.as_ref()) {
+                Ok(_) => break,
+                Err(rustix::io::Errno::INTR) => {}
+                Err(error) => return Err(format!("UI poll failed: {error}")),
+            }
+        }
+        let readiness = descriptors[0].revents();
+        if readiness.intersects(PollFlags::ERR | PollFlags::HUP) {
+            return Err("Wayland compositor disconnected".into());
+        }
+        if readiness.contains(PollFlags::IN) {
+            read_guard
+                .read()
+                .map_err(|error| format!("Wayland socket read failed: {error}"))?;
+        }
+        if readiness.contains(PollFlags::OUT) {
+            self.flush()?;
+        }
+        Ok(())
+    }
+}
+
+impl WaylandWindow {
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn connect(title: &str, default_size: LogicalSize) -> Result<Self, GfxInitError> {
+        Self::connect_on(WaylandConnectionHost::connect()?, None, title, default_size)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn connect_on(
+        host: Rc<RefCell<WaylandConnectionHost>>,
+        libdecor_context: Option<std::rc::Rc<LibdecorContext>>,
+        title: &str,
+        default_size: LogicalSize,
+    ) -> Result<Self, GfxInitError> {
+        let mut shared = host.borrow_mut();
+        let connection = shared.connection.clone();
+        let globals = Rc::clone(&shared.globals);
+        let advertised = globals.contents().clone_list();
+        let qh = shared.queue_handle();
+        let compositor = &shared.state.compositor;
+        let shell = &shared.state.shell;
+        let surface = compositor.create_surface(&qh);
+        let local = Rc::new(RefCell::new(WindowEventState::new(default_size)));
         let has_server_decor = advertised
             .iter()
             .any(|global| global.interface == "zxdg_decoration_manager_v1");
@@ -370,15 +581,6 @@ impl WaylandWindow {
                     Some(viewporter.get_viewport(&surface, &qh, ())),
                 )
             });
-        let text_input_manager = globals
-            .bind::<ZwpTextInputManagerV3, _, _>(&qh, 1..=2, ())
-            .ok();
-        let data_device_manager = DataDeviceManagerState::bind(&globals, &qh).map_err(|error| {
-            GfxInitError::Platform(format!(
-                "cannot bind required wl_data_device_manager: {error}"
-            ))
-        })?;
-        let primary_selection_manager = PrimarySelectionManagerState::bind(&globals, &qh).ok();
         let (window, libdecor) = if has_server_decor {
             let window =
                 shell.create_window(surface.clone(), WindowDecorations::RequestServer, &qh);
@@ -391,89 +593,70 @@ impl WaylandWindow {
             (
                 None,
                 Some(
-                    Libdecor::new(&connection, &surface, title).map_err(|error| {
-                        GfxInitError::Platform(format!(
-                            "cannot create required libdecor window: {error}"
-                        ))
-                    })?,
+                    libdecor_context
+                        .map_or_else(
+                            || Libdecor::new(&connection, &surface, title, default_size),
+                            |context| Libdecor::new_on(context, &surface, title, default_size),
+                        )
+                        .map_err(|error| {
+                            GfxInitError::Platform(format!(
+                                "cannot create required libdecor window: {error}"
+                            ))
+                        })?,
                 ),
             )
         };
+        shared.state.windows.insert(surface.id(), Rc::clone(&local));
+        local.borrow_mut().libdecor_resize_fallback = !has_server_decor;
+        if let Some(fractional) = fractional_scale.as_ref() {
+            shared
+                .state
+                .fractional_windows
+                .insert(fractional.id(), surface.id());
+        }
+        shared.trace_snapshot();
+        drop(shared);
         Ok(Self {
-            state: WaylandState {
-                outputs: OutputState::new(&globals, &qh),
-                seats: SeatState::new(&globals, &qh),
-                shm,
-                keyboard: None,
-                pointer: None,
-                pointer_seat: None,
-                cursor_surface,
-                libdecor_resize_fallback: !has_server_decor,
-                pointer_icon: None,
-                pointer_cursor: PointerCursor::Text,
-                pointer_resize_edge: None,
-                resize_press_active: false,
-                data_device_manager,
-                data_device: None,
-                clipboard_offer: None,
-                clipboard_source: None,
-                primary_selection_manager,
-                primary_device: None,
-                primary_offer: None,
-                primary_source: None,
-                text_input_manager,
-                text_input: None,
-                text_input_focused: false,
-                text_input_commits: 0,
-                target_surface: surface.clone(),
-                modifiers: ModifiersState::default(),
-                pressed_modifiers: PressedModifiers::default(),
-                key_repeat: KeyRepeatState::default(),
-                shortcut_digit_rows: HashMap::new(),
-                keymap_generation: 0,
-                xkb_keymap: None,
-                xkb_state: None,
-                logical_size: DEFAULT_SIZE,
-                scale: Scale120::ONE,
-                pending: PendingEvents::default(),
-                configured: false,
-                suspended: false,
-                seat_token: SeatToken::new(0, 1),
-            },
-            connection,
-            event_queue,
+            host,
+            state: local,
             window,
             surface,
             libdecor,
             _fractional_scale: fractional_scale,
             viewport,
-            flush_blocked: false,
         })
+    }
+
+    pub(crate) fn libdecor_context(&self) -> Option<std::rc::Rc<LibdecorContext>> {
+        self.libdecor.as_ref().map(Libdecor::context)
+    }
+
+    pub(crate) fn host(&self) -> Rc<RefCell<WaylandConnectionHost>> {
+        Rc::clone(&self.host)
     }
 
     pub(crate) fn dispatch_pending(&mut self) -> Result<(), String> {
         // Drain the retained round before admitting another callback batch. Otherwise a busy
         // input source can refill the bounded queue faster than the UI consumes its old events.
-        if !self.state.pending.can_dispatch_callbacks() {
+        if !self.state.borrow().pending.can_dispatch_callbacks() {
             return Ok(());
         }
         if let Some(decor) = self.libdecor.as_mut() {
             decor.dispatch(0)?;
             if let Some((size, state)) = decor.take_configured() {
-                self.state.logical_size = size;
-                self.state.configured = true;
-                self.state.pending.configured = Some((size, self.state.scale, state));
+                let mut local = self.state.borrow_mut();
+                local.logical_size = size;
+                local.configured = true;
+                let scale = local.scale;
+                local.pending.configured = Some((size, scale, state));
             }
-            self.state.pending.close |= decor.take_close();
+            self.state.borrow_mut().pending.close |= decor.take_close();
             if decor.take_commit_requested() {
                 self.surface.commit();
             }
         }
-        self.event_queue
-            .dispatch_pending(&mut self.state)
-            .map_err(|error| format!("Wayland dispatch failed: {error}"))?;
-        self.state.emit_due_key_repeat(Instant::now());
-        if let Some((seat, serial, edge)) = self.state.pending.resize.take()
+        self.host.borrow_mut().dispatch_pending()?;
+        if let Some((seat, serial, edge)) = self.state.borrow_mut().pending.resize.take()
             && let Some(decor) = self.libdecor.as_mut()
         {
             decor.resize(&seat, serial, edge);
@@ -485,30 +668,22 @@ impl WaylandWindow {
         if let Some(decor) = self.libdecor.as_mut() {
             decor.dispatch(50)?;
             if let Some((size, state)) = decor.take_configured() {
-                self.state.logical_size = size;
-                self.state.configured = true;
-                self.state.pending.configured = Some((size, self.state.scale, state));
+                let mut local = self.state.borrow_mut();
+                local.logical_size = size;
+                local.configured = true;
+                let scale = local.scale;
+                local.pending.configured = Some((size, scale, state));
             }
             if decor.take_commit_requested() {
                 self.surface.commit();
             }
             return Ok(());
         }
-        self.event_queue
-            .roundtrip(&mut self.state)
-            .map(|_| ())
-            .map_err(|error| format!("Wayland roundtrip failed: {error}"))
+        self.host.borrow_mut().roundtrip()
     }
 
     pub(crate) fn flush(&mut self) -> Result<(), String> {
-        match self.connection.flush() {
-            Ok(()) => self.flush_blocked = false,
-            Err(WaylandError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                self.flush_blocked = true;
-            }
-            Err(error) => return Err(format!("Wayland flush failed: {error}")),
-        }
-        Ok(())
+        self.host.borrow_mut().flush()
     }
 
     pub(crate) fn poll_read(
@@ -516,188 +691,87 @@ impl WaylandWindow {
         wake: Option<BorrowedFd<'_>>,
         timeout: Option<Duration>,
     ) -> Result<(), String> {
-        if !self.state.pending.input.is_empty() {
+        if !self.state.borrow().pending.input.is_empty() {
             return Ok(());
         }
-        self.flush()?;
-        let timeout = min_timeout(timeout, self.state.key_repeat.deadline());
-        if self.libdecor.is_some() {
-            return self.poll_libdecor(wake, timeout);
-        }
-        let Some(read_guard) = self.event_queue.prepare_read() else {
-            self.dispatch_pending()?;
-            return Ok(());
-        };
-        let mut wayland_interest = PollFlags::IN | PollFlags::ERR | PollFlags::HUP;
-        if self.flush_blocked {
-            wayland_interest |= PollFlags::OUT;
-        }
-        let mut descriptors = vec![PollFd::from_borrowed_fd(
-            self.connection.as_fd(),
-            wayland_interest,
-        )];
-        if let Some(wake) = wake {
-            descriptors.push(PollFd::from_borrowed_fd(
-                wake,
-                PollFlags::IN | PollFlags::ERR,
-            ));
-        }
-        let timeout = timeout.map(|value| Timespec {
-            tv_sec: i64::try_from(value.as_secs()).unwrap_or(i64::MAX),
-            tv_nsec: i64::from(value.subsec_nanos()),
-        });
-        loop {
-            match poll(&mut descriptors, timeout.as_ref()) {
-                Ok(_) => break,
-                Err(rustix::io::Errno::INTR) => {}
-                Err(error) => return Err(format!("UI poll failed: {error}")),
+        let result = self.host.borrow_mut().poll_read(wake, timeout);
+        if let Some(decor) = self.libdecor.as_mut() {
+            decor.dispatch(0)?;
+            if decor.take_commit_requested() {
+                self.surface.commit();
             }
         }
-        let readiness = descriptors[0].revents();
-        if readiness.intersects(PollFlags::ERR | PollFlags::HUP) {
-            return Err("Wayland compositor disconnected".into());
-        }
-        if readiness.contains(PollFlags::IN) {
-            read_guard
-                .read()
-                .map_err(|error| format!("Wayland socket read failed: {error}"))?;
-        }
-        if readiness.contains(PollFlags::OUT) {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    fn poll_libdecor(
-        &mut self,
-        wake: Option<BorrowedFd<'_>>,
-        timeout: Option<Duration>,
-    ) -> Result<(), String> {
-        let Some(read_guard) = self.event_queue.prepare_read() else {
-            self.dispatch_pending()?;
-            return Ok(());
-        };
-        let mut wayland_interest = PollFlags::IN | PollFlags::ERR | PollFlags::HUP;
-        if self.flush_blocked {
-            wayland_interest |= PollFlags::OUT;
-        }
-        let mut descriptors = vec![PollFd::from_borrowed_fd(
-            self.connection.as_fd(),
-            wayland_interest,
-        )];
-        if let Some(wake) = wake {
-            descriptors.push(PollFd::from_borrowed_fd(
-                wake,
-                PollFlags::IN | PollFlags::ERR,
-            ));
-        }
-        let timeout = timeout.map(|value| Timespec {
-            tv_sec: i64::try_from(value.as_secs()).unwrap_or(i64::MAX),
-            tv_nsec: i64::from(value.subsec_nanos()),
-        });
-        loop {
-            match poll(&mut descriptors, timeout.as_ref()) {
-                Ok(_) => break,
-                Err(rustix::io::Errno::INTR) => {}
-                Err(error) => return Err(format!("UI poll failed: {error}")),
-            }
-        }
-        let readiness = descriptors[0].revents();
-        if readiness.intersects(PollFlags::ERR | PollFlags::HUP) {
-            return Err("Wayland compositor disconnected".into());
-        }
-        if readiness.contains(PollFlags::IN) {
-            read_guard
-                .read()
-                .map_err(|error| format!("Wayland socket read failed: {error}"))?;
-        } else {
-            // libdecor shares this wl_display, so cancel our prepared read before dispatching.
-            drop(read_guard);
-        }
-        if readiness.contains(PollFlags::OUT) {
-            self.flush()?;
-        }
-        self.libdecor
-            .as_mut()
-            .expect("libdecor backend")
-            .dispatch(0)?;
-        if self
-            .libdecor
-            .as_mut()
-            .expect("libdecor backend")
-            .take_commit_requested()
-        {
-            self.surface.commit();
-        }
-        Ok(())
+        result
     }
 
     pub(crate) fn take_events(&mut self, output: &mut Vec<PlatformEvent>) -> Result<(), String> {
-        if self.state.pending.input_overflowed {
+        let mut local = self.state.borrow_mut();
+        if local.pending.input_overflowed {
             return Err(format!(
                 "Wayland retained input queue exceeded {RETAINED_INPUT_CAPACITY} events"
             ));
         }
-        if self.state.pending.close {
-            self.state.pending.close = false;
+        if local.pending.close {
+            local.pending.close = false;
             output.push(PlatformEvent::CloseRequested);
         }
-        if let Some((logical_size, scale, state)) = self.state.pending.configured.take() {
+        if let Some((logical_size, scale, state)) = local.pending.configured.take() {
             output.push(PlatformEvent::Configured {
                 logical_size,
                 scale,
                 state,
             });
         }
-        if let Some(scale) = self.state.pending.scale.take() {
+        if let Some(scale) = local.pending.scale.take() {
             output.push(PlatformEvent::ScaleChanged { scale });
         }
-        if self.state.pending.frame_ready {
-            self.state.pending.frame_ready = false;
+        if local.pending.frame_ready {
+            local.pending.frame_ready = false;
             output.push(PlatformEvent::FrameReady);
         }
-        if let Some(suspended) = self.state.pending.suspended.take() {
+        if let Some(suspended) = local.pending.suspended.take() {
             output.push(if suspended {
                 PlatformEvent::SurfaceSuspended
             } else {
                 PlatformEvent::SurfaceResumed
             });
         }
-        self.state.pending.drain_input(output);
+        local.pending.drain_input(output);
         Ok(())
     }
 
     pub(crate) fn request_frame(&self) {
         self.surface
-            .frame(&self.event_queue.handle(), self.surface.clone());
+            .frame(&self.host.borrow().queue_handle(), self.surface.clone());
     }
 
     pub(crate) fn commit(&self) {
+        let local = self.state.borrow();
         if let Some(viewport) = self.viewport.as_ref() {
             viewport.set_destination(
-                i32::try_from(self.state.logical_size.width).unwrap_or(i32::MAX),
-                i32::try_from(self.state.logical_size.height).unwrap_or(i32::MAX),
+                i32::try_from(local.logical_size.width).unwrap_or(i32::MAX),
+                i32::try_from(local.logical_size.height).unwrap_or(i32::MAX),
             );
         } else {
-            let integer_scale = (self.state.scale.0 / 120).max(1);
+            let integer_scale = (local.scale.0 / 120).max(1);
             self.surface
                 .set_buffer_scale(i32::try_from(integer_scale).unwrap_or(i32::MAX));
         }
         self.surface.commit();
     }
 
-    pub(crate) const fn text_input_available(&self) -> bool {
-        self.state.text_input_manager.is_some()
+    pub(crate) fn text_input_available(&self) -> bool {
+        self.host.borrow().state.text_input_manager.is_some()
     }
 
     pub(crate) fn enable_text_input(
         &mut self,
         context: TextInputContext,
     ) -> Result<Option<u32>, String> {
-        if !self.state.text_input_focused {
+        if !self.state.borrow().text_input_focused {
             return Ok(None);
         }
-        let Some(input) = self.state.text_input.clone() else {
+        let Some(input) = self.host.borrow().state.text_input.clone() else {
             return Ok(None);
         };
         input.enable();
@@ -721,7 +795,7 @@ impl WaylandWindow {
         );
         input.commit();
         self.surface.commit();
-        let serial = self.state.bump_text_input_commit();
+        let serial = self.host.borrow_mut().state.bump_text_input_commit();
         self.flush()?;
         Ok(serial)
     }
@@ -730,10 +804,10 @@ impl WaylandWindow {
         &mut self,
         context: TextInputContext,
     ) -> Result<Option<u32>, String> {
-        if !self.state.text_input_focused {
+        if !self.state.borrow().text_input_focused {
             return Ok(None);
         }
-        let Some(input) = self.state.text_input.as_ref() else {
+        let Some(input) = self.host.borrow().state.text_input.clone() else {
             return Ok(None);
         };
         input.set_content_type(
@@ -756,13 +830,13 @@ impl WaylandWindow {
         );
         input.commit();
         self.surface.commit();
-        let serial = self.state.bump_text_input_commit();
+        let serial = self.host.borrow_mut().state.bump_text_input_commit();
         self.flush()?;
         Ok(serial)
     }
 
     pub(crate) fn disable_text_input(&mut self) -> Result<Option<u32>, String> {
-        let Some(input) = self.state.text_input.as_ref() else {
+        let Some(input) = self.host.borrow().state.text_input.clone() else {
             return Ok(None);
         };
         input.set_surrounding_text(String::new(), 0, 0);
@@ -770,7 +844,7 @@ impl WaylandWindow {
         input.disable();
         input.commit();
         self.surface.commit();
-        let serial = self.state.bump_text_input_commit();
+        let serial = self.host.borrow_mut().state.bump_text_input_commit();
         self.flush()?;
         Ok(serial)
     }
@@ -782,35 +856,36 @@ impl WaylandWindow {
         serial: InputSerial,
     ) -> Result<bool, String> {
         const MIMES: [&str; 3] = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain"];
-        if serial.seat != self.state.seat_token {
+        let mut host = self.host.borrow_mut();
+        if serial.seat != host.state.seat_token {
             return Err("selection publish rejected a stale seat serial".into());
         }
-        let qh = self.event_queue.handle();
+        let qh = host.queue_handle();
         match target {
             SelectionTarget::Clipboard => {
-                let Some(device) = self.state.data_device.as_ref() else {
+                let Some(device) = host.state.data_device.as_ref() else {
                     return Ok(false);
                 };
-                let source = self
-                    .state
-                    .data_device_manager
-                    .create_copy_paste_source(&qh, MIMES);
+                let Some(manager) = host.state.data_device_manager.as_ref() else {
+                    return Ok(false);
+                };
+                let source = manager.create_copy_paste_source(&qh, MIMES);
                 source.set_selection(device, serial.value);
-                self.state.clipboard_source = Some((source_id, source));
+                host.state.clipboard_source = Some((source_id, source));
             }
             SelectionTarget::Primary => {
                 let (Some(manager), Some(device)) = (
-                    self.state.primary_selection_manager.as_ref(),
-                    self.state.primary_device.as_ref(),
+                    host.state.primary_selection_manager.as_ref(),
+                    host.state.primary_device.as_ref(),
                 ) else {
                     return Ok(false);
                 };
                 let source = manager.create_selection_source(&qh, MIMES);
                 source.set_selection(device, serial.value);
-                self.state.primary_source = Some((source_id, source));
+                host.state.primary_source = Some((source_id, source));
             }
         }
-        self.flush()?;
+        host.flush()?;
         Ok(true)
     }
 
@@ -823,9 +898,10 @@ impl WaylandWindow {
                 .iter()
                 .find_map(|wanted| mimes.iter().find(|mime| mime.as_str() == *wanted).cloned())
         };
+        let host = self.host.borrow();
         let fd = match target {
             SelectionTarget::Clipboard => {
-                let Some(offer) = self.state.clipboard_offer.as_ref() else {
+                let Some(offer) = host.state.clipboard_offer.as_ref() else {
                     return Ok(None);
                 };
                 let Some(mime) = offer.with_mime_types(choose_mime) else {
@@ -834,7 +910,7 @@ impl WaylandWindow {
                 offer.receive(mime).ok().map(OwnedFd::from)
             }
             SelectionTarget::Primary => {
-                let Some(offer) = self.state.primary_offer.as_ref() else {
+                let Some(offer) = host.state.primary_offer.as_ref() else {
                     return Ok(None);
                 };
                 let Some(mime) = offer.with_mime_types(choose_mime) else {
@@ -843,6 +919,7 @@ impl WaylandWindow {
                 offer.receive(mime).ok().map(OwnedFd::from)
             }
         };
+        drop(host);
         if fd.is_some() {
             self.flush()?;
         }
@@ -857,34 +934,78 @@ impl WaylandWindow {
             let _ = decor.set_title(title);
         }
     }
+    pub(crate) fn set_maximized(&mut self, maximized: bool) {
+        if let Some(window) = self.window.as_ref() {
+            if maximized {
+                window.set_maximized();
+            } else {
+                window.unset_maximized();
+            }
+        }
+        if let Some(decor) = self.libdecor.as_mut() {
+            decor.set_maximized(maximized);
+        }
+    }
+    pub(crate) fn set_fullscreen(&mut self, fullscreen: bool) {
+        if let Some(window) = self.window.as_ref() {
+            if fullscreen {
+                window.set_fullscreen(None);
+            } else {
+                window.unset_fullscreen();
+            }
+        }
+        if let Some(decor) = self.libdecor.as_mut() {
+            decor.set_fullscreen(fullscreen);
+        }
+    }
     pub(crate) fn set_pointer_cursor(&mut self, cursor: PointerCursor) {
-        self.state.pointer_cursor = cursor;
-        let edge = self.state.pointer_resize_edge;
-        self.state.set_pointer_cursor(&self.connection, edge);
+        let edge = {
+            let mut local = self.state.borrow_mut();
+            local.pointer_cursor = cursor;
+            local.pointer_resize_edge
+        };
+        let connection = self.host.borrow().connection.clone();
+        self.host
+            .borrow_mut()
+            .state
+            .set_pointer_cursor_for(&connection, &self.surface.id(), edge);
     }
     pub(crate) fn display_ptr(&self) -> *mut c_void {
-        self.connection.backend().display_ptr().cast()
+        self.host.borrow().connection.backend().display_ptr().cast()
     }
     pub(crate) fn surface_ptr(&self) -> *mut c_void {
         self.surface.id().as_ptr().cast()
     }
 }
 
+pub(crate) fn connect_to_env() -> Result<Connection, GfxInitError> {
+    if env::var_os("WAYLAND_DISPLAY").is_none() {
+        return Err(GfxInitError::Environment(
+            "WAYLAND_DISPLAY is unset; run Leyline inside a GNOME Wayland session".into(),
+        ));
+    }
+    Connection::connect_to_env().map_err(|error| {
+        GfxInitError::Environment(format!(
+            "cannot connect to the Wayland compositor: {error}; verify WAYLAND_DISPLAY and socket access"
+        ))
+    })
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub(crate) struct WaylandState {
+    compositor: CompositorState,
+    shell: XdgShell,
     outputs: OutputState,
     seats: SeatState,
     shm: Shm,
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    keyboard_focus: Option<ObjectId>,
     pointer: Option<ThemedPointer>,
     pointer_seat: Option<wl_seat::WlSeat>,
     cursor_surface: wl_surface::WlSurface,
-    libdecor_resize_fallback: bool,
     pointer_icon: Option<CursorIcon>,
-    pointer_cursor: PointerCursor,
-    pointer_resize_edge: Option<ResizeEdge>,
-    resize_press_active: bool,
-    data_device_manager: DataDeviceManagerState,
+    pointer_focus: Option<ObjectId>,
+    data_device_manager: Option<DataDeviceManagerState>,
     data_device: Option<DataDevice>,
     clipboard_offer: Option<SelectionOffer>,
     clipboard_source: Option<(u64, CopyPasteSource)>,
@@ -894,9 +1015,8 @@ pub(crate) struct WaylandState {
     primary_source: Option<(u64, PrimarySelectionSource)>,
     text_input_manager: Option<ZwpTextInputManagerV3>,
     text_input: Option<ZwpTextInputV3>,
-    text_input_focused: bool,
+    text_input_focus: Option<ObjectId>,
     text_input_commits: u32,
-    target_surface: wl_surface::WlSurface,
     modifiers: ModifiersState,
     pressed_modifiers: PressedModifiers,
     key_repeat: KeyRepeatState,
@@ -904,12 +1024,65 @@ pub(crate) struct WaylandState {
     keymap_generation: u64,
     xkb_keymap: Option<xkb::Keymap>,
     xkb_state: Option<xkb::State>,
+    windows: HashMap<ObjectId, Rc<RefCell<WindowEventState>>>,
+    fractional_windows: HashMap<ObjectId, ObjectId>,
+    seat_token: SeatToken,
+}
+
+#[allow(clippy::struct_excessive_bools)]
+struct WindowEventState {
+    keyboard_focused: bool,
+    libdecor_resize_fallback: bool,
+    pointer_cursor: PointerCursor,
+    pointer_resize_edge: Option<ResizeEdge>,
+    resize_press_active: bool,
+    text_input_focused: bool,
     logical_size: LogicalSize,
     scale: Scale120,
     pending: PendingEvents,
-    pub(crate) configured: bool,
+    configured: bool,
     suspended: bool,
-    seat_token: SeatToken,
+}
+
+impl WindowEventState {
+    fn new(logical_size: LogicalSize) -> Self {
+        Self {
+            keyboard_focused: false,
+            libdecor_resize_fallback: false,
+            pointer_cursor: PointerCursor::Text,
+            pointer_resize_edge: None,
+            resize_press_active: false,
+            text_input_focused: false,
+            logical_size,
+            scale: Scale120::ONE,
+            pending: PendingEvents::default(),
+            configured: false,
+            suspended: false,
+        }
+    }
+}
+
+impl WaylandState {
+    fn window_for_surface(
+        &self,
+        surface: &wl_surface::WlSurface,
+    ) -> Option<Rc<RefCell<WindowEventState>>> {
+        self.windows.get(&surface.id()).cloned()
+    }
+
+    fn focused_window(&self) -> Option<Rc<RefCell<WindowEventState>>> {
+        self.keyboard_focus
+            .as_ref()
+            .and_then(|id| self.windows.get(id))
+            .cloned()
+            .or_else(|| self.windows.values().next().cloned())
+    }
+
+    fn push_focused(&self, event: PlatformEvent) {
+        if let Some(window) = self.focused_window() {
+            window.borrow_mut().pending.push_input(event);
+        }
+    }
 }
 
 impl OutputHandler for WaylandState {
@@ -990,7 +1163,7 @@ impl SeatHandler for WaylandState {
             if let Some(text_input) = self.text_input.take() {
                 text_input.destroy();
             }
-            self.text_input_focused = false;
+            self.text_input_focus = None;
             self.text_input_commits = 0;
             self.pressed_modifiers = PressedModifiers::default();
             self.key_repeat.cancel();
@@ -1014,14 +1187,12 @@ impl SeatHandler for WaylandState {
             self.primary_offer = None;
             self.clipboard_source = None;
             self.primary_source = None;
-            self.pending
-                .push_input(PlatformEvent::Clipboard(ClipboardEvent::Unavailable(
-                    SelectionTarget::Clipboard,
-                )));
-            self.pending
-                .push_input(PlatformEvent::Clipboard(ClipboardEvent::Unavailable(
-                    SelectionTarget::Primary,
-                )));
+            self.push_focused(PlatformEvent::Clipboard(ClipboardEvent::Unavailable(
+                SelectionTarget::Clipboard,
+            )));
+            self.push_focused(PlatformEvent::Clipboard(ClipboardEvent::Unavailable(
+                SelectionTarget::Primary,
+            )));
             self.seat_token = self.seat_token.next_generation();
         }
     }
@@ -1038,17 +1209,22 @@ impl KeyboardHandler for WaylandState {
         _: &[u32],
         _: &[Keysym],
     ) {
-        if surface == &self.target_surface {
+        if let Some(window) = self.window_for_surface(surface) {
+            self.keyboard_focus = Some(surface.id());
+            window.borrow_mut().keyboard_focused = true;
             tracing::debug!("Wayland keyboard focus entered terminal surface");
-            self.pending.push_input(PlatformEvent::KeyboardFocus {
-                seat: self.seat_token,
-                serial: InputSerial {
+            window
+                .borrow_mut()
+                .pending
+                .push_input(PlatformEvent::KeyboardFocus {
                     seat: self.seat_token,
-                    value: serial,
-                    kind: SerialKind::Keyboard,
-                },
-                focused: true,
-            });
+                    serial: InputSerial {
+                        seat: self.seat_token,
+                        value: serial,
+                        kind: SerialKind::Keyboard,
+                    },
+                    focused: true,
+                });
         }
     }
     fn leave(
@@ -1059,18 +1235,25 @@ impl KeyboardHandler for WaylandState {
         surface: &wl_surface::WlSurface,
         serial: u32,
     ) {
-        if surface == &self.target_surface {
+        if let Some(window) = self.window_for_surface(surface) {
+            if self.keyboard_focus.as_ref() == Some(&surface.id()) {
+                self.keyboard_focus = None;
+            }
+            window.borrow_mut().keyboard_focused = false;
             self.pressed_modifiers = PressedModifiers::default();
             self.key_repeat.cancel();
-            self.pending.push_input(PlatformEvent::KeyboardFocus {
-                seat: self.seat_token,
-                serial: InputSerial {
+            window
+                .borrow_mut()
+                .pending
+                .push_input(PlatformEvent::KeyboardFocus {
                     seat: self.seat_token,
-                    value: serial,
-                    kind: SerialKind::Keyboard,
-                },
-                focused: false,
-            });
+                    serial: InputSerial {
+                        seat: self.seat_token,
+                        value: serial,
+                        kind: SerialKind::Keyboard,
+                    },
+                    focused: false,
+                });
         }
     }
     fn press_key(
@@ -1081,6 +1264,9 @@ impl KeyboardHandler for WaylandState {
         serial: u32,
         event: KeyEvent,
     ) {
+        if self.keyboard_focus.is_none() {
+            return;
+        }
         self.push_key(serial, event.clone(), KeyState::Pressed, false);
         self.key_repeat.press(serial, event, Instant::now());
     }
@@ -1092,6 +1278,9 @@ impl KeyboardHandler for WaylandState {
         serial: u32,
         event: KeyEvent,
     ) {
+        if self.keyboard_focus.is_none() {
+            return;
+        }
         self.key_repeat.cancel();
         self.push_key(serial, event, KeyState::Pressed, true);
     }
@@ -1103,6 +1292,9 @@ impl KeyboardHandler for WaylandState {
         serial: u32,
         event: KeyEvent,
     ) {
+        if self.keyboard_focus.is_none() {
+            return;
+        }
         self.key_repeat.release(event.raw_code);
         self.push_key(serial, event, KeyState::Released, false);
     }
@@ -1128,8 +1320,9 @@ impl KeyboardHandler for WaylandState {
         if let Some(state) = self.xkb_state.as_mut() {
             state.update_mask(raw.depressed, raw.latched, raw.locked, 0, 0, layout);
         }
-        self.pending
-            .push_input(PlatformEvent::ModifiersChanged(self.modifiers));
+        if self.keyboard_focus.is_some() {
+            self.push_focused(PlatformEvent::ModifiersChanged(self.modifiers));
+        }
     }
 
     fn update_keymap(
@@ -1190,14 +1383,18 @@ fn parse_digit_row_keycodes(keymap: &str) -> HashMap<u32, std::num::NonZeroU8> {
 
 impl WaylandState {
     fn emit_due_key_repeat(&mut self, now: Instant) {
-        if let Some((serial, event)) = self.key_repeat.take_due(now) {
+        if self.keyboard_focus.is_some()
+            && let Some((serial, event)) = self.key_repeat.take_due(now)
+        {
             self.push_key(serial, event, KeyState::Pressed, true);
         }
     }
 
     fn ensure_selection_devices(&mut self, qh: &QueueHandle<Self>, seat: &wl_seat::WlSeat) {
-        if self.data_device.is_none() {
-            self.data_device = Some(self.data_device_manager.get_data_device(qh, seat));
+        if self.data_device.is_none()
+            && let Some(manager) = self.data_device_manager.as_ref()
+        {
+            self.data_device = Some(manager.get_data_device(qh, seat));
             tracing::debug!("Wayland clipboard data device initialized");
         }
         if self.primary_device.is_none()
@@ -1224,7 +1421,7 @@ impl WaylandState {
             "Wayland keyboard event"
         );
         let identity = self.key_identity(&event);
-        self.pending.push_input(PlatformEvent::Key(KeyInput {
+        self.push_focused(PlatformEvent::Key(KeyInput {
             serial: InputSerial {
                 seat: self.seat_token,
                 value: serial,
@@ -1314,31 +1511,40 @@ impl PointerHandler for WaylandState {
         events: &[PointerEvent],
     ) {
         for event in events {
-            if event.surface != self.target_surface {
+            let Some(window) = self.window_for_surface(&event.surface) else {
                 continue;
-            }
-            let edge = self
+            };
+            let mut local = window.borrow_mut();
+            let edge = local
                 .libdecor_resize_fallback
-                .then(|| content_resize_edge(event.position, self.logical_size))
+                .then(|| content_resize_edge(event.position, local.logical_size))
                 .flatten();
-            self.pointer_resize_edge = edge;
+            local.pointer_resize_edge = edge;
             let kind = match &event.kind {
                 PointerEventKind::Enter { serial } => {
                     // Cursor requests are serial-bound and must be repeated for every enter.
                     self.pointer_icon = None;
-                    self.set_pointer_cursor(connection, edge);
+                    self.pointer_focus = Some(event.surface.id());
+                    drop(local);
+                    self.set_pointer_cursor_for(connection, &event.surface.id(), edge);
+                    local = window.borrow_mut();
                     PointerKind::Enter {
                         serial: self.pointer_serial(*serial),
                     }
                 }
                 PointerEventKind::Leave { serial } => {
-                    self.pointer_resize_edge = None;
+                    local.pointer_resize_edge = None;
+                    if self.pointer_focus.as_ref() == Some(&event.surface.id()) {
+                        self.pointer_focus = None;
+                    }
                     PointerKind::Leave {
                         serial: self.pointer_serial(*serial),
                     }
                 }
                 PointerEventKind::Motion { time } => {
-                    self.set_pointer_cursor(connection, edge);
+                    drop(local);
+                    self.set_pointer_cursor_for(connection, &event.surface.id(), edge);
+                    local = window.borrow_mut();
                     PointerKind::Motion { time_ms: *time }
                 }
                 PointerEventKind::Press {
@@ -1346,12 +1552,12 @@ impl PointerHandler for WaylandState {
                     button,
                     serial,
                 } => {
-                    self.resize_press_active = false;
+                    local.resize_press_active = false;
                     if *button == 0x110
                         && let (Some(edge), Some(seat)) = (edge, self.pointer_seat.clone())
                     {
-                        self.pending.resize = Some((seat, *serial, edge));
-                        self.resize_press_active = true;
+                        local.pending.resize = Some((seat, *serial, edge));
+                        local.resize_press_active = true;
                         continue;
                     }
                     PointerKind::Press {
@@ -1365,7 +1571,7 @@ impl PointerHandler for WaylandState {
                     button,
                     serial,
                 } => {
-                    if *button == 0x110 && std::mem::take(&mut self.resize_press_active) {
+                    if *button == 0x110 && std::mem::take(&mut local.resize_press_active) {
                         continue;
                     }
                     PointerKind::Release {
@@ -1385,7 +1591,8 @@ impl PointerHandler for WaylandState {
                     vertical_120: vertical.value120,
                 },
             };
-            self.pending
+            local
+                .pending
                 .push_input(PlatformEvent::Pointer(PointerInput {
                     position: event.position,
                     kind,
@@ -1403,10 +1610,19 @@ impl WaylandState {
         }
     }
 
-    fn set_pointer_cursor(&mut self, connection: &Connection, edge: Option<ResizeEdge>) {
+    fn set_pointer_cursor_for(
+        &mut self,
+        connection: &Connection,
+        surface: &ObjectId,
+        edge: Option<ResizeEdge>,
+    ) {
         let Some(pointer) = self.pointer.as_ref() else {
             return;
         };
+        let cursor = self
+            .windows
+            .get(surface)
+            .map_or(PointerCursor::Text, |window| window.borrow().pointer_cursor);
         let icon = match edge {
             Some(ResizeEdge::Top) => CursorIcon::NResize,
             Some(ResizeEdge::Bottom) => CursorIcon::SResize,
@@ -1416,7 +1632,7 @@ impl WaylandState {
             Some(ResizeEdge::Right) => CursorIcon::EResize,
             Some(ResizeEdge::TopRight) => CursorIcon::NeResize,
             Some(ResizeEdge::BottomRight) => CursorIcon::SeResize,
-            None => match self.pointer_cursor {
+            None => match cursor {
                 PointerCursor::Text => CursorIcon::Text,
                 PointerCursor::Grab => CursorIcon::Grab,
                 PointerCursor::Grabbing => CursorIcon::Grabbing,
@@ -1624,34 +1840,41 @@ mod key_repeat_tests {
 }
 
 impl WindowHandler for WaylandState {
-    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &Window) {
-        self.pending.close = true;
+    fn request_close(&mut self, _: &Connection, _: &QueueHandle<Self>, window: &Window) {
+        if let Some(local) = self.window_for_surface(window.wl_surface()) {
+            local.borrow_mut().pending.close = true;
+        }
     }
 
     fn configure(
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &Window,
+        window: &Window,
         configure: WindowConfigure,
         _: u32,
     ) {
-        // A zero/None dimension is a compositor non-preference, not suspension.
+        let Some(local) = self.window_for_surface(window.wl_surface()) else {
+            return;
+        };
+        let mut local = local.borrow_mut();
         if let Some(width) = configure.new_size.0 {
-            self.logical_size.width = width.get();
+            local.logical_size.width = width.get();
         }
         if let Some(height) = configure.new_size.1 {
-            self.logical_size.height = height.get();
+            local.logical_size.height = height.get();
         }
-        self.configured = true;
+        local.configured = true;
         let suspended = configure.state.contains(XdgWindowState::SUSPENDED);
-        if suspended != self.suspended {
-            self.suspended = suspended;
-            self.pending.suspended = Some(suspended);
+        if suspended != local.suspended {
+            local.suspended = suspended;
+            local.pending.suspended = Some(suspended);
         }
-        self.pending.configured = Some((
-            self.logical_size,
-            self.scale,
+        let logical_size = local.logical_size;
+        let scale = local.scale;
+        local.pending.configured = Some((
+            logical_size,
+            scale,
             WindowState {
                 maximized: configure.is_maximized(),
                 fullscreen: configure.is_fullscreen(),
@@ -1666,11 +1889,14 @@ impl CompositorHandler for WaylandState {
         &mut self,
         _: &Connection,
         _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         scale: i32,
     ) {
-        self.scale = Scale120(u32::try_from(scale.max(1)).unwrap_or(1).saturating_mul(120));
-        self.pending.scale = Some(self.scale);
+        if let Some(local) = self.window_for_surface(surface) {
+            let mut local = local.borrow_mut();
+            local.scale = Scale120(u32::try_from(scale.max(1)).unwrap_or(1).saturating_mul(120));
+            local.pending.scale = Some(local.scale);
+        }
     }
     fn transform_changed(
         &mut self,
@@ -1680,8 +1906,16 @@ impl CompositorHandler for WaylandState {
         _: wl_output::Transform,
     ) {
     }
-    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
-        self.pending.frame_ready = true;
+    fn frame(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        _: u32,
+    ) {
+        if let Some(local) = self.window_for_surface(surface) {
+            local.borrow_mut().pending.frame_ready = true;
+        }
     }
     fn surface_enter(
         &mut self,
@@ -1728,7 +1962,7 @@ impl Dispatch<WpFractionalScaleManagerV1, ()> for WaylandState {
 impl Dispatch<WpFractionalScaleV1, ()> for WaylandState {
     fn event(
         state: &mut Self,
-        _: &WpFractionalScaleV1,
+        proxy: &WpFractionalScaleV1,
         event: wp_fractional_scale_v1::Event,
         (): &(),
         _: &Connection,
@@ -1736,9 +1970,17 @@ impl Dispatch<WpFractionalScaleV1, ()> for WaylandState {
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event {
             let scale = Scale120(scale.max(1));
-            if state.scale != scale {
-                state.scale = scale;
-                state.pending.scale = Some(scale);
+            if let Some(local) = state
+                .fractional_windows
+                .get(&proxy.id())
+                .and_then(|id| state.windows.get(id))
+                .cloned()
+            {
+                let mut local = local.borrow_mut();
+                if local.scale != scale {
+                    local.scale = scale;
+                    local.pending.scale = Some(scale);
+                }
             }
         }
     }
@@ -1790,40 +2032,65 @@ impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
         _: &QueueHandle<Self>,
     ) {
         let event = match event {
-            zwp_text_input_v3::Event::Enter { surface } if surface == state.target_surface => {
-                state.text_input_focused = true;
+            zwp_text_input_v3::Event::Enter { surface }
+                if state.windows.contains_key(&surface.id()) =>
+            {
+                state.text_input_focus = Some(surface.id());
+                state
+                    .windows
+                    .get(&surface.id())
+                    .unwrap()
+                    .borrow_mut()
+                    .text_input_focused = true;
                 Some(TextInputEvent::Enter)
             }
-            zwp_text_input_v3::Event::Leave { surface } if surface == state.target_surface => {
-                state.text_input_focused = false;
-                Some(TextInputEvent::Leave)
+            zwp_text_input_v3::Event::Leave { surface }
+                if state.windows.contains_key(&surface.id()) =>
+            {
+                if let Some(local) = state.windows.get(&surface.id()) {
+                    let mut local = local.borrow_mut();
+                    local.text_input_focused = false;
+                    local
+                        .pending
+                        .push_input(PlatformEvent::TextInput(TextInputEvent::Leave));
+                }
+                if state.text_input_focus.as_ref() == Some(&surface.id()) {
+                    state.text_input_focus = None;
+                }
+                None
             }
             zwp_text_input_v3::Event::PreeditString {
                 text,
                 cursor_begin,
                 cursor_end,
-            } if state.text_input_focused => Some(TextInputEvent::Preedit {
+            } if state.text_input_focus.is_some() => Some(TextInputEvent::Preedit {
                 text: text.unwrap_or_default(),
                 cursor: (cursor_begin != -1 || cursor_end != -1)
                     .then_some((cursor_begin, cursor_end)),
             }),
-            zwp_text_input_v3::Event::CommitString { text } if state.text_input_focused => {
+            zwp_text_input_v3::Event::CommitString { text } if state.text_input_focus.is_some() => {
                 Some(TextInputEvent::Commit(text.unwrap_or_default()))
             }
             zwp_text_input_v3::Event::DeleteSurroundingText {
                 before_length,
                 after_length,
-            } if state.text_input_focused => Some(TextInputEvent::DeleteSurrounding {
+            } if state.text_input_focus.is_some() => Some(TextInputEvent::DeleteSurrounding {
                 before_bytes: before_length,
                 after_bytes: after_length,
             }),
-            zwp_text_input_v3::Event::Done { serial } if state.text_input_focused => {
+            zwp_text_input_v3::Event::Done { serial } if state.text_input_focus.is_some() => {
                 Some(TextInputEvent::Done { serial })
             }
             _ => None,
         };
-        if let Some(event) = event {
-            state.pending.push_input(PlatformEvent::TextInput(event));
+        if let Some(event) = event
+            && let Some(id) = state.text_input_focus.as_ref()
+            && let Some(local) = state.windows.get(id)
+        {
+            local
+                .borrow_mut()
+                .pending
+                .push_input(PlatformEvent::TextInput(event));
         }
     }
 }
@@ -1870,7 +2137,7 @@ impl DataDeviceHandler for WaylandState {
                 mime_types: offer.with_mime_types(<[String]>::to_vec),
             },
         );
-        self.pending.push_input(PlatformEvent::Clipboard(event));
+        self.push_focused(PlatformEvent::Clipboard(event));
     }
     fn drop_performed(
         &mut self,
@@ -1922,13 +2189,12 @@ impl DataSourceHandler for WaylandState {
             .as_ref()
             .filter(|(_, value)| value.inner() == source)
         {
-            self.pending
-                .push_input(PlatformEvent::Clipboard(ClipboardEvent::Send {
-                    target: SelectionTarget::Clipboard,
-                    source: *source,
-                    mime_type,
-                    fd: OwnedFd::from(fd),
-                }));
+            self.push_focused(PlatformEvent::Clipboard(ClipboardEvent::Send {
+                target: SelectionTarget::Clipboard,
+                source: *source,
+                mime_type,
+                fd: OwnedFd::from(fd),
+            }));
         }
     }
     fn cancelled(
@@ -1943,11 +2209,10 @@ impl DataSourceHandler for WaylandState {
             .is_some_and(|(_, value)| value.inner() == source)
         {
             let (source, _) = self.clipboard_source.take().expect("source was checked");
-            self.pending
-                .push_input(PlatformEvent::Clipboard(ClipboardEvent::SourceCancelled {
-                    target: SelectionTarget::Clipboard,
-                    source,
-                }));
+            self.push_focused(PlatformEvent::Clipboard(ClipboardEvent::SourceCancelled {
+                target: SelectionTarget::Clipboard,
+                source,
+            }));
         }
     }
     fn dnd_dropped(
@@ -1996,7 +2261,7 @@ impl PrimarySelectionDeviceHandler for WaylandState {
                 mime_types: offer.with_mime_types(<[String]>::to_vec),
             },
         );
-        self.pending.push_input(PlatformEvent::Clipboard(event));
+        self.push_focused(PlatformEvent::Clipboard(event));
     }
 }
 
@@ -2014,13 +2279,12 @@ impl PrimarySelectionSourceHandler for WaylandState {
             .as_ref()
             .filter(|(_, value)| value.inner() == source)
         {
-            self.pending
-                .push_input(PlatformEvent::Clipboard(ClipboardEvent::Send {
-                    target: SelectionTarget::Primary,
-                    source: *source,
-                    mime_type,
-                    fd: OwnedFd::from(fd),
-                }));
+            self.push_focused(PlatformEvent::Clipboard(ClipboardEvent::Send {
+                target: SelectionTarget::Primary,
+                source: *source,
+                mime_type,
+                fd: OwnedFd::from(fd),
+            }));
         }
     }
     fn cancelled(
@@ -2035,11 +2299,10 @@ impl PrimarySelectionSourceHandler for WaylandState {
             .is_some_and(|(_, value)| value.inner() == source)
         {
             let (source, _) = self.primary_source.take().expect("source was checked");
-            self.pending
-                .push_input(PlatformEvent::Clipboard(ClipboardEvent::SourceCancelled {
-                    target: SelectionTarget::Primary,
-                    source,
-                }));
+            self.push_focused(PlatformEvent::Clipboard(ClipboardEvent::SourceCancelled {
+                target: SelectionTarget::Primary,
+                source,
+            }));
         }
     }
 }

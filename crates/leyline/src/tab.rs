@@ -7,17 +7,45 @@ use crate::{
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct SessionId(u64);
+pub struct SessionId(NonZeroU64);
 
 impl SessionId {
     #[must_use]
     pub const fn get(self) -> u64 {
-        self.0
+        self.0.get()
     }
 
     #[cfg(test)]
-    pub(crate) const fn from_raw(value: u64) -> Self {
-        Self(value)
+    pub(crate) fn from_raw(value: u64) -> Self {
+        Self(NonZeroU64::new(value).expect("test session id must be non-zero"))
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionIdAllocator {
+    next: Option<NonZeroU64>,
+}
+
+impl Default for SessionIdAllocator {
+    fn default() -> Self {
+        Self {
+            next: Some(NonZeroU64::MIN),
+        }
+    }
+}
+
+impl SessionIdAllocator {
+    /// Allocates the next process-unique session identity.
+    ///
+    /// # Errors
+    /// Returns [`TabError::SessionIdExhausted`] after the final `u64` identity.
+    pub fn allocate(&mut self) -> Result<SessionId, TabError> {
+        let id = SessionId(self.next.ok_or(TabError::SessionIdExhausted)?);
+        self.next = self
+            .next
+            .and_then(|next| next.get().checked_add(1))
+            .and_then(NonZeroU64::new);
+        Ok(id)
     }
 }
 
@@ -52,7 +80,6 @@ pub struct TabManager {
     tabs: Vec<TabEntry>,
     closing: Vec<ClosingTab>,
     active_id: Option<SessionId>,
-    next_id: u64,
     next_bell_generation: NonZeroU64,
     drain_cursor: Option<SessionId>,
     max_count: NonZeroU8,
@@ -97,8 +124,25 @@ pub struct TabBarPresentation {
     pub offset: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TabDragPhase {
+    Armed,
+    Dragging,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TabDrag {
+    pub session: SessionId,
+    pub press_serial: leyline_gfx::InputSerial,
+    pub origin: [f64; 2],
+    pub current: [f64; 2],
+    pub proposed_index: usize,
+    pub phase: TabDragPhase,
+}
+
 impl TabBarPresentation {
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn layout(
         manager: &TabManager,
         viewport_width: u32,
@@ -106,7 +150,12 @@ impl TabBarPresentation {
         config: &crate::config::TabsConfig,
         requested_offset: u32,
     ) -> Self {
-        if manager.tabs.is_empty() {
+        let visible = match config.visibility {
+            crate::config::TabBarVisibility::Always => !manager.tabs.is_empty(),
+            crate::config::TabBarVisibility::Multiple => manager.tabs.len() >= 2,
+            crate::config::TabBarVisibility::Never => false,
+        };
+        if !visible {
             return Self::default();
         }
         let scaled = |value: u16| {
@@ -217,6 +266,16 @@ impl TabBarPresentation {
                 )
             })
     }
+
+    #[must_use]
+    pub fn proposed_index(&self, manager: &TabManager, x: u32) -> Option<usize> {
+        let item = self
+            .items
+            .iter()
+            .find(|item| x < item.rect.x.saturating_add(item.rect.width / 2))
+            .or_else(|| self.items.last())?;
+        manager.tabs.iter().position(|tab| tab.id == item.id)
+    }
 }
 
 fn elide_title(title: &str) -> String {
@@ -235,11 +294,27 @@ pub enum Activation {
     Unchanged,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReorderOutcome {
+    Unchanged,
+    Changed { from: usize, to: usize },
+}
+
 #[allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 impl TabManager {
     #[must_use]
     pub fn bootstrap(session: TerminalSession, runtime: AppRuntime, max_count: NonZeroU8) -> Self {
-        let id = SessionId(1);
+        let id = SessionId(NonZeroU64::MIN);
+        Self::bootstrap_with_id(id, session, runtime, max_count)
+    }
+
+    #[must_use]
+    pub fn bootstrap_with_id(
+        id: SessionId,
+        session: TerminalSession,
+        runtime: AppRuntime,
+        max_count: NonZeroU8,
+    ) -> Self {
         Self {
             tabs: vec![TabEntry {
                 id,
@@ -255,7 +330,19 @@ impl TabManager {
             }],
             closing: Vec::new(),
             active_id: Some(id),
-            next_id: 2,
+            next_bell_generation: NonZeroU64::MIN,
+            drain_cursor: None,
+            max_count,
+        }
+    }
+
+    #[must_use]
+    pub fn bootstrap_entry(entry: TabEntry, max_count: NonZeroU8) -> Self {
+        let id = entry.id;
+        Self {
+            tabs: vec![entry],
+            closing: Vec::new(),
+            active_id: Some(id),
             next_bell_generation: NonZeroU64::MIN,
             drain_cursor: None,
             max_count,
@@ -273,11 +360,36 @@ impl TabManager {
                 limit: usize::from(self.max_count.get()),
             });
         }
-        let id = SessionId(self.next_id);
-        self.next_id = self
-            .next_id
+        let next = self
+            .tabs
+            .iter()
+            .chain(self.closing.iter().map(|tab| &tab.entry))
+            .map(|tab| tab.id.get())
+            .max()
+            .unwrap_or(0)
             .checked_add(1)
+            .and_then(NonZeroU64::new)
             .ok_or(TabError::SessionIdExhausted)?;
+        self.push_with_id(SessionId(next), session, runtime, title)
+    }
+
+    pub fn push_with_id(
+        &mut self,
+        id: SessionId,
+        session: TerminalSession,
+        runtime: AppRuntime,
+        title: String,
+    ) -> Result<SessionId, TabError> {
+        if self.tabs.len() + self.closing.len() >= usize::from(self.max_count.get()) {
+            return Err(TabError::LimitReached {
+                limit: usize::from(self.max_count.get()),
+            });
+        }
+        if self.tabs.iter().any(|tab| tab.id == id)
+            || self.closing.iter().any(|tab| tab.entry.id == id)
+        {
+            return Err(TabError::DuplicateSession(id));
+        }
         self.tabs.push(TabEntry {
             id,
             session,
@@ -304,6 +416,10 @@ impl TabManager {
         self.tabs.len()
     }
     #[must_use]
+    pub fn total_len(&self) -> usize {
+        self.tabs.len() + self.closing.len()
+    }
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.tabs.is_empty()
     }
@@ -324,6 +440,10 @@ impl TabManager {
     }
     pub fn closing_mut(&mut self) -> &mut Vec<ClosingTab> {
         &mut self.closing
+    }
+    #[must_use]
+    pub fn closing(&self) -> &[ClosingTab] {
+        &self.closing
     }
 
     pub fn poll_closing(
@@ -407,6 +527,39 @@ impl TabManager {
         self.activate(tab.id).expect("target exists")
     }
 
+    pub fn reorder(
+        &mut self,
+        session: SessionId,
+        target_index: usize,
+    ) -> Result<ReorderOutcome, TabError> {
+        let from = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == session)
+            .ok_or(TabError::UnknownSession(session))?;
+        let to = target_index.min(self.tabs.len().saturating_sub(1));
+        if from == to {
+            return Ok(ReorderOutcome::Unchanged);
+        }
+        let entry = self.tabs.remove(from);
+        self.tabs.insert(to, entry);
+        // The cursor is identity-based, so keeping it preserves fair rotation across reorders.
+        self.assert_invariants();
+        Ok(ReorderOutcome::Changed { from, to })
+    }
+
+    pub fn move_active(&mut self, delta: i8) -> Result<ReorderOutcome, TabError> {
+        let id = self.active_id.ok_or(TabError::NoActiveSession)?;
+        let from = self.active_index().ok_or(TabError::NoActiveSession)?;
+        let target = if delta < 0 {
+            from.saturating_sub(1)
+        } else {
+            from.saturating_add(1)
+                .min(self.tabs.len().saturating_sub(1))
+        };
+        self.reorder(id, target)
+    }
+
     pub fn close_active(&mut self) -> Option<SessionId> {
         let index = self.active_index()?;
         let mut entry = self.tabs.remove(index);
@@ -441,6 +594,50 @@ impl TabManager {
 
     pub fn get_mut(&mut self, id: SessionId) -> Option<&mut TabEntry> {
         self.tabs.iter_mut().find(|tab| tab.id == id)
+    }
+
+    pub fn extract(&mut self, id: SessionId) -> Result<(TabEntry, usize), TabError> {
+        let index = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == id)
+            .ok_or(TabError::UnknownSession(id))?;
+        let entry = self.tabs.remove(index);
+        self.active_id = if self.tabs.is_empty() {
+            None
+        } else if self.active_id == Some(id) {
+            Some(self.tabs[index.min(self.tabs.len() - 1)].id)
+        } else {
+            self.active_id
+        };
+        self.assert_invariants();
+        Ok((entry, index))
+    }
+
+    pub fn insert(
+        &mut self,
+        entry: TabEntry,
+        target: usize,
+        activate: bool,
+    ) -> Result<SessionId, TabError> {
+        if !self.has_capacity() {
+            return Err(TabError::LimitReached {
+                limit: usize::from(self.max_count.get()),
+            });
+        }
+        if self.tabs.iter().any(|tab| tab.id == entry.id)
+            || self.closing.iter().any(|tab| tab.entry.id == entry.id)
+        {
+            return Err(TabError::DuplicateSession(entry.id));
+        }
+        let id = entry.id;
+        let target = target.min(self.tabs.len());
+        self.tabs.insert(target, entry);
+        if activate || self.active_id.is_none() {
+            self.active_id = Some(id);
+        }
+        self.assert_invariants();
+        Ok(id)
     }
 
     pub fn mark_unread(&mut self, id: SessionId) -> bool {
@@ -549,11 +746,27 @@ pub enum TabError {
     BellGenerationExhausted,
     #[error("unknown session {0:?}")]
     UnknownSession(SessionId),
+    #[error("duplicate session {0:?}")]
+    DuplicateSession(SessionId),
+    #[error("window has no active session")]
+    NoActiveSession,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_ids_include_last_value_then_report_exhaustion() {
+        let mut allocator = SessionIdAllocator {
+            next: NonZeroU64::new(u64::MAX),
+        };
+        assert_eq!(allocator.allocate().unwrap().get(), u64::MAX);
+        assert!(matches!(
+            allocator.allocate(),
+            Err(TabError::SessionIdExhausted)
+        ));
+    }
     use std::{ffi::OsString, sync::Arc};
 
     fn entry() -> (TerminalSession, AppRuntime) {
@@ -611,6 +824,7 @@ mod tests {
                 max_width: 240,
                 show_close_button: true,
                 new_tab_cwd: crate::config::NewTabCwdPolicy::Inherit,
+                visibility: crate::config::TabBarVisibility::Always,
             },
             0,
         );
@@ -747,5 +961,43 @@ mod tests {
         assert!(!manager.tabs()[0].attention);
         assert_eq!(manager.acknowledge(id), Some(generation));
         assert_eq!(manager.acknowledge(id), None);
+    }
+
+    #[test]
+    fn reorder_preserves_active_identity_and_fair_cursor() {
+        let (session, runtime) = entry();
+        let mut manager = TabManager::bootstrap(session, runtime, NonZeroU8::new(3).unwrap());
+        let first = manager.active_id().unwrap();
+        let (session, runtime) = entry();
+        let second = manager.push(session, runtime, "two".into()).unwrap();
+        let (session, runtime) = entry();
+        let third = manager.push(session, runtime, "three".into()).unwrap();
+        let _ = manager.drain_order();
+        assert_eq!(
+            manager.reorder(third, 0).unwrap(),
+            ReorderOutcome::Changed { from: 2, to: 0 }
+        );
+        assert_eq!(manager.active_id(), Some(third));
+        assert_eq!(
+            manager.tabs().iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            vec![third, first, second]
+        );
+        assert_eq!(manager.drain_order().len(), 3);
+    }
+
+    #[test]
+    fn visibility_policy_removes_all_tab_hit_regions() {
+        let (session, runtime) = entry();
+        let manager = TabManager::bootstrap(session, runtime, NonZeroU8::new(2).unwrap());
+        for visibility in [
+            crate::config::TabBarVisibility::Multiple,
+            crate::config::TabBarVisibility::Never,
+        ] {
+            let mut config = crate::config::EffectiveConfig::default().tabs;
+            config.visibility = visibility;
+            let bar = TabBarPresentation::layout(&manager, 200, 120, &config, 0);
+            assert!(bar.bar.is_none());
+            assert!(bar.items.is_empty());
+        }
     }
 }

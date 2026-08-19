@@ -36,6 +36,11 @@ inherit the startup environment and working directory with `TERM=leyline-256colo
 `leyline --term xterm-256color` as an explicit best-effort compatibility mode, and use `-v`, `-vv`,
 or `-vvv` for progressively more detailed stderr logging.
 
+Window launch overrides use `--geometry COLUMNSxLINES`, `--maximized`, or `--fullscreen`;
+`--maximized` and `--fullscreen` are mutually exclusive. `--new-window` is a desktop-entry
+compatible alias for starting this process with a terminal window; it does not contact an existing
+Leyline process.
+
 The canonical standalone source is `terminfo/leyline.terminfo`; it declares `RGB`, allowing modern
 tmux to detect true color without a Leyline-specific override. Useful management and diagnostic
 commands are:
@@ -114,6 +119,10 @@ ansi = [
 [window]
 padding_x = 0
 padding_y = 5
+columns = 80
+lines = 24
+startup_state = "normal" # normal | maximized | fullscreen
+max_windows = 8
 
 [scrolling]
 history_lines = 10000
@@ -135,6 +144,7 @@ hold_after_exit = false
 confirm_multiline_paste = false
 
 [tabs]
+visibility = "always" # always | multiple | never
 max_count = 32
 bar_height = 32
 min_width = 80
@@ -166,15 +176,21 @@ fixed resource limits. Search text is never logged or copied into a window title
 method is active, the query may be shared with the local Wayland input method as surrounding text;
 terminal contents and matching context are not shared.
 
-Tabs are always visible. `Ctrl+Shift+N` creates and activates a tab, `Ctrl+Shift+W` closes it,
-`Ctrl+Shift+Left/Right` cycles, and `Ctrl+Shift+1..9` activates an ordinal tab. Mouse clicks switch
-tabs; a close button or middle click closes one. New tabs repeat the startup launch request and
+The tab bar follows `[tabs].visibility`: `always`, `multiple`, or `never`. `Ctrl+Shift+N` creates
+and activates a tab, `Ctrl+Shift+W` closes it, `Ctrl+Shift+Left/Right` cycles, and
+`Ctrl+Shift+1..9` activates an ordinal tab. `Ctrl+Shift+PageUp/PageDown` reorders the active tab.
+Mouse clicks switch tabs; a close button or middle click closes one, and dragging reorders tabs in
+the current window with bounded edge scrolling. `Ctrl+Shift+Alt+N` creates a new window with a new
+session, while `F11` toggles fullscreen. New tabs and windows repeat the startup launch request and
 use `[tabs].new_tab_cwd`: `inherit` prefers the active tab's last valid OSC 7 directory, `fixed`
 uses `new_tab_fixed_cwd`, and `home` uses the HOME captured at startup. Every unavailable candidate
-falls back to Leyline's startup directory. User `[[keybindings]]` entries can override the actions
+falls back to Leyline's startup directory. `MoveTabToNewWindow` moves the same live PTY into a new
+window without restarting it; bind it explicitly if desired. User `[[keybindings]]` entries can
+override the actions
 `CopyClipboard`, `PasteClipboard`, `PastePrimary`, `Search`, `SearchNext`, `SearchPrevious`,
-`CancelSearch`, `NewTab`, `CloseTab`, `PreviousTab`, `NextTab`, and `ActivateTab1` through
-`ActivateTab9`.
+`CancelSearch`, `NewTab`, `NewWindow`, `CloseTab`, `PreviousTab`, `NextTab`, `MoveTabLeft`,
+`MoveTabRight`, `MoveTabToNewWindow`, `ToggleFullscreen`, `ToggleMaximized`, `RestoreWindow`, and
+`ActivateTab1` through `ActivateTab9`.
 
 Leyline receives current-directory metadata but does not install shell hooks. Configure bash, zsh,
 fish, or a prompt plugin to emit `OSC 7 ; file://host/absolute-path` terminated by BEL or ST, with

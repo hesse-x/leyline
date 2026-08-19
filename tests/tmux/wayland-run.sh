@@ -71,7 +71,7 @@ fi
 [[ -s $output ]] || fail 'pane probe produced no output'
 rg -qx 'pane_TERM=tmux-256color' "$output" || fail 'unexpected pane TERM'
 rg -qx 'pane_tty=yes' "$output" || fail 'pane did not receive a tty'
-rg -qx 'client_termname=xterm-256color' "$output" || fail 'tmux saw the wrong Leyline TERM'
+rg -qx 'client_termname=leyline-256color' "$output" || fail 'tmux saw the wrong Leyline TERM'
 rg -qx 'client_attached=1' "$output" || fail 'tmux client was not attached'
 rg -q '^client_size=[1-9][0-9]*x[1-9][0-9]*$' "$output" || fail 'invalid client size'
 rg -q '^pane_size_tmux=[1-9][0-9]*x[1-9][0-9]*$' "$output" || fail 'invalid pane size'

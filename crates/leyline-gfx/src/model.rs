@@ -365,6 +365,9 @@ pub enum GfxCommand {
     SetDirty,
     SetScene(SceneData),
     RequestClose,
+    RequestMaximized(bool),
+    RequestFullscreen(bool),
+    RequestRestore,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

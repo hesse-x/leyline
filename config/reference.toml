@@ -41,6 +41,15 @@ thumb = "#9aa2a680"
 thumb_hover = "#c1c7caff"
 track = "#00000000"
 
+[window]
+padding_x = 0
+padding_y = 5
+columns = 80
+lines = 24
+# Other values are "maximized" and "fullscreen".
+startup_state = "normal"
+max_windows = 8
+
 [tabs]
 max_count = 32
 bar_height = 32
@@ -50,6 +59,7 @@ show_close_button = true
 # New tabs inherit the active tab's last valid OSC 7 directory by default.
 # Other values are "home" or "fixed"; fixed also requires new_tab_fixed_cwd.
 new_tab_cwd = "inherit"
+visibility = "always" # always | multiple | never
 # new_tab_fixed_cwd = "/srv/project"
 
 [bell]

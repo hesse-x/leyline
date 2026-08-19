@@ -1,5 +1,6 @@
 use std::{
     os::fd::{BorrowedFd, OwnedFd},
+    rc::Rc,
     time::Duration,
 };
 
@@ -7,9 +8,10 @@ use crate::{
     GfxCommand, LinearColor, LogicalSize, PlatformEvent, RectangleInstance, RenderOutcome,
     RenderScene, Scale120, SelectionTarget, TextInputContext,
     atlas::{AtlasManager, AtlasPreparation},
+    decor::LibdecorContext,
     model::SceneData,
-    vulkan::{RenderStatus, VulkanRenderer},
-    wayland::WaylandWindow,
+    vulkan::{RenderStatus, VulkanDeviceContext, VulkanRenderer},
+    wayland::{WaylandConnectionHost, WaylandWindow},
 };
 
 pub const MAX_WINDOW_TITLE_BYTES: usize = 1024;
@@ -46,6 +48,8 @@ pub enum GfxInitError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum GfxError {
+    #[error("graphics initialization error: {0}")]
+    Initialization(#[from] GfxInitError),
     #[error("Wayland runtime error: {0}")]
     Platform(String),
     #[error("Vulkan runtime error: {0}")]
@@ -86,61 +90,81 @@ pub struct GfxRuntime {
     close_requested: bool,
 }
 
-impl GfxRuntime {
-    #[must_use]
-    pub const fn color_glyphs_supported(&self) -> bool {
-        self.renderer.color_glyphs_supported()
-    }
-    /// Connects Wayland, creates a native window and initializes Vulkan 1.3 WSI.
-    ///
-    /// # Errors
-    /// Returns a categorized environment, platform, or device failure.
-    pub fn new(options: &GfxOptions) -> Result<Self, GfxInitError> {
-        if options.title.contains('\0') || options.title.len() > MAX_WINDOW_TITLE_BYTES {
-            return Err(GfxInitError::Platform(
-                "initial window title is invalid".into(),
-            ));
-        }
-        let mut wayland = WaylandWindow::connect(&options.title)?;
-        for _ in 0..8 {
-            wayland.roundtrip().map_err(GfxInitError::Platform)?;
-            if wayland.state.configured {
-                break;
-            }
-        }
-        if !wayland.state.configured {
-            return Err(GfxInitError::Platform(
-                "compositor did not send the initial configure".into(),
-            ));
-        }
-        let mut events = Vec::new();
-        wayland
-            .take_events(&mut events)
+pub(crate) struct PendingGfxRuntime {
+    wayland: WaylandWindow,
+    logical_size: LogicalSize,
+    scale: Scale120,
+    clear: LinearColor,
+    configured: bool,
+    device: Option<Rc<VulkanDeviceContext>>,
+}
+
+impl PendingGfxRuntime {
+    pub(crate) fn dispatch_pending(
+        &mut self,
+        output: &mut Vec<PlatformEvent>,
+    ) -> Result<(), GfxInitError> {
+        self.wayland
+            .dispatch_pending()
             .map_err(GfxInitError::Platform)?;
-        let mut logical_size = options.default_size;
-        let mut scale = Scale120::ONE;
-        for event in events {
+        self.take_events(output)
+    }
+
+    fn take_events(&mut self, output: &mut Vec<PlatformEvent>) -> Result<(), GfxInitError> {
+        let start = output.len();
+        self.wayland
+            .take_events(output)
+            .map_err(GfxInitError::Platform)?;
+        for event in &output[start..] {
             if let PlatformEvent::Configured {
-                logical_size: size,
-                scale: configured_scale,
+                logical_size,
+                scale,
                 ..
             } = event
             {
-                logical_size = size;
-                scale = configured_scale;
+                self.logical_size = *logical_size;
+                self.scale = *scale;
+                self.configured = true;
             }
         }
-        let pixels = scale
-            .pixels(logical_size)
+        Ok(())
+    }
+
+    pub(crate) const fn is_configured(&self) -> bool {
+        self.configured
+    }
+
+    pub(crate) fn poll_wait(
+        &mut self,
+        wake: Option<BorrowedFd<'_>>,
+        timeout: Option<Duration>,
+    ) -> Result<(), GfxError> {
+        self.wayland
+            .poll_read(wake, timeout)
+            .map_err(GfxError::Platform)
+    }
+
+    pub(crate) fn finish(self) -> Result<GfxRuntime, GfxInitError> {
+        if !self.configured {
+            return Err(GfxInitError::Platform(
+                "window renderer requested before initial configure".into(),
+            ));
+        }
+        let pixels = self
+            .scale
+            .pixels(self.logical_size)
             .map_err(|error| GfxInitError::Platform(error.to_string()))?;
-        let renderer = VulkanRenderer::new(&wayland, pixels)?;
-        Ok(Self {
+        let renderer = self.device.map_or_else(
+            || VulkanRenderer::new(&self.wayland, pixels),
+            |device| VulkanRenderer::new_on(device, &self.wayland, pixels),
+        )?;
+        Ok(GfxRuntime {
             renderer,
-            wayland,
-            logical_size,
-            scale,
+            wayland: self.wayland,
+            logical_size: self.logical_size,
+            scale: self.scale,
             scene: SceneData {
-                clear: options.clear,
+                clear: self.clear,
                 rectangles: test_rectangles(pixels.width, pixels.height),
                 glyphs: Vec::new(),
                 glyph_assets: Vec::new(),
@@ -158,6 +182,91 @@ impl GfxRuntime {
             surface_state: SurfaceState::Ready,
             close_requested: false,
         })
+    }
+}
+
+impl GfxRuntime {
+    pub(crate) fn device_context(&self) -> Rc<VulkanDeviceContext> {
+        self.renderer.device_context()
+    }
+
+    pub(crate) fn libdecor_context(&self) -> Option<Rc<LibdecorContext>> {
+        self.wayland.libdecor_context()
+    }
+
+    pub(crate) fn wayland_host(&self) -> Rc<std::cell::RefCell<WaylandConnectionHost>> {
+        self.wayland.host()
+    }
+    #[must_use]
+    pub const fn color_glyphs_supported(&self) -> bool {
+        self.renderer.color_glyphs_supported()
+    }
+    /// Connects Wayland, creates a native window and initializes Vulkan 1.3 WSI.
+    ///
+    /// # Errors
+    /// Returns a categorized environment, platform, or device failure.
+    pub fn new(options: &GfxOptions) -> Result<Self, GfxInitError> {
+        let wayland = WaylandWindow::connect(&options.title, options.default_size)?;
+        Self::new_with_wayland(wayland, options)
+    }
+
+    pub(crate) fn begin_on(
+        host: Rc<std::cell::RefCell<WaylandConnectionHost>>,
+        device: Rc<VulkanDeviceContext>,
+        libdecor: Option<Rc<LibdecorContext>>,
+        options: &GfxOptions,
+    ) -> Result<PendingGfxRuntime, GfxInitError> {
+        if options.title.contains('\0') || options.title.len() > MAX_WINDOW_TITLE_BYTES {
+            return Err(GfxInitError::Platform(
+                "initial window title is invalid".into(),
+            ));
+        }
+        let wayland =
+            WaylandWindow::connect_on(host, libdecor, &options.title, options.default_size)?;
+        Ok(PendingGfxRuntime {
+            wayland,
+            logical_size: options.default_size,
+            scale: Scale120::ONE,
+            clear: options.clear,
+            configured: false,
+            device: Some(device),
+        })
+    }
+
+    fn new_with_wayland(
+        wayland: WaylandWindow,
+        options: &GfxOptions,
+    ) -> Result<Self, GfxInitError> {
+        if options.title.contains('\0') || options.title.len() > MAX_WINDOW_TITLE_BYTES {
+            return Err(GfxInitError::Platform(
+                "initial window title is invalid".into(),
+            ));
+        }
+        let mut pending = PendingGfxRuntime {
+            wayland,
+            logical_size: options.default_size,
+            scale: Scale120::ONE,
+            clear: options.clear,
+            configured: false,
+            device: None,
+        };
+        for _ in 0..8 {
+            pending
+                .wayland
+                .roundtrip()
+                .map_err(GfxInitError::Platform)?;
+            let mut events = Vec::new();
+            pending.take_events(&mut events)?;
+            if pending.is_configured() {
+                break;
+            }
+        }
+        if !pending.is_configured() {
+            return Err(GfxInitError::Platform(
+                "compositor did not send the initial configure".into(),
+            ));
+        }
+        pending.finish()
     }
 
     /// Dispatches already-buffered Wayland callbacks and transfers semantic events.
@@ -245,6 +354,12 @@ impl GfxRuntime {
                 self.dirty = true;
             }
             GfxCommand::RequestClose => self.close_requested = true,
+            GfxCommand::RequestMaximized(maximized) => self.wayland.set_maximized(maximized),
+            GfxCommand::RequestFullscreen(fullscreen) => self.wayland.set_fullscreen(fullscreen),
+            GfxCommand::RequestRestore => {
+                self.wayland.set_fullscreen(false);
+                self.wayland.set_maximized(false);
+            }
         }
         Ok(())
     }
@@ -416,7 +531,7 @@ impl GfxRuntime {
     }
 
     #[must_use]
-    pub const fn text_input_available(&self) -> bool {
+    pub fn text_input_available(&self) -> bool {
         self.wayland.text_input_available()
     }
 

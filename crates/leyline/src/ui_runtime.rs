@@ -1,6 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
-    num::NonZeroU8,
+    collections::{HashMap, HashSet, VecDeque},
+    num::{NonZeroU8, NonZeroU64},
+    ops::{Deref, DerefMut},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -48,56 +49,176 @@ struct PressedTerminalKey {
     foreground_process_group: Option<u32>,
 }
 
+struct DesktopGfx {
+    host: leyline_gfx::GfxHost,
+    current: leyline_gfx::WindowId,
+}
+
+impl DesktopGfx {
+    fn adopt_initial(window: GfxRuntime, max_windows: NonZeroU8) -> Self {
+        let (host, initial) = leyline_gfx::GfxHost::adopt_initial(window, max_windows);
+        Self {
+            host,
+            current: initial,
+        }
+    }
+
+    fn dispatch_pending(
+        &mut self,
+        output: &mut Vec<leyline_gfx::RoutedPlatformEvent>,
+    ) -> Result<(), GfxError> {
+        self.host.dispatch_pending(output)
+    }
+
+    fn create_window(&mut self, options: &GfxOptions) -> Result<leyline_gfx::WindowId, GfxError> {
+        self.host.create_window(options)
+    }
+
+    fn accepts_surface(&self, surface: leyline_gfx::SurfaceKey) -> bool {
+        self.host.accepts_surface(surface)
+    }
+
+    fn window(&self, id: leyline_gfx::WindowId) -> Option<&GfxRuntime> {
+        self.host.window(id)
+    }
+
+    fn current_window(&self) -> &GfxRuntime {
+        self.host
+            .window(self.current)
+            .expect("current graphics window is ready")
+    }
+
+    fn current_window_mut(&mut self) -> &mut GfxRuntime {
+        self.host
+            .window_mut(self.current)
+            .expect("current graphics window is ready")
+    }
+
+    fn current_id(&self) -> leyline_gfx::WindowId {
+        self.current
+    }
+
+    fn set_current(&mut self, id: leyline_gfx::WindowId) {
+        self.current = id;
+    }
+
+    fn logical_size(&self) -> leyline_gfx::LogicalSize {
+        self.current_window().logical_size()
+    }
+
+    fn scale(&self) -> leyline_gfx::Scale120 {
+        self.current_window().scale()
+    }
+
+    fn color_glyphs_supported(&self) -> bool {
+        self.current_window().color_glyphs_supported()
+    }
+
+    fn text_input_available(&self) -> bool {
+        self.current_window().text_input_available()
+    }
+
+    fn apply(&mut self, command: leyline_gfx::GfxCommand) -> Result<(), GfxError> {
+        self.current_window_mut().apply(command)
+    }
+
+    fn try_render(&mut self) -> Result<RenderOutcome, GfxError> {
+        self.current_window_mut().try_render()
+    }
+
+    fn try_render_resize_preview(&mut self) -> Result<RenderOutcome, GfxError> {
+        self.current_window_mut().try_render_resize_preview()
+    }
+
+    fn acknowledge_resize(&mut self) -> Result<(), GfxError> {
+        self.current_window_mut().acknowledge_resize()
+    }
+
+    fn scene_fits_atlas(&self, scene: &leyline_gfx::SceneData) -> Result<bool, GfxError> {
+        self.current_window().scene_fits_atlas(scene)
+    }
+
+    fn enable_text_input(
+        &mut self,
+        context: leyline_gfx::TextInputContext,
+    ) -> Result<Option<u32>, GfxError> {
+        self.current_window_mut().enable_text_input(context)
+    }
+
+    fn update_text_input(
+        &mut self,
+        context: leyline_gfx::TextInputContext,
+    ) -> Result<Option<u32>, GfxError> {
+        self.current_window_mut().update_text_input(context)
+    }
+
+    fn disable_text_input(&mut self) -> Result<Option<u32>, GfxError> {
+        self.current_window_mut().disable_text_input()
+    }
+
+    fn publish_selection(
+        &mut self,
+        target: leyline_gfx::SelectionTarget,
+        source: u64,
+        serial: leyline_gfx::InputSerial,
+    ) -> Result<bool, GfxError> {
+        self.host
+            .window_mut(self.current)
+            .expect("desktop service owner is ready")
+            .publish_selection(target, source, serial)
+    }
+
+    fn receive_selection(
+        &mut self,
+        target: leyline_gfx::SelectionTarget,
+    ) -> Result<Option<std::os::fd::OwnedFd>, GfxError> {
+        self.host
+            .window_mut(self.current)
+            .expect("desktop service owner is ready")
+            .receive_selection(target)
+    }
+
+    fn remove_window(&mut self, id: leyline_gfx::WindowId) -> Result<(), GfxError> {
+        self.host.remove_window(id)
+    }
+
+    fn next_creation_deadline(&self) -> Option<Instant> {
+        self.host.next_creation_deadline()
+    }
+
+    fn expire_creating(&mut self, now: Instant) -> Vec<leyline_gfx::WindowId> {
+        let mut expired = Vec::new();
+        self.host.expire_creating(now, &mut expired);
+        expired
+    }
+
+    fn poll_wait(
+        &mut self,
+        wake: Option<std::os::fd::BorrowedFd<'_>>,
+        timeout: Option<Duration>,
+    ) -> Result<(), GfxError> {
+        self.host.poll_wait(wake, timeout)
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
-pub struct UiRuntime {
+pub struct DesktopRuntime {
     state: RuntimeState,
     app: App,
-    gfx: GfxRuntime,
+    gfx: DesktopGfx,
     wake: EventWake,
-    tabs: TabManager,
+    current_window_id: leyline_gfx::WindowId,
+    sessions: SessionRegistry,
+    session_ids: crate::tab::SessionIdAllocator,
     wake_backend: Arc<dyn WakeBackend>,
-    text: TextSystem,
-    tab_text: TextSystem,
-    layout: GridLayout,
-    layout_generation: u64,
-    text_scale: leyline_gfx::Scale120,
-    resize_settle_deadline: Option<Instant>,
-    font_size: f64,
-    reset_font_size: f64,
-    modifiers: leyline_gfx::ModifiersState,
-    terminal_control_gesture: bool,
-    keyboard_focused: bool,
-    local_pressed_keys: HashSet<(leyline_gfx::SeatToken, u32)>,
-    terminal_pressed_keys: HashMap<(leyline_gfx::SeatToken, u32), PressedTerminalKey>,
-    cursor_blink_visible: bool,
-    cursor_blink_deadline: Option<Instant>,
-    selecting: bool,
-    selection_point: Option<crate::terminal::SelectionPoint>,
-    selection_kind: Option<crate::terminal::SelectionKind>,
-    selection_dragged: bool,
-    click_tracker: ClickTracker,
-    drag_scroll: Option<DragScroll>,
-    link_candidate: Option<LinkCandidate>,
     desktop_launcher: crate::desktop::DesktopLauncher,
-    ime: ImeState,
-    ime_context: Option<leyline_gfx::TextInputContext>,
     clipboard_workers: crate::clipboard::TransferWorkers,
     selection: crate::selection::SelectionController,
-    pending_search_paste: Option<(crate::tab::SessionId, u64)>,
-    last_input_serial: Option<leyline_gfx::InputSerial>,
-    wheel_remainder_120: i32,
-    scrollbar: ScrollbarController,
-    tab_bar: crate::tab::TabBarPresentation,
-    search_dialog: Option<crate::search::SearchDialogPresentation>,
-    search_focused: bool,
-    search_dialog_origin: Option<[u32; 2]>,
-    search_dialog_drag: Option<SearchDialogDrag>,
-    visual_build: Option<PendingVisualBuild>,
-    pending_visual_map: Option<(leyline_gfx::FrameKey, Arc<VisualGridMap>)>,
-    published_visual_map: Option<Arc<VisualGridMap>>,
-    visual_bell: crate::bell::VisualBellState,
     notifications: crate::notification::NotificationWorker,
     sound: crate::sound::SoundWorker,
+    windows: HashMap<leyline_gfx::WindowId, WindowRecord>,
+    pending_platform_events: VecDeque<leyline_gfx::RoutedPlatformEvent>,
+    window_service_cursor: Option<leyline_gfx::WindowId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -113,16 +234,380 @@ struct DragScroll {
     deadline: Instant,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TabDragScroll {
+    direction: i8,
+    deadline: Instant,
+}
+
+enum WindowRecord {
+    Creating {
+        cwd: SpawnDirectory,
+    },
+    Moving {
+        source: leyline_gfx::WindowId,
+        session: crate::tab::SessionId,
+    },
+    Ready(Box<WindowRuntime>),
+    Closing,
+}
+
+struct SessionRegistry {
+    windows: HashMap<leyline_gfx::WindowId, TabManager>,
+    locations: HashMap<crate::tab::SessionId, crate::window::SessionLocation>,
+}
+
+impl SessionRegistry {
+    fn insert(&mut self, window: leyline_gfx::WindowId, tabs: TabManager) {
+        for tab in tabs.tabs() {
+            self.locations
+                .insert(tab.id, crate::window::SessionLocation::Active { window });
+        }
+        assert!(self.windows.insert(window, tabs).is_none());
+    }
+
+    fn get(&self, window: leyline_gfx::WindowId) -> Option<&TabManager> {
+        self.windows.get(&window)
+    }
+
+    fn get_mut(&mut self, window: leyline_gfx::WindowId) -> Option<&mut TabManager> {
+        self.windows.get_mut(&window)
+    }
+
+    fn remove(&mut self, window: leyline_gfx::WindowId) -> Option<TabManager> {
+        let tabs = self.windows.remove(&window)?;
+        self.locations.retain(|_, location| match location {
+            crate::window::SessionLocation::Active { window: owner }
+            | crate::window::SessionLocation::Closing {
+                former_window: owner,
+            }
+            | crate::window::SessionLocation::Moving { source: owner, .. } => *owner != window,
+        });
+        Some(tabs)
+    }
+
+    fn reconcile(&mut self, window: leyline_gfx::WindowId) {
+        let Some(tabs) = self.windows.get(&window) else {
+            return;
+        };
+        let live = tabs
+            .tabs()
+            .iter()
+            .map(|tab| tab.id)
+            .chain(tabs.closing().iter().map(|tab| tab.entry.id))
+            .collect::<HashSet<_>>();
+        self.locations.retain(|session, location| {
+            let owner = match location {
+                crate::window::SessionLocation::Active { window }
+                | crate::window::SessionLocation::Closing {
+                    former_window: window,
+                }
+                | crate::window::SessionLocation::Moving { source: window, .. } => *window,
+            };
+            owner != window || live.contains(session)
+        });
+    }
+
+    fn owner(&self, session: crate::tab::SessionId) -> Option<leyline_gfx::WindowId> {
+        match self.locations.get(&session) {
+            Some(
+                crate::window::SessionLocation::Active { window }
+                | crate::window::SessionLocation::Moving { source: window, .. }
+                | crate::window::SessionLocation::Closing {
+                    former_window: window,
+                },
+            ) => Some(*window),
+            None => None,
+        }
+    }
+
+    fn mark_active(&mut self, session: crate::tab::SessionId, window: leyline_gfx::WindowId) {
+        self.locations
+            .insert(session, crate::window::SessionLocation::Active { window });
+    }
+
+    fn mark_closing(&mut self, session: crate::tab::SessionId, window: leyline_gfx::WindowId) {
+        self.locations.insert(
+            session,
+            crate::window::SessionLocation::Closing {
+                former_window: window,
+            },
+        );
+    }
+
+    fn commit_move_to_new_window(
+        &mut self,
+        source: leyline_gfx::WindowId,
+        target: leyline_gfx::WindowId,
+        session: crate::tab::SessionId,
+        max_tabs: NonZeroU8,
+    ) -> Result<(usize, bool), UiRuntimeError> {
+        if self.windows.contains_key(&target) {
+            return Err(crate::window::WindowError::DuplicateWindow(target).into());
+        }
+        if !self.windows.contains_key(&source) {
+            return Err(crate::window::WindowError::UnknownWindow(source).into());
+        }
+        if self.locations.get(&session)
+            != Some(&crate::window::SessionLocation::Active { window: source })
+        {
+            return Err(crate::window::WindowError::UnknownSession(session).into());
+        }
+        self.locations.insert(
+            session,
+            crate::window::SessionLocation::Moving {
+                token: NonZeroU64::new(target.get()).expect("window ids are non-zero"),
+                source,
+            },
+        );
+        let extracted = self
+            .windows
+            .get_mut(&source)
+            .expect("validated move source is registered")
+            .extract(session);
+        let (entry, from) = match extracted {
+            Ok(value) => value,
+            Err(error) => {
+                self.mark_active(session, source);
+                return Err(error.into());
+            }
+        };
+        let source_empty = self.windows.get(&source).is_some_and(TabManager::is_empty);
+        let previous = self
+            .windows
+            .insert(target, TabManager::bootstrap_entry(entry, max_tabs));
+        assert!(previous.is_none(), "validated move target remains vacant");
+        self.mark_active(session, target);
+        Ok((from, source_empty))
+    }
+}
+
+#[allow(clippy::struct_excessive_bools)]
+pub struct WindowRuntime {
+    text: TextSystem,
+    tab_text: TextSystem,
+    layout: GridLayout,
+    layout_generation: u64,
+    keyboard_focused: bool,
+    tab_bar: crate::tab::TabBarPresentation,
+    window_state: crate::window::WindowStateController,
+    tab_drag: Option<crate::tab::TabDrag>,
+    tab_drag_scroll: Option<TabDragScroll>,
+    text_scale: leyline_gfx::Scale120,
+    resize_settle_deadline: Option<Instant>,
+    font_size: f64,
+    reset_font_size: f64,
+    modifiers: leyline_gfx::ModifiersState,
+    terminal_control_gesture: bool,
+    local_pressed_keys: HashSet<(leyline_gfx::SeatToken, u32)>,
+    terminal_pressed_keys: HashMap<(leyline_gfx::SeatToken, u32), PressedTerminalKey>,
+    cursor_blink_visible: bool,
+    cursor_blink_deadline: Option<Instant>,
+    selecting: bool,
+    selection_point: Option<crate::terminal::SelectionPoint>,
+    selection_kind: Option<crate::terminal::SelectionKind>,
+    selection_dragged: bool,
+    click_tracker: ClickTracker,
+    drag_scroll: Option<DragScroll>,
+    link_candidate: Option<LinkCandidate>,
+    ime: ImeState,
+    ime_context: Option<leyline_gfx::TextInputContext>,
+    pending_search_paste: Option<(crate::tab::SessionId, u64)>,
+    last_input_serial: Option<leyline_gfx::InputSerial>,
+    wheel_remainder_120: i32,
+    scrollbar: ScrollbarController,
+    search_dialog: Option<crate::search::SearchDialogPresentation>,
+    search_focused: bool,
+    search_dialog_origin: Option<[u32; 2]>,
+    search_dialog_drag: Option<SearchDialogDrag>,
+    visual_build: Option<PendingVisualBuild>,
+    pending_visual_map: Option<(leyline_gfx::FrameKey, Arc<VisualGridMap>)>,
+    published_visual_map: Option<Arc<VisualGridMap>>,
+    visual_bell: crate::bell::VisualBellState,
+}
+
+impl WindowRuntime {
+    fn ready(
+        text: TextSystem,
+        tab_text: TextSystem,
+        layout: GridLayout,
+        scale: leyline_gfx::Scale120,
+        font_size: f64,
+        desired_state: crate::window::DesiredWindowState,
+    ) -> Self {
+        Self {
+            text,
+            tab_text,
+            layout,
+            layout_generation: 1,
+            keyboard_focused: false,
+            tab_bar: crate::tab::TabBarPresentation::default(),
+            window_state: crate::window::WindowStateController::new(desired_state),
+            tab_drag: None,
+            tab_drag_scroll: None,
+            text_scale: scale,
+            resize_settle_deadline: None,
+            font_size,
+            reset_font_size: font_size,
+            modifiers: leyline_gfx::ModifiersState::default(),
+            terminal_control_gesture: false,
+            local_pressed_keys: HashSet::new(),
+            terminal_pressed_keys: HashMap::new(),
+            cursor_blink_visible: true,
+            cursor_blink_deadline: None,
+            selecting: false,
+            selection_point: None,
+            selection_kind: None,
+            selection_dragged: false,
+            click_tracker: ClickTracker::default(),
+            drag_scroll: None,
+            link_candidate: None,
+            ime: ImeState::default(),
+            ime_context: None,
+            pending_search_paste: None,
+            last_input_serial: None,
+            wheel_remainder_120: 0,
+            scrollbar: ScrollbarController::default(),
+            search_dialog: None,
+            search_focused: false,
+            search_dialog_origin: None,
+            search_dialog_drag: None,
+            visual_build: None,
+            pending_visual_map: None,
+            published_visual_map: None,
+            visual_bell: crate::bell::VisualBellState::default(),
+        }
+    }
+}
+
+impl Deref for DesktopRuntime {
+    type Target = WindowRuntime;
+
+    fn deref(&self) -> &Self::Target {
+        match self.windows.get(&self.current_window_id) {
+            Some(WindowRecord::Ready(window)) => window,
+            _ => panic!("current window is not ready"),
+        }
+    }
+}
+
+impl DerefMut for DesktopRuntime {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self.windows.get_mut(&self.current_window_id) {
+            Some(WindowRecord::Ready(window)) => window,
+            _ => panic!("current window is not ready"),
+        }
+    }
+}
+
+struct WindowPresentation {
+    text: TextSystem,
+    tab_text: TextSystem,
+    layout: GridLayout,
+}
+
 const DRAG_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
+const WINDOW_STATE_STABILIZATION: Duration = Duration::from_secs(1);
 const CLIPBOARD_RESULT_BUDGET: usize = 2;
 const MAX_PRESSED_KEYS: usize = 256;
+const MAX_PROCESS_SESSIONS: usize = 128;
+const PROCESS_UI_TIME_BUDGET: Duration = Duration::from_millis(8);
+const PROCESS_PLATFORM_EVENT_BUDGET: usize = 256;
 
-impl UiRuntime {
+impl DesktopRuntime {
+    fn current_tabs(&self) -> &TabManager {
+        self.sessions
+            .get(self.current_window_id)
+            .expect("current window sessions are registered")
+    }
+
+    fn current_tabs_mut(&mut self) -> &mut TabManager {
+        self.sessions
+            .get_mut(self.current_window_id)
+            .expect("current window sessions are registered")
+    }
+
+    fn activate_window(&mut self, id: leyline_gfx::WindowId) -> bool {
+        if id == self.current_window_id {
+            return true;
+        }
+        if !matches!(self.windows.get(&id), Some(WindowRecord::Ready(_))) {
+            return false;
+        }
+        self.current_window_id = id;
+        self.gfx.set_current(id);
+        true
+    }
+
+    fn handle_routed_platform_event(
+        &mut self,
+        routed: leyline_gfx::RoutedPlatformEvent,
+    ) -> Result<bool, UiRuntimeError> {
+        if !self.gfx.accepts_surface(routed.surface) {
+            tracing::debug!(
+                category = "stale_platform_event",
+                window_id = routed.surface.window.get(),
+                surface_generation = routed.surface.generation.get(),
+                "discarded event for stale surface"
+            );
+            return Ok(false);
+        }
+        let window = routed.surface.window;
+        if window != self.current_window_id
+            && matches!(self.windows.get(&window), Some(WindowRecord::Ready(_)))
+        {
+            self.activate_window(window);
+        }
+        if window == self.current_window_id {
+            self.handle_window_event(routed.event)
+        } else {
+            self.handle_pending_window_event(window, &routed.event)?;
+            Ok(false)
+        }
+    }
+
+    fn try_render_current_isolated(
+        &mut self,
+        resize_preview: bool,
+    ) -> Result<Option<RenderOutcome>, UiRuntimeError> {
+        let result = if resize_preview {
+            self.gfx.try_render_resize_preview()
+        } else {
+            self.gfx.try_render()
+        };
+        match result {
+            Ok(outcome) => Ok(Some(outcome)),
+            Err(GfxError::Renderer(fault)) if renderer_fault_is_process_fatal(&fault) => {
+                Err(GfxError::Renderer(fault).into())
+            }
+            Err(GfxError::Renderer(fault)) => {
+                let failed = self.current_window_id;
+                tracing::error!(
+                    category = "window_renderer_failed",
+                    current_window_id = failed.get(),
+                    %fault,
+                    "closing only the failed rendering surface"
+                );
+                self.close_current_window()?;
+                Ok(None)
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn activate_session_owner(&mut self, session: crate::tab::SessionId) -> bool {
+        if self.current_tabs_mut().get_mut(session).is_some() {
+            return true;
+        }
+        let owner = self.sessions.owner(session);
+        owner.is_some_and(|owner| self.activate_window(owner))
+    }
+
     fn active_session(&self) -> &TerminalSession {
         &self
-            .tabs
+            .current_tabs()
             .active()
             .expect("running UI has an active tab")
             .session
@@ -130,18 +615,19 @@ impl UiRuntime {
 
     fn active_session_mut(&mut self) -> &mut TerminalSession {
         &mut self
-            .tabs
+            .current_tabs_mut()
             .active_mut()
             .expect("running UI has an active tab")
             .session
     }
 
     #[allow(clippy::too_many_lines)]
-    fn drain_sessions(&mut self) -> Result<(), UiRuntimeError> {
+    fn drain_sessions(&mut self, process_deadline: Instant) -> Result<(), UiRuntimeError> {
         const WINDOW_EVENT_BUDGET: usize = 64;
         const WINDOW_BYTE_BUDGET: usize = 1024 * 1024;
         const WINDOW_TIME_BUDGET: Duration = Duration::from_millis(2);
         let started = Instant::now();
+        let drain_deadline = (started + WINDOW_TIME_BUDGET).min(process_deadline);
         let mut events = 0_usize;
         let mut bytes = 0_usize;
         let mut completed = Vec::new();
@@ -151,11 +637,11 @@ impl UiRuntime {
         let geometry = self.layout.terminal_geometry(self.layout_generation);
         let foreground = self.app.config().colors.foreground.0;
         let background = self.app.config().colors.background.0;
-        for id in self.tabs.drain_order() {
-            let is_active = Some(id) == self.tabs.active_id();
+        for id in self.current_tabs_mut().drain_order() {
+            let is_active = Some(id) == self.current_tabs().active_id();
             let mut incoming = Vec::new();
             let result = self
-                .tabs
+                .current_tabs_mut()
                 .get_mut(id)
                 .expect("drain id exists")
                 .runtime
@@ -177,7 +663,7 @@ impl UiRuntime {
                         if !batch.as_slice().iter().all(|byte| *byte == b'\x07')
                 );
                 let action = match self
-                    .tabs
+                    .current_tabs_mut()
                     .get_mut(id)
                     .expect("drain id exists")
                     .session
@@ -185,21 +671,30 @@ impl UiRuntime {
                 {
                     Ok(action) => action,
                     Err(error) => {
-                        let tab = self.tabs.get_mut(id).expect("drain id exists");
+                        let tab = self
+                            .current_tabs_mut()
+                            .get_mut(id)
+                            .expect("drain id exists");
                         tab.session.mark_failed();
                         tab.runtime.fast_cancel();
                         tracing::warn!(category = "tab_session_failed", session_id = id.get(), %error, "tab session failed");
                         continue;
                     }
                 };
-                if output_activity && id != self.tabs.active_id().expect("active tab") {
-                    bell_presentation_changed |= self.tabs.mark_unread(id);
+                if output_activity && id != self.current_tabs().active_id().expect("active tab") {
+                    bell_presentation_changed |= self.current_tabs_mut().mark_unread(id);
                 }
                 if matches!(action, SessionAction::Completed) {
                     completed.push(id);
                 }
             }
-            let tab = self.tabs.get_mut(id).expect("drain id exists");
+            let window_focused = self.keyboard_focused;
+            let visual_duration = self.app.config().bell.visual_duration;
+            let bell_config = self.app.config().bell.clone();
+            let tab = self
+                .current_tabs_mut()
+                .get_mut(id)
+                .expect("drain id exists");
             for request in tab.session.take_reply_requests() {
                 match request {
                     SessionReplyRequest::Bytes(reply) => {
@@ -222,7 +717,10 @@ impl UiRuntime {
             tab.session.finish_io_round()?;
             let cwd_report = tab.session.take_cwd_report();
             if let Some(report) = cwd_report {
-                match self.tabs.apply_cwd_report(id, report, &local_identity) {
+                match self
+                    .current_tabs_mut()
+                    .apply_cwd_report(id, report, &local_identity)
+                {
                     Some(Ok(())) => tracing::debug!(
                         category = "cwd_report",
                         session_id = id.get(),
@@ -239,7 +737,10 @@ impl UiRuntime {
                     None => {}
                 }
             }
-            let tab = self.tabs.get_mut(id).expect("drain id exists");
+            let tab = self
+                .current_tabs_mut()
+                .get_mut(id)
+                .expect("drain id exists");
             if let Some(title) = tab.session.take_title() {
                 tab.title = match title {
                     crate::session::SessionTitleDelta::Set(title) => title.to_string(),
@@ -254,16 +755,16 @@ impl UiRuntime {
                     crate::bell::BellContext {
                         session_id: id,
                         active: is_active,
-                        window_focused: self.keyboard_focused,
+                        window_focused,
                         muted,
                         session_effects_allowed: allowed,
                     },
-                    &self.app.config().bell,
+                    &bell_config,
                 );
                 let generation = if effects.record_attention_episode {
                     let was_attention = tab.attention;
                     let generation = self
-                        .tabs
+                        .current_tabs_mut()
                         .record_background_bell(id, effects.show_attention_marker)?;
                     bell_presentation_changed |= effects.show_attention_marker && !was_attention;
                     Some(generation)
@@ -271,16 +772,13 @@ impl UiRuntime {
                     None
                 };
                 if effects.schedule_visual {
-                    self.visual_bell.schedule(
-                        id,
-                        Instant::now(),
-                        self.app.config().bell.visual_duration,
-                    );
+                    self.visual_bell
+                        .schedule(id, Instant::now(), visual_duration);
                     bell_presentation_changed = true;
                 }
                 if effects.enqueue_notification {
                     let ordinal = self
-                        .tabs
+                        .current_tabs_mut()
                         .tabs()
                         .iter()
                         .position(|tab| tab.id == id)
@@ -292,7 +790,7 @@ impl UiRuntime {
                             generation,
                             ordinal,
                             Instant::now(),
-                            &self.app.config().bell,
+                            &bell_config,
                         );
                     }
                 }
@@ -302,23 +800,24 @@ impl UiRuntime {
             }
             if events >= WINDOW_EVENT_BUDGET
                 || bytes >= WINDOW_BYTE_BUDGET
-                || (events > 0 && started.elapsed() >= WINDOW_TIME_BUDGET)
+                || (events > 0 && Instant::now() >= drain_deadline)
             {
                 self.wake.signal()?;
                 break;
             }
         }
         for id in completed {
-            if self.tabs.is_empty() {
+            if self.current_tabs().is_empty() {
                 break;
             }
-            if self.tabs.active_id() != Some(id) {
-                let _ = self.tabs.activate(id);
+            if self.current_tabs().active_id() != Some(id) {
+                let _ = self.current_tabs_mut().activate(id);
             }
             self.close_active_tab(ShutdownReason::ChildExited)?;
         }
-        self.tabs.poll_closing(Instant::now())?;
-        if bell_presentation_changed && !self.tabs.is_empty() {
+        self.current_tabs_mut().poll_closing(Instant::now())?;
+        self.sessions.reconcile(self.current_window_id);
+        if bell_presentation_changed && !self.current_tabs().is_empty() {
             self.compose_latest()?;
         }
         Ok(())
@@ -327,20 +826,23 @@ impl UiRuntime {
     fn refresh_active_title(&mut self) -> Result<(), UiRuntimeError> {
         let fallback = launch_title(self.app.launch());
         if let Some(title) = self.active_session_mut().take_title() {
-            self.tabs.active_mut().expect("active tab").title = match title {
+            self.current_tabs_mut()
+                .active_mut()
+                .expect("active tab")
+                .title = match title {
                 crate::session::SessionTitleDelta::Set(title) => title.to_string(),
                 crate::session::SessionTitleDelta::Reset => fallback,
             };
         }
-        let active = self.tabs.active().expect("active tab");
+        let active = self.current_tabs().active().expect("active tab");
         let ordinal = self
-            .tabs
+            .current_tabs()
             .tabs()
             .iter()
             .position(|tab| tab.id == active.id)
             .unwrap_or(0)
             + 1;
-        let title = window_title(ordinal, self.tabs.len(), &active.title);
+        let title = window_title(ordinal, self.current_tabs().len(), &active.title);
         self.gfx.apply(leyline_gfx::GfxCommand::SetTitle(title))?;
         Ok(())
     }
@@ -352,10 +854,36 @@ impl UiRuntime {
     #[allow(clippy::too_many_lines)]
     pub fn new(app: App, app_runtime: AppRuntime, wake: EventWake) -> Result<Self, UiRuntimeError> {
         let clear = LinearColor::from_srgba8(app.config().colors.background.0);
-        let gfx = GfxRuntime::new(&GfxOptions {
+        let bootstrap_request = FontRequest::from_points(
+            app.config().font.family.clone(),
+            app.config().font.size,
+            leyline_gfx::Scale120::ONE.0,
+            app.config().font.ligatures,
+        )?
+        .with_rendering(
+            text_hinting(app.config().font.hinting),
+            text_antialiasing(app.config().font.antialiasing),
+        );
+        let bootstrap_text = TextSystem::new(bootstrap_request)?;
+        let default_size = requested_normal_size(app.config(), bootstrap_text.metrics())?;
+        let mut gfx = GfxRuntime::new(&GfxOptions {
             clear,
+            default_size,
             ..GfxOptions::default()
         })?;
+        let mut desired_window_state = crate::window::DesiredWindowState::default();
+        match app.config().window.startup_state {
+            crate::config::StartupWindowState::Normal => {}
+            crate::config::StartupWindowState::Maximized => {
+                desired_window_state.maximized = true;
+                gfx.apply(leyline_gfx::GfxCommand::RequestMaximized(true))?;
+            }
+            crate::config::StartupWindowState::Fullscreen => {
+                desired_window_state.fullscreen = true;
+                gfx.apply(leyline_gfx::GfxCommand::RequestFullscreen(true))?;
+            }
+        }
+        let gfx = DesktopGfx::adopt_initial(gfx, app.config().window.max_windows);
         let request = FontRequest::from_points(
             app.config().font.family.clone(),
             app.config().font.size,
@@ -403,7 +931,7 @@ impl UiRuntime {
         let layout = GridLayout::calculate_with_style(
             gfx.logical_size(),
             gfx.scale(),
-            content_insets(app.config()),
+            content_insets(app.config(), 1),
             text.metrics(),
             app.config().font.line_spacing,
             text.generation(),
@@ -420,17 +948,15 @@ impl UiRuntime {
         )?;
         let max_count = NonZeroU8::new(app.config().tabs.max_count)
             .ok_or_else(|| UiRuntimeError::Grid("tab count cannot be zero".into()))?;
-        let tabs = TabManager::bootstrap(session, app_runtime, max_count);
+        let mut session_ids = crate::tab::SessionIdAllocator::default();
+        let initial_session_id = session_ids.allocate()?;
+        let tabs =
+            TabManager::bootstrap_with_id(initial_session_id, session, app_runtime, max_count);
         let wake_backend: Arc<dyn WakeBackend> = Arc::new(wake.clone());
         let reset_font_size = app.config().font.size;
         let clipboard_workers = crate::clipboard::TransferWorkers::new(&wake);
-        Ok(Self {
-            state: RuntimeState::Running,
-            app,
-            gfx,
-            wake,
-            tabs,
-            wake_backend,
+        let current_window_id = gfx.current_id();
+        let initial_window = WindowRuntime {
             text,
             tab_text,
             layout,
@@ -442,6 +968,7 @@ impl UiRuntime {
             modifiers: leyline_gfx::ModifiersState::default(),
             terminal_control_gesture: false,
             keyboard_focused: false,
+            window_state: crate::window::WindowStateController::new(desired_window_state),
             local_pressed_keys: HashSet::new(),
             terminal_pressed_keys: HashMap::new(),
             cursor_blink_visible: true,
@@ -453,16 +980,15 @@ impl UiRuntime {
             click_tracker: ClickTracker::default(),
             drag_scroll: None,
             link_candidate: None,
-            desktop_launcher: crate::desktop::DesktopLauncher::new(),
             ime: ImeState::default(),
             ime_context: None,
-            clipboard_workers,
-            selection: crate::selection::SelectionController::default(),
             pending_search_paste: None,
             last_input_serial: None,
             wheel_remainder_120: 0,
             scrollbar: ScrollbarController::default(),
             tab_bar: crate::tab::TabBarPresentation::default(),
+            tab_drag: None,
+            tab_drag_scroll: None,
             search_dialog: None,
             search_focused: false,
             search_dialog_origin: None,
@@ -471,8 +997,37 @@ impl UiRuntime {
             pending_visual_map: None,
             published_visual_map: None,
             visual_bell: crate::bell::VisualBellState::default(),
+        };
+        let windows = HashMap::from([(
+            current_window_id,
+            WindowRecord::Ready(Box::new(initial_window)),
+        )]);
+        let sessions = SessionRegistry {
+            windows: HashMap::from([(current_window_id, tabs)]),
+            locations: HashMap::from([(
+                initial_session_id,
+                crate::window::SessionLocation::Active {
+                    window: current_window_id,
+                },
+            )]),
+        };
+        Ok(Self {
+            state: RuntimeState::Running,
+            app,
+            gfx,
+            wake,
+            current_window_id,
+            sessions,
+            session_ids,
+            wake_backend,
+            desktop_launcher: crate::desktop::DesktopLauncher::new(),
+            clipboard_workers,
+            selection: crate::selection::SelectionController::default(),
             notifications: crate::notification::NotificationWorker::new(),
             sound: crate::sound::SoundWorker::new(),
+            windows,
+            pending_platform_events: VecDeque::new(),
+            window_service_cursor: None,
         })
     }
 
@@ -497,63 +1052,80 @@ impl UiRuntime {
     #[allow(clippy::too_many_lines)]
     fn run_loop(&mut self) -> Result<(), UiRuntimeError> {
         loop {
-            let mut events = Vec::new();
-            self.gfx.dispatch_pending(&mut events)?;
-            for event in events {
-                match event {
-                    PlatformEvent::CloseRequested => {
-                        self.handle_app_event(crate::app::event::AppEvent::ShutdownRequested(
-                            ShutdownReason::UserRequested,
-                        ))?;
+            let round_deadline = Instant::now() + PROCESS_UI_TIME_BUDGET;
+            if self.pending_platform_events.is_empty() {
+                let mut events = Vec::new();
+                self.gfx.dispatch_pending(&mut events)?;
+                self.pending_platform_events.extend(events);
+            }
+            while let Some(routed) = take_priority_close_event(&mut self.pending_platform_events) {
+                let _ = self.handle_routed_platform_event(routed)?;
+            }
+            let mut platform_events = 0_usize;
+            while let Some(routed) = self.pending_platform_events.pop_front() {
+                if self.handle_routed_platform_event(routed)? {
+                    break;
+                }
+                platform_events = platform_events.saturating_add(1);
+                if platform_events >= PROCESS_PLATFORM_EVENT_BUDGET
+                    || Instant::now() >= round_deadline
+                {
+                    if !self.pending_platform_events.is_empty() {
+                        self.wake.signal()?;
                     }
-                    PlatformEvent::Configured { .. } | PlatformEvent::ScaleChanged { .. } => {
-                        self.cancel_pointer_gesture();
-                        self.resize_settle_deadline = Some(Instant::now() + RESIZE_SETTLE_INTERVAL);
-                        self.gfx.acknowledge_resize()?;
-                    }
-                    PlatformEvent::KeyboardFocus { focused, .. } => {
-                        self.keyboard_focused = focused;
-                        self.visual_bell.cancel();
-                        if focused
-                            && let Some(id) = self.tabs.active_id()
-                            && let Some(generation) = self.tabs.acknowledge(id)
-                        {
-                            self.notifications.acknowledge(id, generation);
-                        }
-                        self.active_session_mut().focus_changed(focused)?;
-                        if !focused {
-                            self.local_pressed_keys.clear();
-                            self.terminal_pressed_keys.clear();
-                            self.terminal_control_gesture = false;
-                            self.cancel_paste_confirmation()?;
-                            self.cancel_pointer_gesture();
-                            if let Some(serial) = self.gfx.disable_text_input()? {
-                                self.ime.record_commit_serial(serial);
-                            }
-                            self.ime.deactivate();
-                            self.ime_context = None;
-                        }
-                        self.compose_latest()?;
-                    }
-                    PlatformEvent::Key(key) => self.handle_key(&key)?,
-                    PlatformEvent::ModifiersChanged(modifiers) => self.modifiers_changed(modifiers),
-                    PlatformEvent::Pointer(pointer) => self.handle_pointer(pointer)?,
-                    PlatformEvent::TextInput(event) => self.handle_text_input(event)?,
-                    PlatformEvent::Clipboard(event) => self.handle_clipboard_event(event)?,
-                    PlatformEvent::SurfaceSuspended => self.cancel_pointer_gesture(),
-                    PlatformEvent::FrameReady | PlatformEvent::SurfaceResumed => {}
+                    break;
                 }
             }
+            for id in self.gfx.expire_creating(Instant::now()) {
+                match self.windows.remove(&id) {
+                    Some(WindowRecord::Moving { session, .. }) => tracing::warn!(
+                        category = "tab_move_rolled_back",
+                        current_window_id = id.get(),
+                        session_id = session.get(),
+                        reason = "initial_configure_timeout",
+                        "tab move target timed out"
+                    ),
+                    Some(WindowRecord::Creating { .. }) => tracing::warn!(
+                        category = "window_create_failed",
+                        current_window_id = id.get(),
+                        reason = "initial_configure_timeout",
+                        "new window creation timed out"
+                    ),
+                    Some(WindowRecord::Ready(_) | WindowRecord::Closing) | None => {}
+                }
+            }
+            if self.service_background_windows(round_deadline)? {
+                self.wake.signal()?;
+                continue;
+            }
+            if Instant::now() >= round_deadline {
+                self.wake.signal()?;
+                continue;
+            }
             self.apply_settled_resize()?;
+            if self.window_state.expire(Instant::now()) {
+                tracing::debug!(
+                    category = "window_state_configured",
+                    effective = ?self.window_state.effective(),
+                    "window state request stabilized at compositor state"
+                );
+            }
             self.flush_expired_sync(Instant::now())?;
-            self.drain_sessions()?;
+            self.drain_sessions(round_deadline)?;
             self.notifications.retry_controls();
-            if self.tabs.is_empty() {
+            if self.current_tabs().is_empty() {
+                if self.windows.iter().any(|(id, window)| {
+                    *id != self.current_window_id && matches!(window, WindowRecord::Ready(_))
+                }) {
+                    self.close_current_window()?;
+                    continue;
+                }
                 self.finish_last_tab_shutdown()?;
                 break;
             }
             self.drain_clipboard_results()?;
             self.process_drag_scroll()?;
+            self.process_tab_drag_scroll()?;
             if self.scrollbar.expire(Instant::now()) {
                 self.compose_latest()?;
             }
@@ -573,55 +1145,38 @@ impl UiRuntime {
             if self.poll_shutdown()? {
                 break;
             }
-            let render_timeout = if self.resize_settle_deadline.is_some() {
-                match self.gfx.try_render_resize_preview()? {
-                    RenderOutcome::Deferred => Some(GfxRuntime::retry_delay()),
-                    RenderOutcome::Rendered { committed } => {
-                        if let Some(map) =
-                            take_matching_pending(&mut self.pending_visual_map, committed)
-                        {
-                            let mapping_changed =
-                                visual_mapping_changed(self.published_visual_map.as_deref(), &map);
-                            self.published_visual_map = Some(map);
-                            if mapping_changed {
-                                self.cancel_pointer_gesture();
-                            }
-                            self.refresh_text_input_rectangle()?;
+            let resize_preview = self.resize_settle_deadline.is_some();
+            let Some(render_outcome) = self.try_render_current_isolated(resize_preview)? else {
+                continue;
+            };
+            let render_timeout = match render_outcome {
+                RenderOutcome::Deferred => Some(GfxRuntime::retry_delay()),
+                RenderOutcome::Rendered { committed } => {
+                    if let Some(map) =
+                        take_matching_pending(&mut self.pending_visual_map, committed)
+                    {
+                        let mapping_changed =
+                            visual_mapping_changed(self.published_visual_map.as_deref(), &map);
+                        self.published_visual_map = Some(map);
+                        if mapping_changed {
+                            self.cancel_pointer_gesture();
                         }
-                        None
+                        self.refresh_text_input_rectangle()?;
                     }
-                    RenderOutcome::WaitingForFrame | RenderOutcome::Idle => None,
+                    None
                 }
-            } else {
-                match self.gfx.try_render()? {
-                    RenderOutcome::Deferred => Some(GfxRuntime::retry_delay()),
-                    RenderOutcome::Rendered { committed } => {
-                        if let Some(map) =
-                            take_matching_pending(&mut self.pending_visual_map, committed)
-                        {
-                            let mapping_changed =
-                                visual_mapping_changed(self.published_visual_map.as_deref(), &map);
-                            self.published_visual_map = Some(map);
-                            if mapping_changed {
-                                self.cancel_pointer_gesture();
-                            }
-                            self.refresh_text_input_rectangle()?;
-                        }
-                        None
-                    }
-                    RenderOutcome::WaitingForFrame | RenderOutcome::Idle => None,
-                }
+                RenderOutcome::WaitingForFrame | RenderOutcome::Idle => None,
             };
             let shutdown_poll = self
-                .tabs
+                .current_tabs()
                 .tabs()
                 .iter()
                 .filter_map(|tab| tab.session.shutdown_deadline())
-                .chain(self.tabs.next_closing_deadline())
+                .chain(self.current_tabs().next_closing_deadline())
                 .min()
                 .map(|deadline| deadline.min(Instant::now() + SHUTDOWN_POLL_INTERVAL));
             let sync_deadline = self
-                .tabs
+                .current_tabs_mut()
                 .tabs()
                 .iter()
                 .filter_map(|tab| tab.session.pending_sync().map(|pending| pending.deadline))
@@ -633,18 +1188,59 @@ impl UiRuntime {
                 ),
                 shutdown_poll,
             );
+            let timeout =
+                earliest_timeout(timeout, self.tab_drag_scroll.map(|scroll| scroll.deadline));
             let timeout = earliest_timeout(timeout, self.scrollbar.next_deadline());
             let timeout = earliest_timeout(timeout, sync_deadline);
             let timeout = earliest_timeout(timeout, self.cursor_blink_deadline);
             let timeout = earliest_timeout(timeout, self.visual_bell.deadline());
             let timeout = earliest_timeout(timeout, self.active_session().search().next_deadline());
+            let timeout = earliest_timeout(
+                timeout,
+                self.window_state.pending().map(|pending| pending.deadline),
+            );
+            let timeout = earliest_timeout(timeout, self.gfx.next_creation_deadline());
+            let window_shutdown = self
+                .sessions
+                .windows
+                .values()
+                .filter_map(TabManager::next_closing_deadline)
+                .min();
+            let timeout = earliest_timeout(timeout, window_shutdown);
+            let window_window_state = self
+                .windows
+                .values()
+                .filter_map(|window| match window {
+                    WindowRecord::Ready(window) => window
+                        .window_state
+                        .pending()
+                        .map(|pending| pending.deadline),
+                    WindowRecord::Creating { .. }
+                    | WindowRecord::Moving { .. }
+                    | WindowRecord::Closing => None,
+                })
+                .min();
+            let timeout = earliest_timeout(timeout, window_window_state);
+            let window_tab_drag_scroll = self
+                .windows
+                .values()
+                .filter_map(|window| match window {
+                    WindowRecord::Ready(window) => {
+                        window.tab_drag_scroll.map(|scroll| scroll.deadline)
+                    }
+                    WindowRecord::Creating { .. }
+                    | WindowRecord::Moving { .. }
+                    | WindowRecord::Closing => None,
+                })
+                .min();
+            let timeout = earliest_timeout(timeout, window_tab_drag_scroll);
             let timeout = if self.visual_build.is_some() {
                 Some(Duration::ZERO)
             } else {
                 timeout
             };
             if self
-                .tabs
+                .current_tabs_mut()
                 .tabs()
                 .iter()
                 .all(|tab| tab.runtime.inbox_ref().prepare_to_wait())
@@ -655,6 +1251,60 @@ impl UiRuntime {
         }
         self.app.stop()?;
         Ok(())
+    }
+
+    /// Routes one event for the bootstrap window through the same tagged host stream as every
+    /// other surface. Returning true stops the current dispatch batch after the window closes.
+    fn handle_window_event(&mut self, event: PlatformEvent) -> Result<bool, UiRuntimeError> {
+        match event {
+            PlatformEvent::CloseRequested => {
+                self.close_current_window()?;
+                return Ok(true);
+            }
+            PlatformEvent::Configured { state, .. } => {
+                self.window_state.configured(state);
+                self.cancel_pointer_gesture();
+                self.resize_settle_deadline = Some(Instant::now() + RESIZE_SETTLE_INTERVAL);
+                self.gfx.acknowledge_resize()?;
+            }
+            PlatformEvent::ScaleChanged { .. } => {
+                self.cancel_pointer_gesture();
+                self.resize_settle_deadline = Some(Instant::now() + RESIZE_SETTLE_INTERVAL);
+                self.gfx.acknowledge_resize()?;
+            }
+            PlatformEvent::KeyboardFocus { focused, .. } => {
+                self.keyboard_focused = focused;
+                self.visual_bell.cancel();
+                if focused
+                    && let Some(id) = self.current_tabs().active_id()
+                    && let Some(generation) = self.current_tabs_mut().acknowledge(id)
+                {
+                    self.notifications.acknowledge(id, generation);
+                }
+                self.active_session_mut().focus_changed(focused)?;
+                if !focused {
+                    self.local_pressed_keys.clear();
+                    self.terminal_pressed_keys.clear();
+                    self.terminal_control_gesture = false;
+                    self.cancel_paste_confirmation()?;
+                    self.cancel_pointer_gesture();
+                    if let Some(serial) = self.gfx.disable_text_input()? {
+                        self.ime.record_commit_serial(serial);
+                    }
+                    self.ime.deactivate();
+                    self.ime_context = None;
+                }
+                self.compose_latest()?;
+            }
+            PlatformEvent::Key(key) => self.handle_key(&key)?,
+            PlatformEvent::ModifiersChanged(modifiers) => self.modifiers_changed(modifiers),
+            PlatformEvent::Pointer(pointer) => self.handle_pointer(pointer)?,
+            PlatformEvent::TextInput(event) => self.handle_text_input(event)?,
+            PlatformEvent::Clipboard(event) => self.handle_clipboard_event(event)?,
+            PlatformEvent::SurfaceSuspended => self.cancel_pointer_gesture(),
+            PlatformEvent::FrameReady | PlatformEvent::SurfaceResumed => {}
+        }
+        Ok(false)
     }
 
     fn finish_last_tab_shutdown(&mut self) -> Result<(), UiRuntimeError> {
@@ -678,22 +1328,22 @@ impl UiRuntime {
             error_category = ?category,
             "runtime entered fatal shutdown"
         );
-        for tab in self.tabs.tabs_mut() {
+        for tab in self.current_tabs_mut().tabs_mut() {
             tab.runtime.fast_cancel();
         }
         let _ = self.app.request_shutdown(ShutdownReason::PlatformFailure);
-        for tab in self.tabs.tabs_mut() {
+        for tab in self.current_tabs_mut().tabs_mut() {
             tab.session.begin_shutdown();
         }
 
         while let Some(deadline) = self
-            .tabs
+            .current_tabs_mut()
             .tabs()
             .iter()
             .filter_map(|tab| tab.session.shutdown_deadline())
             .max()
         {
-            let pending = self.tabs.tabs_mut().iter_mut().any(|tab| {
+            let pending = self.current_tabs_mut().tabs_mut().iter_mut().any(|tab| {
                 matches!(
                     tab.session.poll_shutdown(Instant::now()),
                     Ok(ShutdownPoll::Pending)
@@ -712,15 +1362,15 @@ impl UiRuntime {
     }
 
     fn poll_shutdown(&mut self) -> Result<bool, UiRuntimeError> {
-        self.tabs.poll_closing(Instant::now())?;
+        self.current_tabs_mut().poll_closing(Instant::now())?;
         if matches!(self.app.lifecycle(), crate::app::Lifecycle::ShuttingDown(_))
-            && self.tabs.is_empty()
-            && self.tabs.closing_is_empty()
+            && self.current_tabs().is_empty()
+            && self.current_tabs().closing_is_empty()
         {
             return Ok(true);
         }
         if self
-            .tabs
+            .current_tabs_mut()
             .tabs()
             .iter()
             .all(|tab| tab.session.shutdown_deadline().is_none())
@@ -729,7 +1379,7 @@ impl UiRuntime {
         }
         let mut pending = false;
         let mut timed_out = false;
-        for tab in self.tabs.tabs_mut() {
+        for tab in self.current_tabs_mut().tabs_mut() {
             match tab.session.poll_shutdown(Instant::now())? {
                 ShutdownPoll::Pending => pending = true,
                 ShutdownPoll::TimedOut => timed_out = true,
@@ -746,7 +1396,7 @@ impl UiRuntime {
                     "PTY shutdown exceeded the 2 second completion deadline; detached owned workers"
                 );
             }
-            for tab in self.tabs.tabs_mut() {
+            for tab in self.current_tabs_mut().tabs_mut() {
                 tab.runtime.fast_cancel();
             }
             Ok(true)
@@ -783,21 +1433,21 @@ impl UiRuntime {
         let layout = GridLayout::calculate_with_style(
             logical,
             scale,
-            content_insets(self.app.config()),
+            content_insets(self.app.config(), self.current_tabs().len()),
             prepared.metrics(),
             self.app.config().font.line_spacing,
             prepared.generation(),
         )?;
         let grid_changed = self.layout.grid != layout.grid;
         let tab_bar = crate::tab::TabBarPresentation::layout(
-            &self.tabs,
+            self.current_tabs(),
             layout.viewport_px.width,
             scale.0,
             &self.app.config().tabs,
             self.tab_bar.offset,
         );
         if grid_changed {
-            for tab in self.tabs.tabs_mut() {
+            for tab in self.current_tabs_mut().tabs_mut() {
                 if let Err(error) = tab.session.resize(layout.grid) {
                     tab.session.mark_failed();
                     tab.runtime.fast_cancel();
@@ -834,14 +1484,14 @@ impl UiRuntime {
         let layout = GridLayout::calculate_with_style(
             logical,
             scale,
-            content_insets(self.app.config()),
+            content_insets(self.app.config(), self.current_tabs().len()),
             self.text.metrics(),
             self.app.config().font.line_spacing,
             self.text.generation(),
         )?;
         let grid_changed = self.layout.grid != layout.grid;
         if grid_changed {
-            for tab in self.tabs.tabs_mut() {
+            for tab in self.current_tabs_mut().tabs_mut() {
                 if let Err(error) = tab.session.resize(layout.grid) {
                     tab.session.mark_failed();
                     tab.runtime.fast_cancel();
@@ -878,7 +1528,7 @@ impl UiRuntime {
     }
 
     fn flush_expired_sync(&mut self, now: Instant) -> Result<(), UiRuntimeError> {
-        for tab in self.tabs.tabs_mut() {
+        for tab in self.current_tabs_mut().tabs_mut() {
             if let Some(pending) = tab.session.pending_sync()
                 && now >= pending.deadline
             {
@@ -947,7 +1597,7 @@ impl UiRuntime {
                 if let Some(request) = cancellation.request {
                     self.clipboard_workers.cancel(request.get());
                 }
-                for tab in self.tabs.tabs_mut() {
+                for tab in self.current_tabs_mut().tabs_mut() {
                     tab.runtime.fast_cancel();
                     tab.session.begin_shutdown();
                 }
@@ -1031,7 +1681,7 @@ impl UiRuntime {
         }
         let pressed = PressedTerminalKey {
             owner: self
-                .tabs
+                .current_tabs_mut()
                 .active_id()
                 .expect("runtime always has an active tab"),
             identity: key.identity,
@@ -1083,7 +1733,7 @@ impl UiRuntime {
             kind,
             associated_text_allowed: pressed.associated_text_allowed,
         };
-        let Some(owner) = self.tabs.get_mut(pressed.owner) else {
+        let Some(owner) = self.current_tabs_mut().get_mut(pressed.owner) else {
             return Ok(());
         };
         let current_process_group = owner.session.foreground_process_group();
@@ -1103,7 +1753,7 @@ impl UiRuntime {
             && pressed.associated_text_allowed
             && let Some(text) = text
         {
-            let Some(owner) = self.tabs.get_mut(pressed.owner) else {
+            let Some(owner) = self.current_tabs_mut().get_mut(pressed.owner) else {
                 return Ok(());
             };
             owner.session.commit_text(&text)?;
@@ -1169,9 +1819,16 @@ impl UiRuntime {
                 | crate::config::Action::ScrollPageUp
                 | crate::config::Action::ScrollPageDown
                 | crate::config::Action::NewTab
+                | crate::config::Action::NewWindow
                 | crate::config::Action::CloseTab
                 | crate::config::Action::PreviousTab
                 | crate::config::Action::NextTab
+                | crate::config::Action::MoveTabLeft
+                | crate::config::Action::MoveTabRight
+                | crate::config::Action::MoveTabToNewWindow
+                | crate::config::Action::ToggleFullscreen
+                | crate::config::Action::ToggleMaximized
+                | crate::config::Action::RestoreWindow
                 | crate::config::Action::ActivateTab(_)
                 | crate::config::Action::ToggleBellMute
                 | crate::config::Action::Search
@@ -1456,36 +2113,42 @@ impl UiRuntime {
                 Instant::now(),
             )
         });
+        let visual_bell_active = self
+            .current_tabs_mut()
+            .active_id()
+            .is_some_and(|id| self.visual_bell.active_for(id, Instant::now()));
+        let colors = self.app.config().colors.clone();
+        let current = self.current_window_id;
+        let Some(WindowRecord::Ready(window)) = self.windows.get_mut(&current) else {
+            return Err(UiRuntimeError::Grid("current window is not ready".into()));
+        };
         let mut scene = compose(
-            &mut self.text,
-            &mut self.tab_text,
+            &mut window.text,
+            &mut window.tab_text,
             snapshot,
             FrameOverlays {
                 selection: &selection,
                 search: search.as_ref(),
                 preedit: (!search_focused)
-                    .then_some(self.ime.preedit.as_ref())
+                    .then_some(window.ime.preedit.as_ref())
                     .flatten(),
                 paste_confirmation: paste_confirmation.as_ref(),
                 scrollbar: scrollbar.as_ref(),
-                tab_bar: Some(&self.tab_bar),
+                tab_bar: Some(&window.tab_bar),
                 search_dialog: search_dialog.as_ref(),
                 visual_bell: Some(&crate::bell::VisualBellPresentation {
-                    active: self
-                        .tabs
-                        .active_id()
-                        .is_some_and(|id| self.visual_bell.active_for(id, Instant::now())),
+                    active: visual_bell_active,
                     color: 0xff5a_3628,
                     intensity: 1.0,
                 }),
             },
-            &self.layout,
-            &self.app.config().colors,
+            &window.layout,
+            &colors,
             crate::frame_composer::CursorPresentationPolicy {
-                blink_phase_visible: self.cursor_blink_visible,
+                blink_phase_visible: window.cursor_blink_visible,
             },
             &visual_map,
-            self.layout_generation,
+            window.layout_generation,
         )?;
         if !self.gfx.scene_fits_atlas(&scene)? {
             if !downgrade_color_working_set(&mut scene) {
@@ -1505,7 +2168,7 @@ impl UiRuntime {
 
     fn update_tab_bar(&mut self) {
         self.tab_bar = crate::tab::TabBarPresentation::layout(
-            &self.tabs,
+            self.current_tabs(),
             self.layout.viewport_px.width,
             self.gfx.scale().0,
             &self.app.config().tabs,
@@ -1633,7 +2296,7 @@ impl UiRuntime {
     ) -> Result<bool, UiRuntimeError> {
         let resume_ime = self.selection.modal_ime_suspended();
         let active = self
-            .tabs
+            .current_tabs_mut()
             .active_id()
             .expect("runtime always has an active tab");
         let outcome = self.selection.confirmation_input(key, active);
@@ -1668,6 +2331,7 @@ impl UiRuntime {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn execute_action(&mut self, action: crate::config::Action) -> Result<(), UiRuntimeError> {
         use crate::config::Action;
         match action {
@@ -1677,7 +2341,7 @@ impl UiRuntime {
             Action::PasteClipboard => {
                 if self.search_focused && self.active_session().search().is_open() {
                     self.pending_search_paste = Some((
-                        self.tabs.active_id().expect("active tab"),
+                        self.current_tabs().active_id().expect("active tab"),
                         self.active_session().search().revision(),
                     ));
                 } else {
@@ -1716,13 +2380,58 @@ impl UiRuntime {
                 self.request_paste(leyline_gfx::SelectionTarget::Primary)?;
             }
             Action::NewTab => self.new_tab()?,
+            Action::NewWindow => self.new_window()?,
+            Action::MoveTabToNewWindow => self.move_active_tab_to_new_window(),
             Action::CloseTab => self.close_active_tab(ShutdownReason::UserRequested)?,
             Action::PreviousTab => self.switch_relative(-1)?,
             Action::NextTab => self.switch_relative(1)?,
+            Action::MoveTabLeft | Action::MoveTabRight => {
+                let delta = if action == Action::MoveTabLeft { -1 } else { 1 };
+                if let crate::tab::ReorderOutcome::Changed { from, to } =
+                    self.current_tabs_mut().move_active(delta)?
+                {
+                    tracing::info!(
+                        category = "tab_reorder_committed",
+                        from,
+                        to,
+                        "tab reordered"
+                    );
+                    self.update_tab_bar();
+                    self.compose_latest()?;
+                }
+            }
+            Action::ToggleFullscreen => {
+                let target = !self.window_state.desired().fullscreen;
+                self.window_state.request(
+                    crate::window::WindowStateRequest::SetFullscreen(target),
+                    Instant::now(),
+                    WINDOW_STATE_STABILIZATION,
+                )?;
+                self.gfx
+                    .apply(leyline_gfx::GfxCommand::RequestFullscreen(target))?;
+            }
+            Action::ToggleMaximized => {
+                let target = !self.window_state.desired().maximized;
+                self.window_state.request(
+                    crate::window::WindowStateRequest::SetMaximized(target),
+                    Instant::now(),
+                    WINDOW_STATE_STABILIZATION,
+                )?;
+                self.gfx
+                    .apply(leyline_gfx::GfxCommand::RequestMaximized(target))?;
+            }
+            Action::RestoreWindow => {
+                self.window_state.request(
+                    crate::window::WindowStateRequest::Restore,
+                    Instant::now(),
+                    WINDOW_STATE_STABILIZATION,
+                )?;
+                self.gfx.apply(leyline_gfx::GfxCommand::RequestRestore)?;
+            }
             Action::ActivateTab(ordinal) => self.switch_ordinal(ordinal)?,
             Action::ToggleBellMute => {
-                let id = self.tabs.active_id().expect("active tab");
-                let (muted, invalidated) = self.tabs.toggle_bell_mute(id)?;
+                let id = self.current_tabs().active_id().expect("active tab");
+                let (muted, invalidated) = self.current_tabs_mut().toggle_bell_mute(id)?;
                 if muted {
                     self.visual_bell.cancel();
                 }
@@ -1770,11 +2479,12 @@ impl UiRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn new_tab(&mut self) -> Result<(), UiRuntimeError> {
         if !matches!(self.app.lifecycle(), crate::app::Lifecycle::Running) {
             return Ok(());
         }
-        if !self.tabs.has_capacity() {
+        if !self.current_tabs().has_capacity() {
             tracing::warn!(
                 category = "tab_create_failed",
                 limit = self.app.config().tabs.max_count,
@@ -1782,10 +2492,18 @@ impl UiRuntime {
             );
             return Ok(());
         }
-        let source_id = self.tabs.active_id();
+        if self.process_session_count() >= MAX_PROCESS_SESSIONS {
+            tracing::warn!(
+                category = "tab_create_failed",
+                limit = MAX_PROCESS_SESSIONS,
+                "process session limit reached"
+            );
+            return Ok(());
+        }
+        let source_id = self.current_tabs().active_id();
         let (primary, origin) = select_new_tab_cwd(
             &self.app.config().tabs.new_tab_cwd,
-            self.tabs.active(),
+            self.current_tabs().active(),
             self.app.launch_context(),
         );
         let base = &self.app.launch_context().base_cwd;
@@ -1838,20 +2556,29 @@ impl UiRuntime {
                 return Ok(());
             }
         };
+        let tab_bar_was_visible = tab_bar_visible(self.app.config(), self.current_tabs().len());
         self.quiesce_active_interaction()?;
+        let id = self.session_ids.allocate()?;
+        let title = launch_title(self.app.launch());
         match self
-            .tabs
-            .push(session, runtime, launch_title(self.app.launch()))
+            .current_tabs_mut()
+            .push_with_id(id, session, runtime, title)
         {
-            Ok(id) => tracing::info!(
-                category = "tab_created",
-                session_id = id.get(),
-                cwd_origin = final_origin,
-                "tab created"
-            ),
+            Ok(id) => {
+                self.sessions.mark_active(id, self.current_window_id);
+                tracing::info!(
+                    category = "tab_created",
+                    session_id = id.get(),
+                    cwd_origin = final_origin,
+                    "tab created"
+                );
+            }
             Err(error) => {
                 tracing::warn!(category = "tab_create_failed", %error, "could not create tab");
             }
+        }
+        if tab_bar_was_visible != tab_bar_visible(self.app.config(), self.current_tabs().len()) {
+            self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), self.font_size)?;
         }
         self.restore_active_interaction()?;
         let snapshot = self.active_session_mut().end_drain_round()?;
@@ -1861,11 +2588,534 @@ impl UiRuntime {
         self.refresh_active_title()
     }
 
+    fn new_window(&mut self) -> Result<(), UiRuntimeError> {
+        if !matches!(self.app.lifecycle(), crate::app::Lifecycle::Running) {
+            return Ok(());
+        }
+        if self.process_session_count() >= MAX_PROCESS_SESSIONS {
+            tracing::warn!(
+                category = "window_create_failed",
+                limit = MAX_PROCESS_SESSIONS,
+                reason = "process_session_limit",
+                "new window request failed"
+            );
+            return Ok(());
+        }
+        let (candidate, _) = select_new_tab_cwd(
+            &self.app.config().tabs.new_tab_cwd,
+            self.current_tabs().active(),
+            self.app.launch_context(),
+        );
+        let cwd = SpawnDirectory::open(&candidate)
+            .or_else(|_| SpawnDirectory::open(&self.app.launch_context().base_cwd))?;
+        let request = self.gfx.create_window(&GfxOptions {
+            title: "Leyline".into(),
+            default_size: self.gfx.logical_size(),
+            clear: LinearColor::from_srgba8(self.app.config().colors.background.0),
+        });
+        let id = match request {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::warn!(
+                    category = "window_create_failed",
+                    %error,
+                    "new window request failed"
+                );
+                return Ok(());
+            }
+        };
+        self.windows.insert(id, WindowRecord::Creating { cwd });
+        tracing::info!(
+            category = "window_create_requested",
+            current_window_id = id.get(),
+            "new window requested"
+        );
+        Ok(())
+    }
+
+    fn move_active_tab_to_new_window(&mut self) {
+        let Some(session) = self.current_tabs().active_id() else {
+            return;
+        };
+        let request = self.gfx.create_window(&GfxOptions {
+            title: "Leyline".into(),
+            default_size: self.gfx.logical_size(),
+            clear: LinearColor::from_srgba8(self.app.config().colors.background.0),
+        });
+        let id = match request {
+            Ok(id) => id,
+            Err(error) => {
+                tracing::warn!(
+                    category = "tab_move_rolled_back",
+                    session_id = session.get(),
+                    %error,
+                    "tab move target request failed"
+                );
+                return;
+            }
+        };
+        self.windows.insert(
+            id,
+            WindowRecord::Moving {
+                source: self.current_window_id,
+                session,
+            },
+        );
+        tracing::info!(
+            category = "tab_move_prepared",
+            current_window_id = id.get(),
+            session_id = session.get(),
+            "tab move target requested"
+        );
+    }
+
+    fn handle_pending_window_event(
+        &mut self,
+        id: leyline_gfx::WindowId,
+        event: &PlatformEvent,
+    ) -> Result<(), UiRuntimeError> {
+        match event {
+            PlatformEvent::Configured { .. }
+                if matches!(self.windows.get(&id), Some(WindowRecord::Creating { .. })) =>
+            {
+                self.finish_window_creation(id)?;
+            }
+            PlatformEvent::Configured { .. }
+                if matches!(self.windows.get(&id), Some(WindowRecord::Moving { .. })) =>
+            {
+                self.finish_tab_move(id)?;
+            }
+            PlatformEvent::CloseRequested => {
+                if let Some(WindowRecord::Moving { session, .. }) = self.windows.remove(&id) {
+                    tracing::info!(
+                        category = "tab_move_rolled_back",
+                        current_window_id = id.get(),
+                        session_id = session.get(),
+                        reason = "target_closed",
+                        "tab move target closed before commit"
+                    );
+                }
+                self.gfx.remove_window(id)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn finish_window_creation(&mut self, id: leyline_gfx::WindowId) -> Result<(), UiRuntimeError> {
+        let Some(WindowRecord::Creating { cwd }) = self.windows.remove(&id) else {
+            return Ok(());
+        };
+        if self.gfx.window(id).is_none() {
+            self.windows.insert(id, WindowRecord::Creating { cwd });
+            return Ok(());
+        }
+        let prepared = (|| {
+            let presentation = self.prepare_window_presentation(id)?;
+            let session_id = self.session_ids.allocate()?;
+            let runtime = AppRuntimeBuilder::new(self.wake_backend.clone()).build()?;
+            let session = TerminalSession::start(
+                self.app.launch(),
+                cwd,
+                self.app.config(),
+                presentation.layout.grid,
+                &runtime,
+            )?;
+            Ok::<_, UiRuntimeError>((presentation, session_id, runtime, session))
+        })();
+        let (presentation, session_id, runtime, session) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.gfx.remove_window(id)?;
+                tracing::warn!(
+                    category = "window_create_failed",
+                    current_window_id = id.get(),
+                    reason = ?error.category(),
+                    "new window preparation failed"
+                );
+                return Ok(());
+            }
+        };
+        let scale = self
+            .gfx
+            .window(id)
+            .expect("configured window has graphics state")
+            .scale();
+        let font_size = self.app.config().font.size;
+        self.sessions.insert(
+            id,
+            TabManager::bootstrap_with_id(
+                session_id,
+                session,
+                runtime,
+                window_tab_limit(self.app.config()),
+            ),
+        );
+        self.windows.insert(
+            id,
+            WindowRecord::Ready(Box::new(WindowRuntime::ready(
+                presentation.text,
+                presentation.tab_text,
+                presentation.layout,
+                scale,
+                font_size,
+                crate::window::DesiredWindowState::default(),
+            ))),
+        );
+        self.reconfigure_window_layout(id)?;
+        tracing::info!(
+            category = "window_create_committed",
+            current_window_id = id.get(),
+            session_id = session_id.get(),
+            "new window ready"
+        );
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn finish_tab_move(&mut self, id: leyline_gfx::WindowId) -> Result<(), UiRuntimeError> {
+        let Some(WindowRecord::Moving { source, session }) = self.windows.remove(&id) else {
+            return Ok(());
+        };
+        let source_exists = self
+            .sessions
+            .get(source)
+            .is_some_and(|tabs| tabs.tabs().iter().any(|tab| tab.id == session));
+        if !source_exists {
+            self.gfx.remove_window(id)?;
+            tracing::info!(
+                category = "tab_move_rolled_back",
+                current_window_id = id.get(),
+                session_id = session.get(),
+                reason = "source_changed",
+                "tab move rolled back"
+            );
+            return Ok(());
+        }
+        if self.gfx.window(id).is_none() {
+            self.windows
+                .insert(id, WindowRecord::Moving { source, session });
+            return Ok(());
+        }
+        let presentation = match self.prepare_window_presentation(id) {
+            Ok(presentation) => presentation,
+            Err(error) => {
+                self.gfx.remove_window(id)?;
+                tracing::warn!(
+                    category = "tab_move_rolled_back",
+                    current_window_id = id.get(),
+                    session_id = session.get(),
+                    reason = ?error.category(),
+                    "tab move target preparation failed"
+                );
+                return Ok(());
+            }
+        };
+
+        if !self.activate_window(source) {
+            self.gfx.remove_window(id)?;
+            return Ok(());
+        }
+        self.quiesce_active_interaction()?;
+        let scale = self
+            .gfx
+            .window(id)
+            .expect("configured window has graphics state")
+            .scale();
+        let font_size = self.app.config().font.size;
+        let (from, source_empty) = self.sessions.commit_move_to_new_window(
+            source,
+            id,
+            session,
+            window_tab_limit(self.app.config()),
+        )?;
+        self.windows.insert(
+            id,
+            WindowRecord::Ready(Box::new(WindowRuntime::ready(
+                presentation.text,
+                presentation.tab_text,
+                presentation.layout,
+                scale,
+                font_size,
+                crate::window::DesiredWindowState::default(),
+            ))),
+        );
+        self.activate_window(id);
+        let target_tab = self
+            .sessions
+            .get_mut(id)
+            .and_then(TabManager::active_mut)
+            .expect("committed move target owns the moved session");
+        if let Err(error) = target_tab.session.focus_changed(false) {
+            target_tab.session.mark_failed();
+            target_tab.runtime.fast_cancel();
+            tracing::warn!(
+                category = "tab_session_failed",
+                session_id = session.get(),
+                %error,
+                "moved tab focus transition failed"
+            );
+        }
+        if let Err(error) = target_tab.session.resize(presentation.layout.grid) {
+            target_tab.session.mark_failed();
+            target_tab.runtime.fast_cancel();
+            tracing::warn!(
+                category = "tab_session_failed",
+                session_id = session.get(),
+                %error,
+                "moved tab resize failed"
+            );
+        }
+        self.reconfigure_window_layout(id)?;
+        if source_empty {
+            self.close_window_window(source)?;
+        } else {
+            self.activate_window(source);
+            self.reconfigure_window_layout(source)?;
+            self.restore_active_interaction()?;
+            self.refresh_active_title()?;
+            self.activate_window(id);
+        }
+        let source_current_window_id = source.get();
+        tracing::info!(
+            category = "tab_move_committed",
+            source_current_window_id,
+            target_current_window_id = id.get(),
+            session_id = session.get(),
+            from,
+            "tab moved without restarting PTY"
+        );
+        Ok(())
+    }
+
+    fn prepare_window_presentation(
+        &self,
+        id: leyline_gfx::WindowId,
+    ) -> Result<WindowPresentation, UiRuntimeError> {
+        let gfx = self
+            .gfx
+            .window(id)
+            .ok_or_else(|| UiRuntimeError::Grid("window window is not configured".into()))?;
+        let logical = gfx.logical_size();
+        let scale = gfx.scale();
+        let request = FontRequest::from_points(
+            self.app.config().font.family.clone(),
+            self.app.config().font.size,
+            scale.0,
+            self.app.config().font.ligatures,
+        )?
+        .with_rendering(
+            text_hinting(self.app.config().font.hinting),
+            text_antialiasing(self.app.config().font.antialiasing),
+        )
+        .with_color_glyphs(self.app.config().unicode.color_glyphs && gfx.color_glyphs_supported());
+        let text = TextSystem::new(request)?;
+        let tab_text = TextSystem::new(tab_font_request(self.app.config().font.size, scale.0)?)?;
+        let layout = GridLayout::calculate_with_style(
+            logical,
+            scale,
+            content_insets(self.app.config(), 1),
+            text.metrics(),
+            self.app.config().font.line_spacing,
+            text.generation(),
+        )?;
+        Ok(WindowPresentation {
+            text,
+            tab_text,
+            layout,
+        })
+    }
+
+    fn reconfigure_window_layout(
+        &mut self,
+        id: leyline_gfx::WindowId,
+    ) -> Result<(), UiRuntimeError> {
+        let Some(gfx) = self.gfx.window(id) else {
+            return Ok(());
+        };
+        let (logical, scale) = (gfx.logical_size(), gfx.scale());
+        let Some(tabs) = self.sessions.get_mut(id) else {
+            return Ok(());
+        };
+        let Some(WindowRecord::Ready(window)) = self.windows.get_mut(&id) else {
+            return Ok(());
+        };
+        let layout = GridLayout::calculate_with_style(
+            logical,
+            scale,
+            content_insets(self.app.config(), tabs.len()),
+            window.text.metrics(),
+            self.app.config().font.line_spacing,
+            window.text.generation(),
+        )?;
+        if layout.grid != window.layout.grid {
+            for tab in tabs.tabs_mut() {
+                tab.session.resize(layout.grid)?;
+            }
+        }
+        window.tab_bar = crate::tab::TabBarPresentation::layout(
+            tabs,
+            layout.viewport_px.width,
+            scale.0,
+            &self.app.config().tabs,
+            window.tab_bar.offset,
+        );
+        window.layout = layout;
+        window.layout_generation = window.layout_generation.saturating_add(1);
+        Ok(())
+    }
+
+    fn process_session_count(&self) -> usize {
+        self.sessions
+            .windows
+            .values()
+            .map(TabManager::total_len)
+            .sum::<usize>()
+            .saturating_add(
+                self.windows
+                    .values()
+                    .filter(|window| matches!(window, WindowRecord::Creating { .. }))
+                    .count(),
+            )
+    }
+
+    fn close_window_window(&mut self, id: leyline_gfx::WindowId) -> Result<(), UiRuntimeError> {
+        let Some(window) = self.windows.remove(&id) else {
+            return Ok(());
+        };
+        self.gfx.remove_window(id)?;
+        let session_id = match &window {
+            WindowRecord::Ready(_) => self
+                .sessions
+                .get(id)
+                .and_then(TabManager::active_id)
+                .map(crate::tab::SessionId::get),
+            WindowRecord::Creating { .. } | WindowRecord::Moving { .. } | WindowRecord::Closing => {
+                None
+            }
+        };
+        if matches!(window, WindowRecord::Ready(_)) {
+            let mut closing = Vec::new();
+            if let Some(tabs) = self.sessions.get_mut(id) {
+                while let Some(session) = tabs.close_active() {
+                    closing.push(session);
+                }
+            }
+            for session in closing {
+                self.sessions.mark_closing(session, id);
+            }
+            self.windows.insert(id, WindowRecord::Closing);
+        }
+        tracing::info!(
+            category = "window_close_started",
+            current_window_id = id.get(),
+            session_id,
+            "window window closing"
+        );
+        Ok(())
+    }
+
+    fn close_current_window(&mut self) -> Result<(), UiRuntimeError> {
+        let closing = self.current_window_id;
+        let next = self.windows.iter().find_map(|(id, window)| {
+            (*id != closing && matches!(window, WindowRecord::Ready(_))).then_some(*id)
+        });
+        let Some(next) = next else {
+            self.handle_app_event(crate::app::event::AppEvent::ShutdownRequested(
+                ShutdownReason::UserRequested,
+            ))?;
+            return Ok(());
+        };
+        self.activate_window(next);
+        self.close_window_window(closing)
+    }
+
+    fn service_background_windows(
+        &mut self,
+        process_deadline: Instant,
+    ) -> Result<bool, UiRuntimeError> {
+        let original = self.current_window_id;
+        let mut ids = self
+            .windows
+            .iter()
+            .filter_map(|(id, window)| {
+                (*id != original && matches!(window, WindowRecord::Ready(_))).then_some(*id)
+            })
+            .collect::<Vec<_>>();
+        rotate_window_service_order(&mut ids, self.window_service_cursor);
+        for id in ids {
+            if Instant::now() >= process_deadline {
+                self.activate_window(original);
+                return Ok(true);
+            }
+            if !self.activate_window(id) {
+                continue;
+            }
+            self.window_service_cursor = Some(id);
+            self.apply_settled_resize()?;
+            self.flush_expired_sync(Instant::now())?;
+            self.drain_sessions(process_deadline)?;
+            if self.current_tabs().is_empty() {
+                self.close_current_window()?;
+                continue;
+            }
+            self.process_drag_scroll()?;
+            self.process_tab_drag_scroll()?;
+            if self.scrollbar.expire(Instant::now()) || self.visual_bell.expire(Instant::now()) {
+                self.compose_latest()?;
+            }
+            let search_effect = self.active_session_mut().advance_search(Instant::now())?;
+            if search_effect.needs_frame && search_effect.scroll_target.is_none() {
+                self.compose_latest()?;
+            }
+            if let Some(snapshot) = self.active_session_mut().end_drain_round()? {
+                self.compose_snapshot(&snapshot)?;
+            }
+            self.advance_visual_build()?;
+            self.advance_cursor_blink(Instant::now())?;
+            self.refresh_active_title()?;
+            let resize_preview = self.resize_settle_deadline.is_some();
+            let _ = self.try_render_current_isolated(resize_preview)?;
+        }
+        let closing = self
+            .windows
+            .iter()
+            .filter_map(|(id, window)| matches!(window, WindowRecord::Closing).then_some(*id))
+            .collect::<Vec<_>>();
+        for id in closing {
+            let finished = match self.windows.get(&id) {
+                Some(WindowRecord::Closing) => {
+                    let tabs = self
+                        .sessions
+                        .get_mut(id)
+                        .expect("closing sessions registered");
+                    tabs.poll_closing(Instant::now())?;
+                    tabs.closing_is_empty()
+                }
+                _ => false,
+            };
+            self.sessions.reconcile(id);
+            if finished {
+                self.windows.remove(&id);
+                self.sessions.remove(id);
+                tracing::info!(
+                    category = "window_close_completed",
+                    current_window_id = id.get(),
+                    "window closed"
+                );
+            }
+        }
+        self.activate_window(original);
+        Ok(false)
+    }
+
     fn close_active_tab(&mut self, reason: ShutdownReason) -> Result<(), UiRuntimeError> {
+        let tab_bar_was_visible = tab_bar_visible(self.app.config(), self.current_tabs().len());
         self.quiesce_active_interaction()?;
         self.active_session_mut().finish_io_round()?;
-        let closed = self.tabs.close_active();
+        let closed = self.current_tabs_mut().close_active();
         if let Some(id) = closed {
+            self.sessions.mark_closing(id, self.current_window_id);
             self.notifications.forget(id);
             self.sound.forget(id);
             tracing::info!(
@@ -1874,9 +3124,18 @@ impl UiRuntime {
                 "tab closing"
             );
         }
-        if self.tabs.is_empty() {
-            self.handle_app_event(crate::app::event::AppEvent::ShutdownRequested(reason))?;
+        if self.current_tabs().is_empty() {
+            if self.windows.iter().any(|(id, window)| {
+                *id != self.current_window_id && matches!(window, WindowRecord::Ready(_))
+            }) {
+                self.close_current_window()?;
+            } else {
+                self.handle_app_event(crate::app::event::AppEvent::ShutdownRequested(reason))?;
+            }
             return Ok(());
+        }
+        if tab_bar_was_visible != tab_bar_visible(self.app.config(), self.current_tabs().len()) {
+            self.reconfigure_layout(self.gfx.logical_size(), self.gfx.scale(), self.font_size)?;
         }
         self.restore_active_interaction()?;
         if let Some(snapshot) = self.active_session_mut().end_drain_round()? {
@@ -1888,7 +3147,7 @@ impl UiRuntime {
     fn switch_relative(&mut self, delta: i8) -> Result<(), UiRuntimeError> {
         self.quiesce_active_interaction()?;
         if matches!(
-            self.tabs.activate_relative(delta),
+            self.current_tabs_mut().activate_relative(delta),
             crate::tab::Activation::Changed { .. }
         ) {
             if let Some(snapshot) = self.active_session_mut().end_drain_round()? {
@@ -1903,7 +3162,7 @@ impl UiRuntime {
     fn switch_ordinal(&mut self, ordinal: u8) -> Result<(), UiRuntimeError> {
         self.quiesce_active_interaction()?;
         if matches!(
-            self.tabs.activate_ordinal(ordinal),
+            self.current_tabs_mut().activate_ordinal(ordinal),
             crate::tab::Activation::Changed { .. }
         ) {
             if let Some(snapshot) = self.active_session_mut().end_drain_round()? {
@@ -1918,7 +3177,7 @@ impl UiRuntime {
     fn switch_to(&mut self, id: crate::tab::SessionId) -> Result<(), UiRuntimeError> {
         self.quiesce_active_interaction()?;
         if matches!(
-            self.tabs.activate(id),
+            self.current_tabs_mut().activate(id),
             Ok(crate::tab::Activation::Changed { .. })
         ) {
             if let Some(snapshot) = self.active_session_mut().snapshot_if_dirty()? {
@@ -1952,8 +3211,8 @@ impl UiRuntime {
 
     fn restore_active_interaction(&mut self) -> Result<(), UiRuntimeError> {
         if self.keyboard_focused {
-            if let Some(id) = self.tabs.active_id()
-                && let Some(generation) = self.tabs.acknowledge(id)
+            if let Some(id) = self.current_tabs().active_id()
+                && let Some(generation) = self.current_tabs_mut().acknowledge(id)
             {
                 self.notifications.acknowledge(id, generation);
             }
@@ -1974,6 +3233,14 @@ impl UiRuntime {
         }
         if let leyline_gfx::PointerKind::Release { serial, .. } = event.kind {
             self.last_input_serial = Some(serial);
+        }
+        if matches!(event.kind, leyline_gfx::PointerKind::Leave { .. })
+            && self.tab_drag.take().is_some()
+        {
+            self.tab_drag_scroll = None;
+            self.set_pointer_cursor(leyline_gfx::PointerCursor::Text)?;
+            self.compose_latest()?;
+            return Ok(());
         }
         let scale = f64::from(self.gfx.scale().0) / 120.0;
         if !event.position.0.is_finite() || !event.position.1.is_finite() {
@@ -2090,13 +3357,98 @@ impl UiRuntime {
                 self.set_search_focus(false)?;
             }
         }
+        if let Some(mut drag) = self.tab_drag.take() {
+            match event.kind {
+                leyline_gfx::PointerKind::Motion { .. } => {
+                    drag.current = [f64::from(pixel[0]), f64::from(pixel[1])];
+                    let dx = drag.current[0] - drag.origin[0];
+                    let dy = drag.current[1] - drag.origin[1];
+                    let threshold = 8.0 * scale;
+                    if dx.mul_add(dx, dy * dy) >= threshold * threshold {
+                        drag.phase = crate::tab::TabDragPhase::Dragging;
+                    }
+                    if drag.phase == crate::tab::TabDragPhase::Dragging {
+                        if let Some(index) =
+                            self.tab_bar.proposed_index(self.current_tabs(), pixel[0])
+                        {
+                            drag.proposed_index = index;
+                        }
+                        let edge_direction = self
+                            .tab_bar
+                            .bar
+                            .and_then(|bar| {
+                                tab_drag_edge_direction(bar, pixel[0], self.gfx.scale().0)
+                            })
+                            .filter(|_| self.tab_bar.max_offset > 0);
+                        self.tab_drag_scroll = edge_direction.map(|direction| {
+                            self.tab_drag_scroll
+                                .filter(|scroll| scroll.direction == direction)
+                                .unwrap_or(TabDragScroll {
+                                    direction,
+                                    deadline: Instant::now() + DRAG_SCROLL_INTERVAL,
+                                })
+                        });
+                        self.set_pointer_cursor(leyline_gfx::PointerCursor::Grabbing)?;
+                    }
+                    self.tab_drag = Some(drag);
+                    self.compose_latest()?;
+                    return Ok(());
+                }
+                leyline_gfx::PointerKind::Release { button: 0x110, .. } => {
+                    self.tab_drag_scroll = None;
+                    if drag.phase == crate::tab::TabDragPhase::Dragging
+                        && let crate::tab::ReorderOutcome::Changed { from, to } = self
+                            .current_tabs_mut()
+                            .reorder(drag.session, drag.proposed_index)?
+                    {
+                        tracing::info!(
+                            category = "tab_reorder_committed",
+                            session_id = drag.session.get(),
+                            from,
+                            to,
+                            "tab reordered by pointer"
+                        );
+                        self.update_tab_bar();
+                    }
+                    self.set_pointer_cursor(leyline_gfx::PointerCursor::Text)?;
+                    self.compose_latest()?;
+                    return Ok(());
+                }
+                leyline_gfx::PointerKind::Leave { .. } => {
+                    self.tab_drag_scroll = None;
+                    self.set_pointer_cursor(leyline_gfx::PointerCursor::Text)?;
+                    return Ok(());
+                }
+                _ => self.tab_drag = Some(drag),
+            }
+        }
         if self.tab_bar.bar.is_some_and(|bar| bar.contains(pixel)) {
             match event.kind {
-                leyline_gfx::PointerKind::Press { button: 0x110, .. } => {
+                leyline_gfx::PointerKind::Press {
+                    button: 0x110,
+                    serial,
+                    ..
+                } => {
                     if let Some((id, close)) = self.tab_bar.hit(pixel) {
                         self.switch_to(id)?;
                         if close {
                             self.close_active_tab(ShutdownReason::UserRequested)?;
+                        } else {
+                            let proposed_index = self
+                                .current_tabs_mut()
+                                .tabs()
+                                .iter()
+                                .position(|tab| tab.id == id)
+                                .unwrap_or(0);
+                            self.tab_drag = Some(crate::tab::TabDrag {
+                                session: id,
+                                press_serial: serial,
+                                origin: [f64::from(pixel[0]), f64::from(pixel[1])],
+                                current: [f64::from(pixel[0]), f64::from(pixel[1])],
+                                proposed_index,
+                                phase: crate::tab::TabDragPhase::Armed,
+                            });
+                            self.tab_drag_scroll = None;
                         }
                     }
                 }
@@ -2469,6 +3821,38 @@ impl UiRuntime {
         Ok(())
     }
 
+    fn process_tab_drag_scroll(&mut self) -> Result<(), UiRuntimeError> {
+        let Some(mut scroll) = self.tab_drag_scroll else {
+            return Ok(());
+        };
+        let now = Instant::now();
+        if now < scroll.deadline {
+            return Ok(());
+        }
+        let step = 16_u32.saturating_mul(self.gfx.scale().0).div_ceil(120);
+        let previous = self.tab_bar.offset;
+        self.tab_bar.offset = if scroll.direction < 0 {
+            previous.saturating_sub(step)
+        } else {
+            previous.saturating_add(step).min(self.tab_bar.max_offset)
+        };
+        scroll.deadline = now + DRAG_SCROLL_INTERVAL;
+        self.tab_drag_scroll = Some(scroll);
+        if self.tab_bar.offset == previous {
+            return Ok(());
+        }
+        self.update_tab_bar();
+        if let Some(mut drag) = self.tab_drag.take() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let x = drag.current[0].max(0.0).floor() as u32;
+            if let Some(index) = self.tab_bar.proposed_index(self.current_tabs(), x) {
+                drag.proposed_index = index;
+            }
+            self.tab_drag = Some(drag);
+        }
+        self.compose_latest()
+    }
+
     fn cancel_pointer_gesture(&mut self) {
         self.selecting = false;
         self.selection_point = None;
@@ -2478,6 +3862,8 @@ impl UiRuntime {
         self.link_candidate = None;
         self.click_tracker.reset();
         self.scrollbar.cancel();
+        self.tab_drag = None;
+        self.tab_drag_scroll = None;
     }
 
     fn copy_selection(
@@ -2536,7 +3922,7 @@ impl UiRuntime {
     ) -> Result<(), UiRuntimeError> {
         let transfer_target = selection_transfer_target(target);
         let owner = self
-            .tabs
+            .current_tabs_mut()
             .active_id()
             .expect("runtime always has an active tab");
         let Some(start) = self.selection.begin_request(transfer_target, owner) else {
@@ -2661,7 +4047,7 @@ impl UiRuntime {
                 } => {
                     self.clipboard_workers.finish_request(request);
                     let active = self
-                        .tabs
+                        .current_tabs_mut()
                         .active_id()
                         .expect("runtime always has an active tab");
                     let search_target = self.pending_search_paste.take();
@@ -2676,7 +4062,7 @@ impl UiRuntime {
                         crate::selection::PasteTransition::Paste { owner, text } => {
                             if let Some((search_owner, revision)) = search_target {
                                 if owner == search_owner
-                                    && self.tabs.active_id() == Some(owner)
+                                    && self.current_tabs().active_id() == Some(owner)
                                     && self.search_focused
                                     && self.active_session().search().is_open()
                                     && self.active_session().search().revision() == revision
@@ -2738,14 +4124,14 @@ impl UiRuntime {
         owner: crate::tab::SessionId,
         text: &str,
     ) -> Result<(), UiRuntimeError> {
-        if self.tabs.active_id() != Some(owner) {
+        if !self.activate_session_owner(owner) || self.current_tabs().active_id() != Some(owner) {
             tracing::debug!(
                 session_id = owner.get(),
                 "stale paste owner is no longer active"
             );
             return Ok(());
         }
-        if let Some(tab) = self.tabs.get_mut(owner) {
+        if let Some(tab) = self.current_tabs_mut().get_mut(owner) {
             tab.session.paste(text)?;
         }
         Ok(())
@@ -2759,6 +4145,10 @@ fn selection_transfer_target(
         leyline_gfx::SelectionTarget::Clipboard => crate::clipboard::TransferTarget::Clipboard,
         leyline_gfx::SelectionTarget::Primary => crate::clipboard::TransferTarget::Primary,
     }
+}
+
+fn window_tab_limit(config: &crate::config::EffectiveConfig) -> NonZeroU8 {
+    NonZeroU8::new(config.tabs.max_count).expect("validated tab limit is non-zero")
 }
 
 fn ignores_key_repeat(action: crate::config::Action) -> bool {
@@ -2934,11 +4324,229 @@ fn window_title(ordinal: usize, count: usize, title: &str) -> String {
 mod tests {
     use super::{
         accumulate_wheel_steps, format_terminal_query, ignores_key_repeat,
-        keep_selection_after_release, key_text, search_query_capacity, select_new_tab_cwd,
-        should_cancel_search, starts_terminal_control_gesture, take_matching_pending,
-        terminal_key_owner_changed, terminal_modifiers, visible_search_query,
-        visual_mapping_changed, xkb_text_allowed,
+        keep_selection_after_release, key_text, renderer_fault_is_process_fatal,
+        rotate_window_service_order, search_query_capacity, select_new_tab_cwd,
+        should_cancel_search, starts_terminal_control_gesture, tab_drag_edge_direction,
+        take_matching_pending, take_priority_close_event, terminal_key_owner_changed,
+        terminal_modifiers, visible_search_query, visual_mapping_changed, xkb_text_allowed,
     };
+
+    fn registry_tab_manager(id: crate::tab::SessionId) -> crate::tab::TabManager {
+        let runtime = crate::app::runtime::AppRuntimeBuilder::new(std::sync::Arc::new(
+            crate::app::runtime::CountingWake::default(),
+        ))
+        .build()
+        .unwrap();
+        let launch = crate::cli::LaunchRequest::Command(crate::cli::CommandSpec {
+            program: std::ffi::OsString::from("/bin/true"),
+            args: Vec::new(),
+        });
+        let session = crate::session::TerminalSession::start(
+            &launch,
+            leyline_pty::SpawnDirectory::open(std::path::Path::new("/tmp")).unwrap(),
+            &crate::config::EffectiveConfig::default(),
+            crate::terminal::GridSize::new(8, 4).unwrap(),
+            &runtime,
+        )
+        .unwrap();
+        crate::tab::TabManager::bootstrap_with_id(
+            id,
+            session,
+            runtime,
+            std::num::NonZeroU8::new(4).unwrap(),
+        )
+    }
+
+    #[test]
+    fn production_registry_move_commit_has_one_owner() {
+        let source = leyline_gfx::WindowId::from_raw(1).unwrap();
+        let target = leyline_gfx::WindowId::from_raw(2).unwrap();
+        let mut ids = crate::tab::SessionIdAllocator::default();
+        let session = ids.allocate().unwrap();
+        let mut registry = super::SessionRegistry {
+            windows: std::collections::HashMap::from([(source, registry_tab_manager(session))]),
+            locations: std::collections::HashMap::from([(
+                session,
+                crate::window::SessionLocation::Active { window: source },
+            )]),
+        };
+        let (from, source_empty) = registry
+            .commit_move_to_new_window(
+                source,
+                target,
+                session,
+                std::num::NonZeroU8::new(4).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(from, 0);
+        assert!(source_empty);
+        assert!(registry.get(source).unwrap().is_empty());
+        assert_eq!(registry.get(target).unwrap().active_id(), Some(session));
+        assert_eq!(
+            registry.locations.get(&session),
+            Some(&crate::window::SessionLocation::Active { window: target })
+        );
+    }
+
+    #[test]
+    fn production_registry_rejects_move_before_mutating_source() {
+        let source = leyline_gfx::WindowId::from_raw(1).unwrap();
+        let target = leyline_gfx::WindowId::from_raw(2).unwrap();
+        let mut ids = crate::tab::SessionIdAllocator::default();
+        let session = ids.allocate().unwrap();
+        let target_session = ids.allocate().unwrap();
+        let mut registry = super::SessionRegistry {
+            windows: std::collections::HashMap::from([
+                (source, registry_tab_manager(session)),
+                (target, registry_tab_manager(target_session)),
+            ]),
+            locations: std::collections::HashMap::from([
+                (
+                    session,
+                    crate::window::SessionLocation::Active { window: source },
+                ),
+                (
+                    target_session,
+                    crate::window::SessionLocation::Active { window: target },
+                ),
+            ]),
+        };
+        assert!(matches!(
+            registry.commit_move_to_new_window(
+                source,
+                target,
+                session,
+                std::num::NonZeroU8::new(4).unwrap(),
+            ),
+            Err(super::UiRuntimeError::Window(
+                crate::window::WindowError::DuplicateWindow(id)
+            )) if id == target
+        ));
+        assert_eq!(registry.get(source).unwrap().active_id(), Some(session));
+        assert_eq!(
+            registry.locations.get(&session),
+            Some(&crate::window::SessionLocation::Active { window: source })
+        );
+    }
+
+    #[test]
+    fn production_registry_rolls_back_location_if_extract_rejects() {
+        let source = leyline_gfx::WindowId::from_raw(1).unwrap();
+        let target = leyline_gfx::WindowId::from_raw(2).unwrap();
+        let mut ids = crate::tab::SessionIdAllocator::default();
+        let session = ids.allocate().unwrap();
+        let actual_session = ids.allocate().unwrap();
+        let mut registry = super::SessionRegistry {
+            windows: std::collections::HashMap::from([(
+                source,
+                registry_tab_manager(actual_session),
+            )]),
+            locations: std::collections::HashMap::from([(
+                session,
+                crate::window::SessionLocation::Active { window: source },
+            )]),
+        };
+        assert!(matches!(
+            registry.commit_move_to_new_window(
+                source,
+                target,
+                session,
+                std::num::NonZeroU8::new(4).unwrap(),
+            ),
+            Err(super::UiRuntimeError::Tab(
+                crate::tab::TabError::UnknownSession(id)
+            )) if id == session
+        ));
+        assert_eq!(
+            registry.locations.get(&session),
+            Some(&crate::window::SessionLocation::Active { window: source })
+        );
+        assert!(registry.get(target).is_none());
+    }
+
+    #[test]
+    fn window_service_cursor_rotates_across_process_rounds() {
+        let ids = [1, 2, 3, 4].map(|raw| leyline_gfx::WindowId::from_raw(raw).unwrap());
+        let mut first = ids;
+        rotate_window_service_order(&mut first, None);
+        assert_eq!(first, ids);
+
+        let mut after_second = ids;
+        rotate_window_service_order(&mut after_second, Some(ids[1]));
+        assert_eq!(after_second, [ids[2], ids[3], ids[0], ids[1]]);
+
+        let mut wrapped = ids;
+        rotate_window_service_order(&mut wrapped, Some(ids[3]));
+        assert_eq!(wrapped, ids);
+    }
+
+    #[test]
+    fn close_event_bypasses_queued_bulk_platform_work() {
+        let window = leyline_gfx::WindowId::from_raw(1).unwrap();
+        let surface = leyline_gfx::SurfaceKey {
+            window,
+            generation: std::num::NonZeroU64::MIN,
+        };
+        let mut events = std::collections::VecDeque::from([
+            leyline_gfx::RoutedPlatformEvent {
+                surface,
+                event: leyline_gfx::PlatformEvent::FrameReady,
+            },
+            leyline_gfx::RoutedPlatformEvent {
+                surface,
+                event: leyline_gfx::PlatformEvent::CloseRequested,
+            },
+            leyline_gfx::RoutedPlatformEvent {
+                surface,
+                event: leyline_gfx::PlatformEvent::FrameReady,
+            },
+        ]);
+        assert!(matches!(
+            take_priority_close_event(&mut events).map(|event| event.event),
+            Some(leyline_gfx::PlatformEvent::CloseRequested)
+        ));
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event.event, leyline_gfx::PlatformEvent::FrameReady))
+        );
+    }
+
+    #[test]
+    fn tab_drag_edge_scroll_has_bounded_direction_zones() {
+        let bar = crate::tab::PixelRect {
+            x: 10,
+            y: 0,
+            width: 200,
+            height: 30,
+        };
+        assert_eq!(tab_drag_edge_direction(bar, 10, 120), Some(-1));
+        assert_eq!(tab_drag_edge_direction(bar, 33, 120), Some(-1));
+        assert_eq!(tab_drag_edge_direction(bar, 34, 120), None);
+        assert_eq!(tab_drag_edge_direction(bar, 185, 120), None);
+        assert_eq!(tab_drag_edge_direction(bar, 186, 120), Some(1));
+        assert_eq!(tab_drag_edge_direction(bar, 209, 120), Some(1));
+    }
+
+    #[test]
+    fn only_device_loss_escalates_a_window_renderer_fault() {
+        assert!(renderer_fault_is_process_fatal(
+            &leyline_gfx::RendererFault::DeviceLost {
+                operation: leyline_gfx::RendererOperation::Present,
+            }
+        ));
+        assert!(!renderer_fault_is_process_fatal(
+            &leyline_gfx::RendererFault::SurfaceLost {
+                operation: leyline_gfx::RendererOperation::Present,
+            }
+        ));
+        assert!(!renderer_fault_is_process_fatal(
+            &leyline_gfx::RendererFault::OutOfDeviceMemory {
+                operation: leyline_gfx::RendererOperation::Recreate,
+            }
+        ));
+    }
 
     #[test]
     fn search_query_window_follows_the_utf8_cursor() {
@@ -3343,7 +4951,7 @@ fn text_antialiasing(value: crate::config::AntialiasPreference) -> AntialiasPref
     }
 }
 
-fn content_insets(config: &crate::config::EffectiveConfig) -> ContentInsets {
+fn content_insets(config: &crate::config::EffectiveConfig, tab_count: usize) -> ContentInsets {
     let right = if config.scrollbar.mode == crate::config::ScrollbarMode::Hidden {
         config.window.padding_x
     } else {
@@ -3351,15 +4959,94 @@ fn content_insets(config: &crate::config::EffectiveConfig) -> ContentInsets {
         let gutter = config.scrollbar.hit_width.ceil() as u16;
         config.window.padding_x.max(gutter.saturating_add(2))
     };
+    let show_tabs = tab_bar_visible(config, tab_count);
     ContentInsets {
         left: config.window.padding_x,
         right,
-        top: config
-            .window
-            .padding_y
-            .saturating_add(config.tabs.bar_height),
+        top: config.window.padding_y.saturating_add(if show_tabs {
+            config.tabs.bar_height
+        } else {
+            0
+        }),
         bottom: config.window.padding_y,
     }
+}
+
+fn tab_bar_visible(config: &crate::config::EffectiveConfig, tab_count: usize) -> bool {
+    match config.tabs.visibility {
+        crate::config::TabBarVisibility::Always => tab_count > 0,
+        crate::config::TabBarVisibility::Multiple => tab_count >= 2,
+        crate::config::TabBarVisibility::Never => false,
+    }
+}
+
+fn rotate_window_service_order(
+    ids: &mut [leyline_gfx::WindowId],
+    cursor: Option<leyline_gfx::WindowId>,
+) {
+    ids.sort_unstable();
+    let Some(cursor) = cursor else {
+        return;
+    };
+    let start = ids.iter().position(|id| *id > cursor).unwrap_or(0);
+    ids.rotate_left(start);
+}
+
+fn tab_drag_edge_direction(bar: crate::tab::PixelRect, x: u32, scale_120: u32) -> Option<i8> {
+    let edge = 24_u32.saturating_mul(scale_120).div_ceil(120).max(1);
+    if x < bar.x.saturating_add(edge) {
+        Some(-1)
+    } else if x >= bar.x.saturating_add(bar.width).saturating_sub(edge) {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+fn renderer_fault_is_process_fatal(fault: &leyline_gfx::RendererFault) -> bool {
+    matches!(fault, leyline_gfx::RendererFault::DeviceLost { .. })
+}
+
+fn take_priority_close_event(
+    events: &mut VecDeque<leyline_gfx::RoutedPlatformEvent>,
+) -> Option<leyline_gfx::RoutedPlatformEvent> {
+    let index = events
+        .iter()
+        .position(|routed| matches!(&routed.event, PlatformEvent::CloseRequested))?;
+    events.remove(index)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn requested_normal_size(
+    config: &crate::config::EffectiveConfig,
+    metrics: leyline_text::CellMetrics,
+) -> Result<leyline_gfx::LogicalSize, UiRuntimeError> {
+    let width = u32::from(config.window.columns)
+        .checked_mul(u32::from(metrics.width_px.get()))
+        .and_then(|value| value.checked_add(u32::from(config.window.padding_x) * 2))
+        .and_then(|value| {
+            (config.scrollbar.mode != crate::config::ScrollbarMode::Hidden)
+                .then(|| config.scrollbar.hit_width.ceil() as u32 + 2)
+                .map_or(Some(value), |gutter| value.checked_add(gutter))
+        })
+        .ok_or_else(|| UiRuntimeError::Grid("requested window width overflow".into()))?;
+    let rows = u32::from(config.window.lines)
+        .checked_mul(u32::from(metrics.height_px.get()))
+        .ok_or_else(|| UiRuntimeError::Grid("requested window height overflow".into()))?;
+    let chrome = u32::from(config.window.padding_y)
+        .checked_mul(2)
+        .and_then(|value| {
+            value.checked_add(if tab_bar_visible(config, 1) {
+                u32::from(config.tabs.bar_height)
+            } else {
+                0
+            })
+        })
+        .ok_or_else(|| UiRuntimeError::Grid("requested window height overflow".into()))?;
+    let height = rows
+        .checked_add(chrome)
+        .ok_or_else(|| UiRuntimeError::Grid("requested window height overflow".into()))?;
+    Ok(leyline_gfx::LogicalSize { width, height })
 }
 
 fn take_matching_pending<T>(
@@ -3399,6 +5086,8 @@ pub enum UiRuntimeError {
     #[error(transparent)]
     Tab(#[from] crate::tab::TabError),
     #[error(transparent)]
+    Window(#[from] crate::window::WindowError),
+    #[error(transparent)]
     Runtime(#[from] crate::app::runtime::RuntimeBuildError),
     #[error("cannot calculate terminal grid: {0}")]
     Grid(String),
@@ -3415,21 +5104,26 @@ pub enum UiRuntimeError {
 }
 
 impl ClassifiedError for UiRuntimeError {
+    #[allow(clippy::unnested_or_patterns)]
     fn category(&self) -> ErrorCategory {
         match self {
             Self::Init(GfxInitError::Environment(_))
+            | Self::Graphics(GfxError::Initialization(GfxInitError::Environment(_)))
             | Self::SessionStart(_)
             | Self::SpawnDirectory(_)
             | Self::Graphics(GfxError::Platform(_)) => ErrorCategory::Environment,
-            Self::Init(GfxInitError::Platform(_)) | Self::Ime(_) => ErrorCategory::Platform,
-            Self::Init(GfxInitError::Device(_)) | Self::Graphics(GfxError::Renderer(_)) => {
-                ErrorCategory::Renderer
-            }
+            Self::Init(GfxInitError::Platform(_))
+            | Self::Graphics(GfxError::Initialization(GfxInitError::Platform(_)))
+            | Self::Ime(_) => ErrorCategory::Platform,
+            Self::Init(GfxInitError::Device(_))
+            | Self::Graphics(GfxError::Initialization(GfxInitError::Device(_)))
+            | Self::Graphics(GfxError::Renderer(_)) => ErrorCategory::Renderer,
             Self::Graphics(GfxError::Internal(_) | GfxError::Capacity(_))
             | Self::App(_)
             | Self::Wake(_)
             | Self::Session(_)
             | Self::Tab(_)
+            | Self::Window(_)
             | Self::Runtime(_)
             | Self::Grid(_)
             | Self::Text(_)

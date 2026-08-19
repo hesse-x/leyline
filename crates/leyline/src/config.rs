@@ -37,6 +37,11 @@ pub struct TerminalConfig {
 }
 
 pub const MAX_TABS: u8 = 32;
+pub const MAX_WINDOWS: u8 = 16;
+pub const MIN_COLUMNS: u16 = 20;
+pub const MAX_COLUMNS: u16 = 500;
+pub const MIN_LINES: u16 = 5;
+pub const MAX_LINES: u16 = 300;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TabsConfig {
@@ -46,6 +51,15 @@ pub struct TabsConfig {
     pub max_width: u16,
     pub show_close_button: bool,
     pub new_tab_cwd: NewTabCwdPolicy,
+    pub visibility: TabBarVisibility,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum TabBarVisibility {
+    #[default]
+    Always,
+    Multiple,
+    Never,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -130,6 +144,18 @@ pub struct ColorsConfig {
 pub struct WindowConfig {
     pub padding_x: u16,
     pub padding_y: u16,
+    pub columns: u16,
+    pub lines: u16,
+    pub startup_state: StartupWindowState,
+    pub max_windows: NonZeroU8,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum StartupWindowState {
+    #[default]
+    Normal,
+    Maximized,
+    Fullscreen,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -224,9 +250,16 @@ pub enum Action {
     ScrollPageUp,
     ScrollPageDown,
     NewTab,
+    NewWindow,
     CloseTab,
     PreviousTab,
     NextTab,
+    MoveTabLeft,
+    MoveTabRight,
+    MoveTabToNewWindow,
+    ToggleFullscreen,
+    ToggleMaximized,
+    RestoreWindow,
     ActivateTab(u8),
     ToggleBellMute,
     Search,
@@ -264,6 +297,10 @@ impl Default for EffectiveConfig {
             window: WindowConfig {
                 padding_x: 0,
                 padding_y: 5,
+                columns: 80,
+                lines: 24,
+                startup_state: StartupWindowState::Normal,
+                max_windows: NonZeroU8::new(8).expect("non-zero constant"),
             },
             scrolling: ScrollingConfig {
                 history_lines: 10_000,
@@ -295,6 +332,7 @@ impl Default for EffectiveConfig {
                 max_width: 240,
                 show_close_button: true,
                 new_tab_cwd: NewTabCwdPolicy::Inherit,
+                visibility: TabBarVisibility::Always,
             },
             bell: BellConfig::default(),
             keybindings: default_keybindings(),
@@ -302,12 +340,13 @@ impl Default for EffectiveConfig {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn default_keybindings() -> Vec<KeyBinding> {
     use crate::input::shortcut::{BindingOrigin, KeyChord, LogicalKeyPattern};
     use Action::{
-        CloseTab, CopyClipboard, DecreaseFontSize, IncreaseFontSize, NewTab, NextTab,
-        PasteClipboard, PastePrimary, PreviousTab, ResetFontSize, ScrollPageDown, ScrollPageUp,
-        Search,
+        CloseTab, CopyClipboard, DecreaseFontSize, IncreaseFontSize, MoveTabLeft, MoveTabRight,
+        NewTab, NewWindow, NextTab, PasteClipboard, PastePrimary, PreviousTab, ResetFontSize,
+        ScrollPageDown, ScrollPageUp, Search, ToggleFullscreen,
     };
     use leyline_gfx::ModifierMask;
     [
@@ -354,6 +393,11 @@ fn default_keybindings() -> Vec<KeyBinding> {
             NewTab,
         ),
         (
+            LogicalKeyPattern::Character('N'),
+            modifier_mask(&[Modifier::Control, Modifier::Shift, Modifier::Alt]),
+            NewWindow,
+        ),
+        (
             LogicalKeyPattern::Character('W'),
             modifier_mask(&[Modifier::Control, Modifier::Shift]),
             CloseTab,
@@ -372,6 +416,21 @@ fn default_keybindings() -> Vec<KeyBinding> {
             LogicalKeyPattern::ArrowRight,
             modifier_mask(&[Modifier::Control, Modifier::Shift]),
             NextTab,
+        ),
+        (
+            LogicalKeyPattern::PageUp,
+            modifier_mask(&[Modifier::Control, Modifier::Shift]),
+            MoveTabLeft,
+        ),
+        (
+            LogicalKeyPattern::PageDown,
+            modifier_mask(&[Modifier::Control, Modifier::Shift]),
+            MoveTabRight,
+        ),
+        (
+            LogicalKeyPattern::Function(11),
+            ModifierMask::empty(),
+            ToggleFullscreen,
         ),
     ]
     .into_iter()
@@ -615,6 +674,7 @@ struct RawTabs {
     show_close_button: Option<bool>,
     new_tab_cwd: Option<String>,
     new_tab_fixed_cwd: Option<String>,
+    visibility: Option<String>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -652,6 +712,10 @@ struct RawColors {
 struct RawWindow {
     padding_x: Option<i64>,
     padding_y: Option<i64>,
+    columns: Option<i64>,
+    lines: Option<i64>,
+    startup_state: Option<String>,
+    max_windows: Option<i64>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -790,7 +854,14 @@ impl RawConfig {
             source,
             "window",
             &self.window.unknown,
-            &["padding_x", "padding_y"],
+            &[
+                "padding_x",
+                "padding_y",
+                "columns",
+                "lines",
+                "startup_state",
+                "max_windows",
+            ],
         );
         collect_unknown(
             &mut warnings,
@@ -848,6 +919,7 @@ impl RawConfig {
                 "show_close_button",
                 "new_tab_cwd",
                 "new_tab_fixed_cwd",
+                "visibility",
             ],
         );
 
@@ -986,6 +1058,51 @@ impl RawConfig {
             256,
             &mut result.window.padding_x,
         )?;
+        set_bounded(
+            path,
+            "window.columns",
+            self.window.columns,
+            i64::from(MIN_COLUMNS),
+            i64::from(MAX_COLUMNS),
+            &mut result.window.columns,
+        )?;
+        set_bounded(
+            path,
+            "window.lines",
+            self.window.lines,
+            i64::from(MIN_LINES),
+            i64::from(MAX_LINES),
+            &mut result.window.lines,
+        )?;
+        if let Some(value) = self.window.startup_state {
+            result.window.startup_state = match value.as_str() {
+                "normal" => StartupWindowState::Normal,
+                "maximized" => StartupWindowState::Maximized,
+                "fullscreen" => StartupWindowState::Fullscreen,
+                _ => {
+                    return semantic(
+                        path,
+                        "window.startup_state",
+                        format!(
+                            "{} is not one of normal, maximized, fullscreen",
+                            escape_diagnostic(&value)
+                        ),
+                    );
+                }
+            };
+        }
+        if let Some(value) = self.window.max_windows {
+            if !(1..=i64::from(MAX_WINDOWS)).contains(&value) {
+                return semantic(
+                    path,
+                    "window.max_windows",
+                    format!("{value} is outside 1..={MAX_WINDOWS}"),
+                );
+            }
+            result.window.max_windows =
+                NonZeroU8::new(u8::try_from(value).expect("validated window count fits u8"))
+                    .expect("validated window count is non-zero");
+        }
         if let Some(value) = self.scrollbar.mode {
             result.scrollbar.mode = match value.as_str() {
                 "auto" => ScrollbarMode::Auto,
@@ -1226,6 +1343,23 @@ impl RawConfig {
                     .into(),
             });
         }
+        if let Some(value) = self.tabs.visibility {
+            result.tabs.visibility = match value.as_str() {
+                "always" => TabBarVisibility::Always,
+                "multiple" => TabBarVisibility::Multiple,
+                "never" => TabBarVisibility::Never,
+                _ => {
+                    return semantic(
+                        path,
+                        "tabs.visibility",
+                        format!(
+                            "{} is not one of always, multiple, never",
+                            escape_diagnostic(&value)
+                        ),
+                    );
+                }
+            };
+        }
 
         if let Some(bindings) = self.keybindings {
             let mut positions = result
@@ -1444,9 +1578,16 @@ fn parse_binding(path: &Path, index: usize, raw: RawKeyBinding) -> Result<KeyBin
         "ScrollPageUp" => Action::ScrollPageUp,
         "ScrollPageDown" => Action::ScrollPageDown,
         "NewTab" => Action::NewTab,
+        "NewWindow" => Action::NewWindow,
         "CloseTab" => Action::CloseTab,
         "PreviousTab" => Action::PreviousTab,
         "NextTab" => Action::NextTab,
+        "MoveTabLeft" => Action::MoveTabLeft,
+        "MoveTabRight" => Action::MoveTabRight,
+        "MoveTabToNewWindow" => Action::MoveTabToNewWindow,
+        "ToggleFullscreen" => Action::ToggleFullscreen,
+        "ToggleMaximized" => Action::ToggleMaximized,
+        "RestoreWindow" => Action::RestoreWindow,
         "ToggleBellMute" => Action::ToggleBellMute,
         "Search" => Action::Search,
         "SearchNext" => Action::SearchNext,
