@@ -1,0 +1,6 @@
+ASCII text and ligature candidates: office affine ffi fl
+CJK: 中文终端性能测试 日本語 한국어
+Combining: é Å ñ
+RTL: العربية עברית
+ZWJ emoji: 👨‍👩‍👧‍👦 👩‍💻 🏳️‍🌈
+Emoji: 😀 🚀 ❤️ 👍🏽

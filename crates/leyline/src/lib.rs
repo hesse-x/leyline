@@ -13,6 +13,7 @@ pub mod interaction;
 pub mod layout;
 pub mod logging;
 pub mod notification;
+pub mod perf;
 pub mod search;
 pub mod security;
 pub mod selection;
@@ -68,6 +69,12 @@ pub fn run(
     environment: impl ConfigEnvironment,
     io: &mut impl ProcessIo,
 ) -> RunOutcome {
+    let perf_output_guard = perf::initialize_from_env();
+    if perf_output_guard.is_some() {
+        leyline_pty::set_write_latency_observer(|elapsed| {
+            perf::record_duration(perf::PerfStage::InputToPtyWrite, elapsed);
+        });
+    }
     let cli = match cli::parse(args) {
         ParseOutcome::Print { text, success } => {
             if success {

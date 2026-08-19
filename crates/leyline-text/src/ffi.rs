@@ -101,6 +101,7 @@ pub struct TextSystem {
     cache_clock: u64,
     cache_evictions: u64,
     scene_pins: Option<HashSet<GlyphKey>>,
+    buffer: Buffer,
     library: Library,
     fontconfig: FontconfigOwner,
     request: FontRequest,
@@ -150,6 +151,10 @@ impl TextSystem {
         generation: u64,
     ) -> Result<Self, TextError> {
         let library = initialize_freetype()?;
+        let buffer = Buffer(unsafe { hb::hb_buffer_create() });
+        if buffer.0.is_null() {
+            return Err(TextError::Shape("HarfBuzz buffer allocation failed".into()));
+        }
         let raster_profile = requested_profile(&request);
         let mut system = Self {
             faces: Vec::new(),
@@ -159,6 +164,7 @@ impl TextSystem {
             cache_clock: 0,
             cache_evictions: 0,
             scene_pins: None,
+            buffer,
             library,
             fontconfig,
             request,
@@ -311,33 +317,34 @@ impl TextSystem {
             ));
         }
         let face_id = self.resolve_face(Some(text), style)?;
-        let face = self.face(face_id)?;
-        let buffer = Buffer(unsafe { hb::hb_buffer_create() });
-        if buffer.0.is_null() {
-            return Err(TextError::Shape("HarfBuzz buffer allocation failed".into()));
-        }
+        let (hb_font, raw_face) = {
+            let face = self.face(face_id)?;
+            (face.hb_font, face.raw)
+        };
+        let buffer = self.buffer.0;
         let length = c_int::try_from(text.len())
             .map_err(|_| TextError::CapacityExceeded("cluster bytes"))?;
         // SAFETY: buffer/font are live; text remains borrowed during shaping; result pointers are
         // bounded by the counts returned by HarfBuzz and copied before native objects change.
         unsafe {
-            hb::hb_buffer_add_utf8(buffer.0, text.as_ptr().cast(), length, 0, length);
-            hb::hb_buffer_set_cluster_level(
-                buffer.0,
-                hb::HB_BUFFER_CLUSTER_LEVEL_MONOTONE_GRAPHEMES,
-            );
+            hb::hb_buffer_clear_contents(buffer);
+            hb::hb_buffer_set_direction(buffer, hb::HB_DIRECTION_INVALID);
+            hb::hb_buffer_set_script(buffer, hb::HB_SCRIPT_UNKNOWN);
+            hb::hb_buffer_set_language(buffer, ptr::null_mut());
+            hb::hb_buffer_set_cluster_level(buffer, hb::HB_BUFFER_CLUSTER_LEVEL_MONOTONE_GRAPHEMES);
+            hb::hb_buffer_add_utf8(buffer, text.as_ptr().cast(), length, 0, length);
             match direction {
                 TextDirection::Auto => {}
                 TextDirection::LeftToRight => {
-                    hb::hb_buffer_set_direction(buffer.0, hb::HB_DIRECTION_LTR);
+                    hb::hb_buffer_set_direction(buffer, hb::HB_DIRECTION_LTR);
                 }
                 TextDirection::RightToLeft => {
-                    hb::hb_buffer_set_direction(buffer.0, hb::HB_DIRECTION_RTL);
+                    hb::hb_buffer_set_direction(buffer, hb::HB_DIRECTION_RTL);
                 }
             }
-            hb::hb_buffer_guess_segment_properties(buffer.0);
+            hb::hb_buffer_guess_segment_properties(buffer);
             let language = hb::hb_language_from_string(c"und".as_ptr(), -1);
-            hb::hb_buffer_set_language(buffer.0, language);
+            hb::hb_buffer_set_language(buffer, language);
         }
         let features = if self.request.ligatures {
             Vec::new()
@@ -355,13 +362,13 @@ impl TextSystem {
         // SAFETY: feature slice and native owners remain valid for the duration of the call.
         unsafe {
             hb::hb_shape(
-                face.hb_font,
-                buffer.0,
+                hb_font,
+                buffer,
                 features.as_ptr(),
                 u32::try_from(features.len()).unwrap_or(0),
             );
         }
-        let count = unsafe { hb::hb_buffer_get_length(buffer.0) } as usize;
+        let count = unsafe { hb::hb_buffer_get_length(buffer) } as usize;
         if count == 0 || count > MAX_PREPARED_GLYPHS {
             return Err(TextError::Shape(
                 "HarfBuzz returned an invalid glyph count".into(),
@@ -370,9 +377,9 @@ impl TextSystem {
         let mut info_count =
             u32::try_from(count).map_err(|_| TextError::Shape("glyph count".into()))?;
         let mut position_count = info_count;
-        let infos = unsafe { hb::hb_buffer_get_glyph_infos(buffer.0, &raw mut info_count) };
+        let infos = unsafe { hb::hb_buffer_get_glyph_infos(buffer, &raw mut info_count) };
         let positions =
-            unsafe { hb::hb_buffer_get_glyph_positions(buffer.0, &raw mut position_count) };
+            unsafe { hb::hb_buffer_get_glyph_positions(buffer, &raw mut position_count) };
         if infos.is_null()
             || positions.is_null()
             || info_count as usize != count
@@ -385,9 +392,9 @@ impl TextSystem {
         let infos = unsafe { std::slice::from_raw_parts(infos, count) };
         let positions = unsafe { std::slice::from_raw_parts(positions, count) };
         let synthetic_bold = matches!(style, FontStyle::Bold | FontStyle::BoldItalic)
-            && unsafe { (*face.raw).style_flags & ft::FT_STYLE_FLAG_BOLD == 0 };
+            && unsafe { (*raw_face).style_flags & ft::FT_STYLE_FLAG_BOLD == 0 };
         let synthetic_italic = matches!(style, FontStyle::Italic | FontStyle::BoldItalic)
-            && unsafe { (*face.raw).style_flags & ft::FT_STYLE_FLAG_ITALIC == 0 };
+            && unsafe { (*raw_face).style_flags & ft::FT_STYLE_FLAG_ITALIC == 0 };
         let mut glyphs = Vec::with_capacity(count);
         for (info, position) in infos.iter().zip(positions) {
             if info.cluster as usize >= text.len() || !text.is_char_boundary(info.cluster as usize)

@@ -40,3 +40,6 @@ shaderc = "0.10.1"
 
 [patch.crates-io]
 vte = { path = "third_party/vte" }
+
+[profile.release]
+lto = "thin"

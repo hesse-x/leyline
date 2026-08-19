@@ -9,7 +9,7 @@ use crate::{
     RenderScene, Scale120, SelectionTarget, TextInputContext,
     atlas::{AtlasManager, AtlasPreparation},
     decor::LibdecorContext,
-    model::SceneData,
+    model::{PreparedScene, SceneData},
     vulkan::{RenderStatus, VulkanDeviceContext, VulkanRenderer},
     wayland::{WaylandConnectionHost, WaylandWindow},
 };
@@ -58,6 +58,14 @@ pub enum GfxError {
     Internal(String),
     #[error("graphics capacity exceeded: {0}")]
     Capacity(String),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PrepareSceneError {
+    #[error("scene exceeds the color atlas capacity")]
+    NeedsColorDowngrade(SceneData),
+    #[error(transparent)]
+    Gfx(#[from] GfxError),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -337,18 +345,26 @@ impl GfxRuntime {
             }
             GfxCommand::SetPointerCursor(cursor) => self.wayland.set_pointer_cursor(cursor),
             GfxCommand::SetDirty => self.dirty = true,
-            GfxCommand::SetScene(scene) => {
+            GfxCommand::SetPreparedScene(PreparedScene {
+                scene,
+                atlas: prepared,
+            }) => {
+                if !self.atlas.accepts(&prepared) {
+                    return Err(GfxError::Internal(
+                        "prepared scene is stale or belongs to another runtime".into(),
+                    ));
+                }
                 if self.pending_atlas.take().is_some() {
                     self.pending_scene = None;
                     self.renderer.discard_pending_glyphs();
                 }
-                let prepared = self
-                    .atlas
-                    .prepare(&scene.glyphs, &scene.glyph_assets)
-                    .map_err(atlas_error)?;
-                self.renderer
+                if let Err(error) = self
+                    .renderer
                     .upload_glyphs(&prepared.uploads, prepared.is_repack())
-                    .map_err(GfxError::Renderer)?;
+                {
+                    self.renderer.discard_pending_glyphs();
+                    return Err(GfxError::Renderer(error));
+                }
                 self.pending_atlas = Some(prepared);
                 self.pending_scene = Some(scene);
                 self.dirty = true;
@@ -419,27 +435,35 @@ impl GfxRuntime {
             rectangles: &scene_data.rectangles,
             glyphs,
         };
-        let recreate_after_present =
-            match self.renderer.render(&scene).map_err(GfxError::Renderer)? {
-                RenderStatus::Deferred => return Ok(RenderOutcome::Deferred),
-                RenderStatus::OutOfDate => {
-                    self.swapchain_state = SwapchainState::RecreatePending;
-                    return Ok(RenderOutcome::Deferred);
-                }
-                RenderStatus::SubmittedOutOfDate => {
-                    self.commit_pending_atlas();
-                    self.swapchain_state = SwapchainState::RecreatePending;
-                    return Ok(RenderOutcome::Deferred);
-                }
-                RenderStatus::Suboptimal => {
-                    self.commit_pending_atlas();
-                    true
-                }
-                RenderStatus::Rendered => {
-                    self.commit_pending_atlas();
-                    false
-                }
-            };
+        let status = match self.renderer.render(&scene) {
+            Ok(status) => status,
+            Err(error) => {
+                self.pending_atlas = None;
+                self.pending_scene = None;
+                self.renderer.discard_pending_glyphs();
+                return Err(GfxError::Renderer(error));
+            }
+        };
+        let recreate_after_present = match status {
+            RenderStatus::Deferred => return Ok(RenderOutcome::Deferred),
+            RenderStatus::OutOfDate => {
+                self.swapchain_state = SwapchainState::RecreatePending;
+                return Ok(RenderOutcome::Deferred);
+            }
+            RenderStatus::SubmittedOutOfDate => {
+                self.commit_pending_atlas();
+                self.swapchain_state = SwapchainState::RecreatePending;
+                return Ok(RenderOutcome::Deferred);
+            }
+            RenderStatus::Suboptimal => {
+                self.commit_pending_atlas();
+                true
+            }
+            RenderStatus::Rendered => {
+                self.commit_pending_atlas();
+                false
+            }
+        };
         self.wayland.request_frame();
         self.wayland.commit();
         self.wayland.flush().map_err(GfxError::Platform)?;
@@ -518,15 +542,18 @@ impl GfxRuntime {
         self.atlas.stats()
     }
 
-    /// Preflights the bounded atlas without changing the active or pending frame.
+    /// Builds an opaque scene transaction without changing active or pending graphics state.
     ///
     /// # Errors
-    /// Returns an invariant error for malformed assets.
-    pub fn scene_fits_atlas(&self, scene: &SceneData) -> Result<bool, GfxError> {
+    /// Returns the owned scene for color downgrade when the bounded atlas is full.
+    #[allow(clippy::result_large_err)] // The downgrade branch intentionally returns scene ownership.
+    pub fn prepare_scene(&self, scene: SceneData) -> Result<PreparedScene, PrepareSceneError> {
         match self.atlas.prepare(&scene.glyphs, &scene.glyph_assets) {
-            Ok(_) => Ok(true),
-            Err(crate::atlas::AtlasError::Full) => Ok(false),
-            Err(error) => Err(atlas_error(error)),
+            Ok(atlas) => Ok(PreparedScene { scene, atlas }),
+            Err(crate::atlas::AtlasError::Full) => {
+                Err(PrepareSceneError::NeedsColorDowngrade(scene))
+            }
+            Err(error) => Err(PrepareSceneError::Gfx(atlas_error(error))),
         }
     }
 

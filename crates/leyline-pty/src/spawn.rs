@@ -257,7 +257,123 @@ pub enum ChildExit {
 }
 
 enum CommandMessage {
-    Write(Vec<u8>),
+    Write {
+        bytes: Vec<u8>,
+        queued_at: Option<std::time::Instant>,
+    },
+}
+
+#[derive(Clone)]
+struct EventWake {
+    fd: Arc<File>,
+}
+
+impl EventWake {
+    fn new() -> io::Result<Self> {
+        // SAFETY: eventfd returns a newly owned descriptor on success.
+        let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
+        if fd == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            // SAFETY: successful eventfd returned a uniquely owned descriptor.
+            fd: Arc::new(unsafe { File::from_raw_fd(fd) }),
+        })
+    }
+
+    fn signal(&self) -> io::Result<()> {
+        let bytes = 1_u64.to_ne_bytes();
+        // SAFETY: the descriptor and fixed-size input buffer are valid for this call.
+        let written =
+            unsafe { libc::write(self.fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len()) };
+        if written == bytes.len().cast_signed()
+            || (written == -1 && io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock)
+        {
+            Ok(())
+        } else if written == -1 {
+            Err(io::Error::last_os_error())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short eventfd write",
+            ))
+        }
+    }
+
+    fn drain(&self) -> io::Result<()> {
+        let mut bytes = [0_u8; std::mem::size_of::<u64>()];
+        loop {
+            // SAFETY: the descriptor and fixed-size output buffer are valid for this call.
+            let read =
+                unsafe { libc::read(self.fd.as_raw_fd(), bytes.as_mut_ptr().cast(), bytes.len()) };
+            if read == bytes.len().cast_signed() {
+                continue;
+            }
+            if read == -1 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::WouldBlock {
+                    return Ok(());
+                }
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "short eventfd read",
+            ));
+        }
+    }
+
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+#[derive(Default)]
+struct PendingWrite {
+    bytes: Vec<u8>,
+    head: usize,
+}
+
+impl PendingWrite {
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[self.head..]
+    }
+
+    fn len(&self) -> usize {
+        self.bytes.len() - self.head
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn append(&mut self, bytes: &[u8]) {
+        debug_assert!(self.len().saturating_add(bytes.len()) <= MAX_OUTSTANDING_WRITE_BYTES);
+        self.bytes.extend_from_slice(bytes);
+    }
+
+    fn consume(&mut self, count: usize) {
+        assert!(count <= self.len(), "cannot consume beyond pending bytes");
+        self.head += count;
+        if self.head == self.bytes.len() {
+            self.bytes.clear();
+            self.head = 0;
+        } else if self.head >= 64 * 1024 && self.head >= self.bytes.len() / 2 {
+            self.bytes.drain(..self.head);
+            self.head = 0;
+        }
+    }
+}
+
+static WRITE_LATENCY_OBSERVER: std::sync::OnceLock<fn(std::time::Duration)> =
+    std::sync::OnceLock::new();
+
+/// Installs the process-wide input-to-first-write latency observer.
+pub fn set_write_latency_observer(observer: fn(std::time::Duration)) {
+    let _ = WRITE_LATENCY_OBSERVER.set(observer);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -272,6 +388,7 @@ pub struct PtyProcess {
     shutdown: Arc<AtomicBool>,
     outstanding_write_bytes: Arc<AtomicUsize>,
     latest_resize: Arc<Mutex<Option<PtySize>>>,
+    wake: EventWake,
     terminal: File,
     io_thread: Option<JoinHandle<()>>,
     wait_thread: Option<JoinHandle<()>>,
@@ -284,6 +401,7 @@ impl PtyProcess {
     /// Returns a typed resource, execution, or thread creation error.
     pub fn spawn(spec: SpawnSpec, sinks: PtySinks) -> Result<Self, SpawnError> {
         validate_spec(&spec)?;
+        let wake = EventWake::new().map_err(SpawnError::Pty)?;
         let (master, slave) = open_pty(spec.initial_size)?;
         let terminal = master.try_clone().map_err(SpawnError::Pty)?;
         let cwd_fd = spec.cwd.handle.as_raw_fd();
@@ -330,6 +448,7 @@ impl PtyProcess {
         let io_shutdown = Arc::clone(&shutdown);
         let io_outstanding = Arc::clone(&outstanding_write_bytes);
         let io_resize = Arc::clone(&latest_resize);
+        let io_wake = wake.clone();
         let io_thread = thread::Builder::new()
             .name("leyline-pty-io".into())
             .spawn(move || {
@@ -339,6 +458,7 @@ impl PtyProcess {
                     &io_shutdown,
                     &io_outstanding,
                     &io_resize,
+                    &io_wake,
                     &io_sinks,
                 );
             })
@@ -357,6 +477,7 @@ impl PtyProcess {
             Ok(thread) => thread,
             Err(error) => {
                 shutdown.store(true, Ordering::Release);
+                let _ = wake.signal();
                 let _ = io_thread.join();
                 return Err(SpawnError::Thread(error));
             }
@@ -366,6 +487,7 @@ impl PtyProcess {
             shutdown,
             outstanding_write_bytes,
             latest_resize,
+            wake,
             terminal,
             io_thread: Some(io_thread),
             wait_thread: Some(wait_thread),
@@ -384,6 +506,9 @@ impl PtyProcess {
             .latest_resize
             .lock()
             .map_err(|_| PtyCommandError::Unavailable)? = Some(size);
+        self.wake
+            .signal()
+            .map_err(|_| PtyCommandError::Unavailable)?;
         Ok(())
     }
     /// Queues a bounded parser response for the PTY master.
@@ -410,8 +535,19 @@ impl PtyProcess {
         if reserved.is_err() {
             return Ok(WriteStatus::WouldBlock);
         }
-        match self.commands.try_send(CommandMessage::Write(bytes)) {
-            Ok(()) => Ok(WriteStatus::Accepted),
+        let queued_at = WRITE_LATENCY_OBSERVER
+            .get()
+            .map(|_| std::time::Instant::now());
+        match self
+            .commands
+            .try_send(CommandMessage::Write { bytes, queued_at })
+        {
+            Ok(()) => {
+                self.wake
+                    .signal()
+                    .map_err(|_| PtyCommandError::Unavailable)?;
+                Ok(WriteStatus::Accepted)
+            }
             Err(crossbeam_channel::TrySendError::Full(_)) => {
                 self.outstanding_write_bytes
                     .fetch_sub(len, Ordering::AcqRel);
@@ -447,6 +583,9 @@ impl PtyProcess {
     /// Returns [`PtyCommandError::Unavailable`] when the endpoint is already unavailable.
     pub fn request_shutdown(&self) -> Result<(), PtyCommandError> {
         self.shutdown.store(true, Ordering::Release);
+        self.wake
+            .signal()
+            .map_err(|_| PtyCommandError::Unavailable)?;
         Ok(())
     }
     /// Waits for both owning workers to finish and observes panics.
@@ -480,6 +619,7 @@ impl PtyProcess {
     fn join_inner(&mut self, shutdown: bool) -> Result<(), JoinError> {
         if shutdown {
             self.shutdown.store(true, Ordering::Release);
+            let _ = self.wake.signal();
         }
         if self
             .io_thread
@@ -502,6 +642,7 @@ impl PtyProcess {
 impl Drop for PtyProcess {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        let _ = self.wake.signal();
         // Dropping JoinHandle detaches; shutdown ownership stays in worker-owned Arcs.
         self.io_thread.take();
         self.wait_thread.take();
@@ -581,11 +722,44 @@ fn io_worker(
     shutdown: &AtomicBool,
     outstanding: &AtomicUsize,
     latest_resize: &Mutex<Option<PtySize>>,
+    wake: &EventWake,
     sinks: &PtySinks,
 ) {
     let fd = master.as_raw_fd();
-    let mut pending_write = Vec::new();
+    let mut pending_write = PendingWrite::default();
+    let mut pending_commands = std::collections::VecDeque::new();
     'outer: loop {
+        let mut fds = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN
+                    | if pending_write.is_empty() {
+                        0
+                    } else {
+                        libc::POLLOUT
+                    },
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let poll = unsafe { libc::poll(fds.as_mut_ptr(), 2, -1) };
+        if poll < 0 {
+            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            (sinks.failed)(format!("poll: {}", io::Error::last_os_error()));
+            break;
+        }
+        if fds[1].revents & (libc::POLLIN | libc::POLLERR) != 0
+            && let Err(error) = wake.drain()
+        {
+            (sinks.failed)(format!("wake drain: {error}"));
+            break;
+        }
         if shutdown.load(Ordering::Acquire) {
             break;
         }
@@ -599,33 +773,35 @@ fn io_worker(
         }
         while let Ok(command) = commands.try_recv() {
             match command {
-                CommandMessage::Write(bytes) => pending_write.extend(bytes),
+                CommandMessage::Write { bytes, queued_at } => {
+                    pending_commands.push_back((bytes.len(), queued_at));
+                    pending_write.append(&bytes);
+                }
             }
-        }
-        let mut fds = [libc::pollfd {
-            fd,
-            events: libc::POLLIN
-                | if pending_write.is_empty() {
-                    0
-                } else {
-                    libc::POLLOUT
-                },
-            revents: 0,
-        }];
-        let poll = unsafe { libc::poll(fds.as_mut_ptr(), 1, 25) };
-        if poll < 0 {
-            if io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            (sinks.failed)(format!("poll: {}", io::Error::last_os_error()));
-            break;
         }
         if fds[0].revents & libc::POLLOUT != 0 && !pending_write.is_empty() {
-            let count =
-                unsafe { libc::write(fd, pending_write.as_ptr().cast(), pending_write.len()) };
+            let bytes = pending_write.as_slice();
+            let count = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
             if count > 0 {
                 let count = count.cast_unsigned();
-                pending_write.drain(..count);
+                let mut credited = count;
+                while credited != 0 {
+                    let Some((remaining, queued_at)) = pending_commands.front_mut() else {
+                        break;
+                    };
+                    if let Some(queued_at) = queued_at.take()
+                        && let Some(observer) = WRITE_LATENCY_OBSERVER.get()
+                    {
+                        observer(queued_at.elapsed());
+                    }
+                    let consumed = credited.min(*remaining);
+                    *remaining -= consumed;
+                    credited -= consumed;
+                    if *remaining == 0 {
+                        pending_commands.pop_front();
+                    }
+                }
+                pending_write.consume(count);
                 outstanding.fetch_sub(count, Ordering::AcqRel);
                 (sinks.writable)();
             }
@@ -681,7 +857,7 @@ fn io_worker(
         + commands
             .try_iter()
             .map(|command| match command {
-                CommandMessage::Write(bytes) => bytes.len(),
+                CommandMessage::Write { bytes, .. } => bytes.len(),
             })
             .sum::<usize>();
     if discarded != 0 {
@@ -892,12 +1068,62 @@ mod tests {
     use super::*;
     use std::{
         os::unix::ffi::OsStringExt,
-        sync::{Mutex, mpsc},
+        sync::{Mutex, atomic::AtomicUsize, mpsc},
         time::Duration,
     };
 
+    static WRITE_LATENCY_SAMPLES: AtomicUsize = AtomicUsize::new(0);
+
+    fn count_write_latency(_: Duration) {
+        WRITE_LATENCY_SAMPLES.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn cwd() -> SpawnDirectory {
         SpawnDirectory::open(std::path::Path::new("/tmp")).unwrap()
+    }
+
+    #[test]
+    fn event_wake_coalesces_drains_and_is_close_on_exec() {
+        let wake = EventWake::new().unwrap();
+        let flags = unsafe { libc::fcntl(wake.as_raw_fd(), libc::F_GETFD) };
+        assert_ne!(flags, -1);
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        wake.signal().unwrap();
+        wake.signal().unwrap();
+        wake.drain().unwrap();
+        wake.drain().unwrap();
+    }
+
+    #[test]
+    fn pending_write_uses_a_cursor_and_compacts_only_after_threshold() {
+        let mut pending = PendingWrite::default();
+        assert!(pending.is_empty());
+        pending.append(b"abcdef");
+        pending.consume(2);
+        assert_eq!(pending.as_slice(), b"cdef");
+        assert_eq!(pending.head, 2);
+
+        let mut pending = PendingWrite::default();
+        pending.append(&vec![7; 128 * 1024]);
+        pending.consume(64 * 1024 - 1);
+        assert_eq!(pending.head, 64 * 1024 - 1);
+        pending.consume(1);
+        assert_eq!(pending.head, 0);
+        assert_eq!(pending.len(), 64 * 1024);
+        assert!(pending.as_slice().iter().all(|byte| *byte == 7));
+
+        pending.consume(64 * 1024);
+        assert!(pending.is_empty());
+        assert_eq!(pending.head, 0);
+    }
+
+    #[test]
+    fn pending_write_preserves_interleaved_append_order() {
+        let mut pending = PendingWrite::default();
+        pending.append(b"first");
+        pending.consume(3);
+        pending.append(b"-second");
+        assert_eq!(pending.as_slice(), b"st-second");
     }
 
     fn collect(
@@ -952,6 +1178,33 @@ mod tests {
         let text = String::from_utf8_lossy(&output.lock().unwrap()).into_owned();
         assert!(text.contains("leyline-256color:truecolor"), "{text:?}");
         assert!(text.contains(":/tmp:/tmp"), "{text:?}");
+    }
+
+    #[test]
+    fn accepted_write_records_latency_and_releases_byte_credit() {
+        set_write_latency_observer(count_write_latency);
+        let before = WRITE_LATENCY_SAMPLES.load(Ordering::Relaxed);
+        let spec = SpawnSpec::command(
+            "/bin/sh".into(),
+            vec!["-c".into(), "read line".into()],
+            cwd(),
+            PtySize::new(40, 12, 0, 0).unwrap(),
+        )
+        .unwrap();
+        let (process, _output, done) = collect(spec);
+        assert_eq!(
+            process.try_write(b"done\n".to_vec()).unwrap(),
+            WriteStatus::Accepted
+        );
+        let _ = done.recv_timeout(Duration::from_secs(3)).unwrap();
+        let _ = done.recv_timeout(Duration::from_secs(3)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process.outstanding_write_bytes() != 0 {
+            assert!(Instant::now() < deadline, "write credit was not released");
+            thread::sleep(Duration::from_millis(1));
+        }
+        process.join().unwrap();
+        assert!(WRITE_LATENCY_SAMPLES.load(Ordering::Relaxed) > before);
     }
 
     #[test]

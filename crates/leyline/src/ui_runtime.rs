@@ -135,8 +135,12 @@ impl DesktopGfx {
         self.current_window_mut().acknowledge_resize()
     }
 
-    fn scene_fits_atlas(&self, scene: &leyline_gfx::SceneData) -> Result<bool, GfxError> {
-        self.current_window().scene_fits_atlas(scene)
+    #[allow(clippy::result_large_err)] // A downgrade error must retain the original scene.
+    fn prepare_scene(
+        &self,
+        scene: leyline_gfx::SceneData,
+    ) -> Result<leyline_gfx::PreparedScene, leyline_gfx::PrepareSceneError> {
+        self.current_window().prepare_scene(scene)
     }
 
     fn enable_text_input(
@@ -2220,7 +2224,7 @@ impl DesktopRuntime {
         let Some(WindowRecord::Ready(window)) = self.windows.get_mut(&current) else {
             return Err(UiRuntimeError::Grid("current window is not ready".into()));
         };
-        let mut scene = compose(
+        let scene = compose(
             &mut window.text,
             &mut window.tab_text,
             snapshot,
@@ -2248,18 +2252,32 @@ impl DesktopRuntime {
             &visual_map,
             window.layout_generation,
         )?;
-        if !self.gfx.scene_fits_atlas(&scene)? {
-            if !downgrade_color_working_set(&mut scene) {
-                return Err(crate::frame_composer::ComposeError::Capacity("glyph atlas").into());
+        let prepared = match self.gfx.prepare_scene(scene) {
+            Ok(prepared) => prepared,
+            Err(leyline_gfx::PrepareSceneError::NeedsColorDowngrade(mut scene)) => {
+                if !downgrade_color_working_set(&mut scene) {
+                    return Err(crate::frame_composer::ComposeError::Capacity("glyph atlas").into());
+                }
+                tracing::warn!(
+                    category = "capacity_pressure",
+                    operation = "color_to_gray_rebuild",
+                    "mixed atlas exceeded four pages; rebuilt the frame with grayscale emoji"
+                );
+                match self.gfx.prepare_scene(scene) {
+                    Ok(prepared) => prepared,
+                    Err(leyline_gfx::PrepareSceneError::NeedsColorDowngrade(_)) => {
+                        return Err(
+                            crate::frame_composer::ComposeError::Capacity("glyph atlas").into()
+                        );
+                    }
+                    Err(leyline_gfx::PrepareSceneError::Gfx(error)) => return Err(error.into()),
+                }
             }
-            tracing::warn!(
-                category = "capacity_pressure",
-                operation = "color_to_gray_rebuild",
-                "mixed atlas exceeded four pages; rebuilt the frame with grayscale emoji"
-            );
-        }
-        let key = scene.frame_key;
-        self.gfx.apply(leyline_gfx::GfxCommand::SetScene(scene))?;
+            Err(leyline_gfx::PrepareSceneError::Gfx(error)) => return Err(error.into()),
+        };
+        let key = prepared.frame_key();
+        self.gfx
+            .apply(leyline_gfx::GfxCommand::SetPreparedScene(prepared))?;
         self.pending_visual_map = Some((key, visual_map));
         Ok(())
     }

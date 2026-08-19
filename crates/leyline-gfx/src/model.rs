@@ -310,6 +310,19 @@ pub struct SceneData {
     pub frame_key: FrameKey,
 }
 
+/// A scene and the exact atlas state prepared for it as one opaque transaction.
+pub struct PreparedScene {
+    pub(crate) scene: SceneData,
+    pub(crate) atlas: crate::atlas::AtlasPreparation,
+}
+
+impl PreparedScene {
+    #[must_use]
+    pub const fn frame_key(&self) -> FrameKey {
+        self.scene.frame_key
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub struct FrameKey {
     pub snapshot_generation: u64,
@@ -359,11 +372,12 @@ pub enum GlyphRenderMode {
     Color = 1,
 }
 
+#[allow(clippy::large_enum_variant)] // Scene ownership stays direct across the command boundary.
 pub enum GfxCommand {
     SetTitle(String),
     SetPointerCursor(PointerCursor),
     SetDirty,
-    SetScene(SceneData),
+    SetPreparedScene(PreparedScene),
     RequestClose,
     RequestMaximized(bool),
     RequestFullscreen(bool),

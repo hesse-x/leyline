@@ -8,4 +8,5 @@ mod spawn;
 pub use spawn::{
     ChildExit, JoinError, MAX_OUTSTANDING_WRITE_BYTES, PtyCommandError, PtyProcess, PtySinks,
     PtySize, SpawnDirectory, SpawnDirectoryError, SpawnError, SpawnSpec, WriteStatus,
+    set_write_latency_observer,
 };

@@ -68,6 +68,7 @@ pub struct AtlasManager {
     entries: HashMap<GlyphKey, AtlasRect>,
     epoch: u64,
     repacks: u64,
+    revision: u64,
 }
 
 pub struct AtlasPreparation {
@@ -75,6 +76,7 @@ pub struct AtlasPreparation {
     pub instances: Vec<GlyphInstance>,
     next: AtlasManager,
     repacked: bool,
+    base_revision: u64,
 }
 
 impl AtlasPreparation {
@@ -107,6 +109,7 @@ impl AtlasManager {
             entries: HashMap::new(),
             epoch: 0,
             repacks: 0,
+            revision: 0,
         }
     }
 
@@ -136,10 +139,11 @@ impl AtlasManager {
         placements: &[GlyphPlacement],
         assets: &[GlyphAsset],
     ) -> Result<AtlasPreparation, AtlasError> {
+        let asset_index = build_asset_index(assets)?;
         let mut next = self.clone();
+        next.revision = self.revision.checked_add(1).ok_or(AtlasError::Overflow)?;
         let mut uploads = Vec::new();
         for asset in assets {
-            validate_bitmap(asset)?;
             if asset.bitmap.size_px == [0, 0] || next.entries.contains_key(&asset.key) {
                 continue;
             }
@@ -149,18 +153,21 @@ impl AtlasManager {
                 asset.bitmap.size_px[1],
             ) {
                 Ok(rect) => rect,
-                Err(AtlasError::Full) => return self.prepare_repack(placements, assets),
+                Err(AtlasError::Full) => {
+                    return self.prepare_repack(placements, assets, &asset_index);
+                }
                 Err(error) => return Err(error),
             };
             next.entries.insert(asset.key, rect);
             uploads.push((rect, asset.clone()));
         }
-        let instances = build_instances(&next.entries, placements, assets)?;
+        let instances = build_instances(&next.entries, placements, &asset_index)?;
         Ok(AtlasPreparation {
             uploads,
             instances,
             next,
             repacked: false,
+            base_revision: self.revision,
         })
     }
 
@@ -168,13 +175,14 @@ impl AtlasManager {
         &self,
         placements: &[GlyphPlacement],
         assets: &[GlyphAsset],
+        asset_index: &HashMap<GlyphKey, &GlyphAsset>,
     ) -> Result<AtlasPreparation, AtlasError> {
         let mut next = Self::new();
         next.epoch = self.epoch.checked_add(1).ok_or(AtlasError::Overflow)?;
         next.repacks = self.repacks.saturating_add(1);
+        next.revision = self.revision.checked_add(1).ok_or(AtlasError::Overflow)?;
         let mut uploads = Vec::new();
         for asset in assets {
-            validate_bitmap(asset)?;
             if asset.bitmap.size_px == [0, 0] || next.entries.contains_key(&asset.key) {
                 continue;
             }
@@ -186,12 +194,13 @@ impl AtlasManager {
             next.entries.insert(asset.key, rect);
             uploads.push((rect, asset.clone()));
         }
-        let instances = build_instances(&next.entries, placements, assets)?;
+        let instances = build_instances(&next.entries, placements, asset_index)?;
         Ok(AtlasPreparation {
             uploads,
             instances,
             next,
             repacked: true,
+            base_revision: self.revision,
         })
     }
 
@@ -202,6 +211,10 @@ impl AtlasManager {
         };
         *self = preparation.next;
         result
+    }
+
+    pub(crate) const fn accepts(&self, preparation: &AtlasPreparation) -> bool {
+        self.revision == preparation.base_revision
     }
 
     fn allocate(
@@ -267,6 +280,19 @@ fn validate_bitmap(asset: &GlyphAsset) -> Result<(), AtlasError> {
     Ok(())
 }
 
+fn build_asset_index(assets: &[GlyphAsset]) -> Result<HashMap<GlyphKey, &GlyphAsset>, AtlasError> {
+    let mut index = HashMap::with_capacity(assets.len());
+    for asset in assets {
+        validate_bitmap(asset)?;
+        if let Some(existing) = index.insert(asset.key, asset)
+            && existing.bitmap != asset.bitmap
+        {
+            return Err(AtlasError::ConflictingAsset(asset.key));
+        }
+    }
+    Ok(index)
+}
+
 pub struct AtlasCommit {
     pub instances: Vec<GlyphInstance>,
     pub repacked: bool,
@@ -276,7 +302,7 @@ pub struct AtlasCommit {
 fn build_instances(
     entries: &HashMap<GlyphKey, AtlasRect>,
     placements: &[GlyphPlacement],
-    assets: &[GlyphAsset],
+    assets: &HashMap<GlyphKey, &GlyphAsset>,
 ) -> Result<Vec<GlyphInstance>, AtlasError> {
     let mut instances = Vec::with_capacity(placements.len());
     for placement in placements {
@@ -284,8 +310,8 @@ fn build_instances(
             continue;
         };
         let asset = assets
-            .iter()
-            .find(|asset| asset.key == placement.key)
+            .get(&placement.key)
+            .copied()
             .ok_or(AtlasError::MissingAsset)?;
         let bitmap = &asset.bitmap;
         let mut x = placement.origin_px[0];
@@ -336,7 +362,6 @@ fn build_instances(
             color_scale: placement.color_scale,
         });
     }
-    instances.sort_by_key(|glyph| glyph.atlas_page);
     Ok(instances)
 }
 
@@ -358,6 +383,8 @@ pub enum AtlasError {
     MissingAsset,
     #[error("glyph bitmap length does not match its declared dimensions")]
     InvalidBitmap,
+    #[error("conflicting glyph assets share key {0:?}")]
+    ConflictingAsset(GlyphKey),
 }
 
 #[cfg(test)]
@@ -519,5 +546,77 @@ mod tests {
             Err(AtlasError::Full)
         ));
         assert_eq!(atlas.stats(), before);
+    }
+
+    #[test]
+    fn duplicate_identical_assets_share_one_index_entry() {
+        let glyph = asset(7, [8, 8]);
+        let duplicate = glyph.clone();
+        let prepared = AtlasManager::new()
+            .prepare(&[placement(&glyph)], &[glyph, duplicate])
+            .unwrap();
+        assert_eq!(prepared.uploads.len(), 1);
+        assert_eq!(prepared.instances.len(), 1);
+    }
+
+    #[test]
+    fn conflicting_assets_fail_without_changing_stats() {
+        let atlas = AtlasManager::new();
+        let before = atlas.stats();
+        let first = asset(7, [8, 8]);
+        let mut conflicting = first.clone();
+        conflicting.bitmap.advance_26_6 = 128;
+
+        assert!(matches!(
+            atlas.prepare(&[placement(&first)], &[first, conflicting]),
+            Err(AtlasError::ConflictingAsset(_))
+        ));
+        assert_eq!(atlas.stats(), before);
+    }
+
+    #[test]
+    fn missing_asset_is_rejected_for_resident_glyph() {
+        let mut atlas = AtlasManager::new();
+        let glyph = asset(7, [8, 8]);
+        let glyph_placement = placement(&glyph);
+        let prepared = atlas
+            .prepare(
+                std::slice::from_ref(&glyph_placement),
+                std::slice::from_ref(&glyph),
+            )
+            .unwrap();
+        atlas.commit(prepared);
+
+        assert!(matches!(
+            atlas.prepare(std::slice::from_ref(&glyph_placement), &[]),
+            Err(AtlasError::MissingAsset)
+        ));
+    }
+
+    #[test]
+    fn indexed_build_preserves_ten_thousand_placement_order() {
+        let assets = (0..256).map(|id| asset(id, [1, 1])).collect::<Vec<_>>();
+        let placements = (0..10_000)
+            .map(|index| {
+                let mut value = placement(&assets[index % assets.len()]);
+                let order = u16::try_from(index).unwrap();
+                value.origin_px[0] = i32::from(order);
+                value.clip_px[0] = u32::from(order);
+                value
+            })
+            .collect::<Vec<_>>();
+
+        let prepared = AtlasManager::new().prepare(&placements, &assets).unwrap();
+        assert_eq!(prepared.instances.len(), 10_000);
+        assert!(
+            prepared
+                .instances
+                .iter()
+                .enumerate()
+                .all(|(index, instance)| {
+                    instance.origin_px[0].to_bits()
+                        == f32::from(u16::try_from(index).unwrap()).to_bits()
+                })
+        );
     }
 }

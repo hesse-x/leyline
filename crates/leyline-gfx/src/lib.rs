@@ -22,10 +22,12 @@ pub use input::{
 pub use model::{
     ClipboardEvent, CommittedFrameKey, FrameKey, GfxCommand, GlyphInstance, GlyphPlacement,
     GlyphRenderMode, KeyInput, KeyState, LinearColor, LogicalSize, ModifiersState, PixelSize,
-    PlatformEvent, PointerCursor, PointerInput, PointerKind, RectangleInstance, RenderOutcome,
-    RenderScene, Scale120, SceneData, SelectionTarget, TextInputContext, TextInputEvent,
-    TextInputPurpose, TextInputRectangle, WindowState,
+    PlatformEvent, PointerCursor, PointerInput, PointerKind, PreparedScene, RectangleInstance,
+    RenderOutcome, RenderScene, Scale120, SceneData, SelectionTarget, TextInputContext,
+    TextInputEvent, TextInputPurpose, TextInputRectangle, WindowState,
 };
-pub use runtime::{GfxError, GfxInitError, GfxOptions, GfxRuntime, MAX_WINDOW_TITLE_BYTES};
+pub use runtime::{
+    GfxError, GfxInitError, GfxOptions, GfxRuntime, MAX_WINDOW_TITLE_BYTES, PrepareSceneError,
+};
 pub use vulkan::{RendererFault, RendererOperation};
 pub use wake::{EventWake, WakeError};
