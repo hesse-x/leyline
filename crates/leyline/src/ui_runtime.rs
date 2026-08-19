@@ -262,6 +262,7 @@ struct TabDragScroll {
 enum WindowRecord {
     Creating {
         cwd: SpawnDirectory,
+        title: String,
     },
     Moving {
         source: leyline_gfx::WindowId,
@@ -658,6 +659,7 @@ impl DesktopRuntime {
         let mut tab_presentation_changed = false;
         let fallback_title = launch_title(self.app.launch());
         let local_identity = self.app.launch_context().local_identity.clone();
+        let home = self.app.launch_context().home.clone();
         let window = self.current_window();
         let geometry = window.layout.terminal_geometry(window.layout_generation);
         let foreground = self.app.config().colors.foreground.0;
@@ -742,10 +744,10 @@ impl DesktopRuntime {
             tab.session.finish_io_round()?;
             let cwd_report = tab.session.take_cwd_report();
             if let Some(report) = cwd_report {
-                match self
+                let outcome = self
                     .current_tabs_mut()
-                    .apply_cwd_report(id, report, &local_identity)
-                {
+                    .apply_cwd_report(id, report, &local_identity);
+                match outcome {
                     Some(Ok(())) => tracing::debug!(
                         category = "cwd_report",
                         session_id = id.get(),
@@ -761,14 +763,33 @@ impl DesktopRuntime {
                     ),
                     None => {}
                 }
+                if matches!(outcome, Some(Ok(()))) {
+                    let tab = self
+                        .current_tabs_mut()
+                        .get_mut(id)
+                        .expect("cwd report owner exists");
+                    if tab.title_source == crate::tab::TabTitleSource::Default
+                        && let Some(hint) = &tab.cwd_hint
+                    {
+                        let title = cwd_title(&hint.path, home.as_deref());
+                        if tab.title != title {
+                            tab.title = title;
+                            tab_presentation_changed = true;
+                        }
+                    }
+                }
             }
             let tab = self
                 .current_tabs_mut()
                 .get_mut(id)
                 .expect("drain id exists");
             if let Some(title) = tab.session.take_title() {
+                let fallback = tab.cwd_hint.as_ref().map_or_else(
+                    || fallback_title.clone(),
+                    |hint| cwd_title(&hint.path, home.as_deref()),
+                );
                 tab_presentation_changed |=
-                    update_session_title(&mut tab.title, title, &fallback_title);
+                    update_session_title(&mut tab.title, &mut tab.title_source, title, &fallback);
             }
             let bell = tab.session.take_bell();
             if bell {
@@ -851,11 +872,14 @@ impl DesktopRuntime {
 
     fn refresh_active_title(&mut self) -> Result<(), UiRuntimeError> {
         let fallback = launch_title(self.app.launch());
+        let home = self.app.launch_context().home.clone();
         if let Some(title) = self.active_session_mut().take_title() {
-            self.current_tabs_mut()
-                .active_mut()
-                .expect("active tab")
-                .title = resolved_session_title(title, &fallback);
+            let tab = self.current_tabs_mut().active_mut().expect("active tab");
+            let fallback = tab.cwd_hint.as_ref().map_or_else(
+                || fallback.clone(),
+                |hint| cwd_title(&hint.path, home.as_deref()),
+            );
+            update_session_title(&mut tab.title, &mut tab.title_source, title, &fallback);
         }
         let active = self.current_tabs().active().expect("active tab");
         let ordinal = self
@@ -989,8 +1013,14 @@ impl DesktopRuntime {
             .ok_or_else(|| UiRuntimeError::Grid("tab count cannot be zero".into()))?;
         let mut session_ids = crate::tab::SessionIdAllocator::default();
         let initial_session_id = session_ids.allocate()?;
-        let tabs =
+        let mut tabs =
             TabManager::bootstrap_with_id(initial_session_id, session, app_runtime, max_count);
+        if let Some(tab) = tabs.active_mut() {
+            tab.title = cwd_title(
+                &app.launch_context().base_cwd,
+                app.launch_context().home.as_deref(),
+            );
+        }
         let wake_backend: Arc<dyn WakeBackend> = Arc::new(wake.clone());
         let reset_font_size = app.config().font.size;
         let clipboard_workers = crate::clipboard::TransferWorkers::new(&wake);
@@ -1218,7 +1248,7 @@ impl DesktopRuntime {
                     if let Some(map) = self.current_window_mut().presentation.commit(committed) {
                         let mapping_changed = visual_mapping_changed(previous.as_deref(), &map);
                         if mapping_changed {
-                            self.cancel_pointer_gesture();
+                            self.cancel_terminal_pointer_gesture();
                         }
                         self.refresh_text_input_rectangle()?;
                     }
@@ -2370,13 +2400,23 @@ impl DesktopRuntime {
     fn update_tab_bar(&mut self) {
         let viewport_width = self.current_window().layout.viewport_px.width;
         let offset = self.current_window().tab_bar.offset;
-        let tab_bar = crate::tab::TabBarPresentation::layout(
+        let drag = self
+            .current_window()
+            .tab_drag
+            .filter(|drag| drag.phase == crate::tab::TabDragPhase::Dragging);
+        let mut tab_bar = crate::tab::TabBarPresentation::layout(
             self.current_tabs(),
             viewport_width,
             self.gfx.scale().0,
             &self.app.config().tabs,
             offset,
         );
+        if let Some(drag) = drag {
+            #[allow(clippy::cast_possible_truncation)]
+            let offset_x = (drag.current[0] - drag.origin[0])
+                .clamp(f64::from(i32::MIN), f64::from(i32::MAX)) as i32;
+            tab_bar.apply_drag_preview(drag.session, offset_x);
+        }
         self.current_window_mut().tab_bar = tab_bar;
     }
 
@@ -2738,8 +2778,8 @@ impl DesktopRuntime {
             self.app.launch_context(),
         );
         let base = &self.app.launch_context().base_cwd;
-        let (cwd, final_origin) = match SpawnDirectory::open(&primary) {
-            Ok(cwd) => (cwd, origin),
+        let (cwd, title_path, final_origin) = match SpawnDirectory::open(&primary) {
+            Ok(cwd) => (cwd, primary.clone(), origin),
             Err(error) if primary != *base => {
                 tracing::warn!(
                     category = "tab_cwd",
@@ -2751,7 +2791,7 @@ impl DesktopRuntime {
                     "new tab cwd candidate unavailable"
                 );
                 match SpawnDirectory::open(base) {
-                    Ok(cwd) => (cwd, "base"),
+                    Ok(cwd) => (cwd, base.clone(), "base"),
                     Err(base_error) => {
                         tracing::warn!(
                             category = "tab_create_failed",
@@ -2787,7 +2827,7 @@ impl DesktopRuntime {
         let tab_bar_was_visible = tab_bar_visible(self.app.config(), self.current_tabs().len());
         self.quiesce_active_interaction()?;
         let id = self.session_ids.allocate()?;
-        let title = launch_title(self.app.launch());
+        let title = cwd_title(&title_path, self.app.launch_context().home.as_deref());
         match self
             .current_tabs_mut()
             .push_with_id(id, session, runtime, title)
@@ -2835,8 +2875,12 @@ impl DesktopRuntime {
             self.current_tabs().active(),
             self.app.launch_context(),
         );
-        let cwd = SpawnDirectory::open(&candidate)
-            .or_else(|_| SpawnDirectory::open(&self.app.launch_context().base_cwd))?;
+        let base = &self.app.launch_context().base_cwd;
+        let (cwd, title_path) = match SpawnDirectory::open(&candidate) {
+            Ok(cwd) => (cwd, candidate),
+            Err(_) => (SpawnDirectory::open(base)?, base.clone()),
+        };
+        let title = cwd_title(&title_path, self.app.launch_context().home.as_deref());
         let request = self.gfx.create_window(&GfxOptions {
             title: "Leyline".into(),
             default_size: self.gfx.logical_size(),
@@ -2853,7 +2897,8 @@ impl DesktopRuntime {
                 return Ok(());
             }
         };
-        self.windows.insert(id, WindowRecord::Creating { cwd });
+        self.windows
+            .insert(id, WindowRecord::Creating { cwd, title });
         tracing::info!(
             category = "window_create_requested",
             current_window_id = id.get(),
@@ -2932,11 +2977,12 @@ impl DesktopRuntime {
     }
 
     fn finish_window_creation(&mut self, id: leyline_gfx::WindowId) -> Result<(), UiRuntimeError> {
-        let Some(WindowRecord::Creating { cwd }) = self.windows.remove(&id) else {
+        let Some(WindowRecord::Creating { cwd, title }) = self.windows.remove(&id) else {
             return Ok(());
         };
         if self.gfx.window(id).is_none() {
-            self.windows.insert(id, WindowRecord::Creating { cwd });
+            self.windows
+                .insert(id, WindowRecord::Creating { cwd, title });
             return Ok(());
         }
         let prepared = (|| {
@@ -2971,15 +3017,14 @@ impl DesktopRuntime {
             .expect("configured window has graphics state")
             .scale();
         let font_size = self.app.config().font.size;
-        self.sessions.insert(
-            id,
-            TabManager::bootstrap_with_id(
-                session_id,
-                session,
-                runtime,
-                window_tab_limit(self.app.config()),
-            ),
+        let mut tabs = TabManager::bootstrap_with_id(
+            session_id,
+            session,
+            runtime,
+            window_tab_limit(self.app.config()),
         );
+        tabs.active_mut().expect("new window tab exists").title = title;
+        self.sessions.insert(id, tabs);
         self.windows.insert(
             id,
             WindowRecord::Ready(Box::new(WindowRuntime::ready(
@@ -4143,6 +4188,12 @@ impl DesktopRuntime {
     }
 
     fn cancel_pointer_gesture(&mut self) {
+        self.cancel_terminal_pointer_gesture();
+        self.current_window_mut().tab_drag = None;
+        self.current_window_mut().tab_drag_scroll = None;
+    }
+
+    fn cancel_terminal_pointer_gesture(&mut self) {
         self.current_window_mut().selecting = false;
         self.current_window_mut().selection_point = None;
         self.current_window_mut().selection_kind = None;
@@ -4151,8 +4202,6 @@ impl DesktopRuntime {
         self.current_window_mut().link_candidate = None;
         self.current_window_mut().click_tracker.reset();
         self.current_window_mut().scrollbar.cancel();
-        self.current_window_mut().tab_drag = None;
-        self.current_window_mut().tab_drag_scroll = None;
     }
 
     fn copy_selection(
@@ -4598,6 +4647,20 @@ fn launch_title(launch: &crate::cli::LaunchRequest) -> String {
     }
 }
 
+fn cwd_title(path: &std::path::Path, home: Option<&std::path::Path>) -> String {
+    if let Some(home) = home {
+        if path == home {
+            return "~/".into();
+        }
+        if let Ok(relative) = path.strip_prefix(home)
+            && !relative.as_os_str().is_empty()
+        {
+            return format!("~/{}", relative.to_string_lossy());
+        }
+    }
+    path.to_string_lossy().into_owned()
+}
+
 fn resolved_session_title(title: crate::session::SessionTitleDelta, fallback: &str) -> String {
     match title {
         crate::session::SessionTitleDelta::Set(title) if !title.is_empty() => title.to_string(),
@@ -4609,9 +4672,18 @@ fn resolved_session_title(title: crate::session::SessionTitleDelta, fallback: &s
 
 fn update_session_title(
     current: &mut String,
+    source: &mut crate::tab::TabTitleSource,
     title: crate::session::SessionTitleDelta,
     fallback: &str,
 ) -> bool {
+    *source = if matches!(
+        &title,
+        crate::session::SessionTitleDelta::Set(title) if !title.is_empty()
+    ) {
+        crate::tab::TabTitleSource::Explicit
+    } else {
+        crate::tab::TabTitleSource::Default
+    };
     let resolved = resolved_session_title(title, fallback);
     if *current == resolved {
         return false;
@@ -4634,7 +4706,7 @@ fn window_title(ordinal: usize, count: usize, title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        accumulate_wheel_steps, format_terminal_query, ignores_key_repeat,
+        accumulate_wheel_steps, cwd_title, format_terminal_query, ignores_key_repeat,
         keep_selection_after_release, key_text, renderer_fault_is_process_fatal,
         resolved_session_title, rotate_window_service_order, search_query_capacity,
         select_new_tab_cwd, should_cancel_search, starts_terminal_control_gesture,
@@ -4665,23 +4737,54 @@ mod tests {
     #[test]
     fn session_title_update_reports_tab_presentation_changes() {
         let mut current = "Shell".to_owned();
+        let mut source = crate::tab::TabTitleSource::Default;
         assert!(update_session_title(
             &mut current,
+            &mut source,
             crate::session::SessionTitleDelta::Set("Codex - ◐".into()),
             "Shell"
         ));
         assert_eq!(current, "Codex - ◐");
+        assert_eq!(source, crate::tab::TabTitleSource::Explicit);
         assert!(!update_session_title(
             &mut current,
+            &mut source,
             crate::session::SessionTitleDelta::Set("Codex - ◐".into()),
             "Shell"
         ));
         assert!(update_session_title(
             &mut current,
+            &mut source,
             crate::session::SessionTitleDelta::Set("Codex - ◓".into()),
             "Shell"
         ));
         assert_eq!(current, "Codex - ◓");
+        assert!(update_session_title(
+            &mut current,
+            &mut source,
+            crate::session::SessionTitleDelta::Reset,
+            "~/Leyline"
+        ));
+        assert_eq!(current, "~/Leyline");
+        assert_eq!(source, crate::tab::TabTitleSource::Default);
+    }
+
+    #[test]
+    fn cwd_titles_are_home_relative_only_below_home() {
+        let home = std::path::Path::new("/home/user");
+        assert_eq!(cwd_title(home, Some(home)), "~/");
+        assert_eq!(
+            cwd_title(std::path::Path::new("/home/user/work/repo"), Some(home)),
+            "~/work/repo"
+        );
+        assert_eq!(
+            cwd_title(std::path::Path::new("/home/username/repo"), Some(home)),
+            "/home/username/repo"
+        );
+        assert_eq!(
+            cwd_title(std::path::Path::new("/srv/repo"), Some(home)),
+            "/srv/repo"
+        );
     }
 
     fn registry_tab_manager(id: crate::tab::SessionId) -> crate::tab::TabManager {

@@ -180,9 +180,12 @@ The tab bar follows `[tabs].visibility`: `always`, `multiple`, or `never`. `Ctrl
 and activates a tab, `Ctrl+Shift+W` closes it, `Ctrl+Shift+Left/Right` cycles, and
 `Ctrl+Shift+1..9` activates an ordinal tab. `Ctrl+Shift+PageUp/PageDown` reorders the active tab.
 Mouse clicks switch tabs; a close button or middle click closes one, and dragging reorders tabs in
-the current window with bounded edge scrolling. `Ctrl+Shift+Alt+N` creates a new window with a new
-session, while `F11` toggles fullscreen. New tabs and windows repeat the startup launch request and
-use `[tabs].new_tab_cwd`: `inherit` prefers the active tab's last valid OSC 7 directory, `fixed`
+the current window with a moving title preview and bounded edge scrolling. By default, tab and
+window titles show the current local directory: `~/` for HOME, `~/...` below HOME, and an absolute
+path elsewhere. An explicit OSC 0/2 application title takes precedence until it is reset.
+`Ctrl+Shift+Alt+N` creates a new window with a new session, while `F11` toggles fullscreen. New tabs
+and windows repeat the startup launch request and use `[tabs].new_tab_cwd`: `inherit` prefers the
+active tab's last valid OSC 7 directory, `fixed`
 uses `new_tab_fixed_cwd`, and `home` uses the HOME captured at startup. Every unavailable candidate
 falls back to Leyline's startup directory. `MoveTabToNewWindow` moves the same live PTY into a new
 window without restarting it; bind it explicitly if desired. User `[[keybindings]]` entries can

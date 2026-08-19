@@ -510,7 +510,13 @@ fn compose_active_scene(
             });
         }
         let close_marker = tab_shaped_cache.get(&(TAB_CLOSE_MARK.to_owned(), FontStyle::Regular));
-        for item in &tab_bar.items {
+        // Draw the moving label last so it remains legible while crossing neighboring tabs.
+        for item in tab_bar
+            .items
+            .iter()
+            .filter(|item| item.drag_offset_x == 0)
+            .chain(tab_bar.items.iter().filter(|item| item.drag_offset_x != 0))
+        {
             if item.active {
                 rectangles.push(RectangleInstance {
                     origin_px: [item.rect.x as f32, item.rect.y as f32],
@@ -598,8 +604,17 @@ fn compose_active_scene(
                     })
                     .max(0)
                     / 64;
-                let text_origin = title_left as i32
-                    + (i32::try_from(available_width).unwrap_or(i32::MAX) - run_width).max(0) / 2;
+                let text_origin = (title_left as i32
+                    + (i32::try_from(available_width).unwrap_or(i32::MAX) - run_width).max(0) / 2)
+                    .saturating_add(item.drag_offset_x);
+                let title_clip = if item.drag_offset_x == 0 {
+                    [title_left, item.rect.y, available_width, item.rect.height]
+                } else {
+                    tab_bar.bar.map_or(
+                        [title_left, item.rect.y, available_width, item.rect.height],
+                        |bar| [bar.x, bar.y, bar.width, bar.height],
+                    )
+                };
                 let mut pen_x = 0_i32;
                 for glyph in &shaped.glyphs {
                     let Some(bitmap) = assets.get(&glyph.key) else {
@@ -616,7 +631,7 @@ fn compose_active_scene(
                         glyphs.push(GlyphPlacement {
                             key: glyph.key,
                             origin_px: [x, y],
-                            clip_px: [title_left, item.rect.y, available_width, item.rect.height],
+                            clip_px: title_clip,
                             color: LinearColor::from_srgba8(if item.active {
                                 TAB_ACTIVE_TEXT
                             } else if item.attention || item.unread {

@@ -64,12 +64,19 @@ pub struct TabEntry {
     pub session: TerminalSession,
     pub runtime: AppRuntime,
     pub title: String,
+    pub title_source: TabTitleSource,
     pub cwd_hint: Option<LocalCwdHint>,
     pub last_cwd_reject: Option<CwdRejectReason>,
     pub unread: bool,
     pub attention: bool,
     pub bell_muted: bool,
     active_bell_generation: Option<BellGeneration>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TabTitleSource {
+    Default,
+    Explicit,
 }
 
 pub struct ClosingTab {
@@ -114,6 +121,7 @@ pub struct TabBarItem {
     pub unread: bool,
     pub attention: bool,
     pub bell_muted: bool,
+    pub drag_offset_x: i32,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -238,6 +246,7 @@ impl TabBarPresentation {
                     unread: tab.unread,
                     attention: tab.attention,
                     bell_muted: tab.bell_muted,
+                    drag_offset_x: 0,
                 })
             })
             .collect();
@@ -275,6 +284,12 @@ impl TabBarPresentation {
             .find(|item| x < item.rect.x.saturating_add(item.rect.width / 2))
             .or_else(|| self.items.last())?;
         manager.tabs.iter().position(|tab| tab.id == item.id)
+    }
+
+    pub fn apply_drag_preview(&mut self, session: SessionId, offset_x: i32) {
+        if let Some(item) = self.items.iter_mut().find(|item| item.id == session) {
+            item.drag_offset_x = offset_x;
+        }
     }
 }
 
@@ -321,6 +336,7 @@ impl TabManager {
                 session,
                 runtime,
                 title: "Shell".into(),
+                title_source: TabTitleSource::Default,
                 cwd_hint: None,
                 last_cwd_reject: None,
                 unread: false,
@@ -395,6 +411,7 @@ impl TabManager {
             session,
             runtime,
             title,
+            title_source: TabTitleSource::Default,
             cwd_hint: None,
             last_cwd_reject: None,
             unread: false,
@@ -875,6 +892,27 @@ mod tests {
             }
         );
         assert_eq!(bar.max_offset, 0);
+    }
+
+    #[test]
+    fn drag_preview_moves_only_the_selected_label() {
+        let (session, runtime) = entry();
+        let mut manager = TabManager::bootstrap(session, runtime, NonZeroU8::new(2).unwrap());
+        let first = manager.active_id().unwrap();
+        let (session, runtime) = entry();
+        manager.push(session, runtime, "two".into()).unwrap();
+        let mut bar = TabBarPresentation::layout(
+            &manager,
+            800,
+            120,
+            &crate::config::EffectiveConfig::default().tabs,
+            0,
+        );
+
+        bar.apply_drag_preview(first, 37);
+
+        assert_eq!(bar.items[0].drag_offset_x, 37);
+        assert_eq!(bar.items[1].drag_offset_x, 0);
     }
 
     #[test]
