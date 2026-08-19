@@ -646,7 +646,7 @@ impl DesktopRuntime {
         let mut events = 0_usize;
         let mut bytes = 0_usize;
         let mut completed = Vec::new();
-        let mut bell_presentation_changed = false;
+        let mut tab_presentation_changed = false;
         let fallback_title = launch_title(self.app.launch());
         let local_identity = self.app.launch_context().local_identity.clone();
         let geometry = self.layout.terminal_geometry(self.layout_generation);
@@ -697,7 +697,7 @@ impl DesktopRuntime {
                     }
                 };
                 if output_activity && id != self.current_tabs().active_id().expect("active tab") {
-                    bell_presentation_changed |= self.current_tabs_mut().mark_unread(id);
+                    tab_presentation_changed |= self.current_tabs_mut().mark_unread(id);
                 }
                 if matches!(action, SessionAction::Completed) {
                     completed.push(id);
@@ -757,7 +757,8 @@ impl DesktopRuntime {
                 .get_mut(id)
                 .expect("drain id exists");
             if let Some(title) = tab.session.take_title() {
-                tab.title = resolved_session_title(title, &fallback_title);
+                tab_presentation_changed |=
+                    update_session_title(&mut tab.title, title, &fallback_title);
             }
             let bell = tab.session.take_bell();
             if bell {
@@ -778,7 +779,7 @@ impl DesktopRuntime {
                     let generation = self
                         .current_tabs_mut()
                         .record_background_bell(id, effects.show_attention_marker)?;
-                    bell_presentation_changed |= effects.show_attention_marker && !was_attention;
+                    tab_presentation_changed |= effects.show_attention_marker && !was_attention;
                     Some(generation)
                 } else {
                     None
@@ -786,7 +787,7 @@ impl DesktopRuntime {
                 if effects.schedule_visual {
                     self.visual_bell
                         .schedule(id, Instant::now(), visual_duration);
-                    bell_presentation_changed = true;
+                    tab_presentation_changed = true;
                 }
                 if effects.enqueue_notification {
                     let ordinal = self
@@ -829,7 +830,7 @@ impl DesktopRuntime {
         }
         self.current_tabs_mut().poll_closing(Instant::now())?;
         self.sessions.reconcile(self.current_window_id);
-        if bell_presentation_changed && !self.current_tabs().is_empty() {
+        if tab_presentation_changed && !self.current_tabs().is_empty() {
             self.compose_latest()?;
         }
         Ok(())
@@ -4415,6 +4416,19 @@ fn resolved_session_title(title: crate::session::SessionTitleDelta, fallback: &s
     }
 }
 
+fn update_session_title(
+    current: &mut String,
+    title: crate::session::SessionTitleDelta,
+    fallback: &str,
+) -> bool {
+    let resolved = resolved_session_title(title, fallback);
+    if *current == resolved {
+        return false;
+    }
+    *current = resolved;
+    true
+}
+
 fn window_title(ordinal: usize, count: usize, title: &str) -> String {
     let prefix = format!("[{ordinal}/{count}] ");
     let suffix = " — Leyline";
@@ -4434,7 +4448,7 @@ mod tests {
         resolved_session_title, rotate_window_service_order, search_query_capacity,
         select_new_tab_cwd, should_cancel_search, starts_terminal_control_gesture,
         tab_drag_edge_direction, take_matching_pending, take_priority_close_event,
-        terminal_key_owner_changed, terminal_modifiers, visible_search_query,
+        terminal_key_owner_changed, terminal_modifiers, update_session_title, visible_search_query,
         visual_mapping_changed, xkb_text_allowed,
     };
 
@@ -4455,6 +4469,28 @@ mod tests {
             ),
             "Editor"
         );
+    }
+
+    #[test]
+    fn session_title_update_reports_tab_presentation_changes() {
+        let mut current = "Shell".to_owned();
+        assert!(update_session_title(
+            &mut current,
+            crate::session::SessionTitleDelta::Set("Codex - ◐".into()),
+            "Shell"
+        ));
+        assert_eq!(current, "Codex - ◐");
+        assert!(!update_session_title(
+            &mut current,
+            crate::session::SessionTitleDelta::Set("Codex - ◐".into()),
+            "Shell"
+        ));
+        assert!(update_session_title(
+            &mut current,
+            crate::session::SessionTitleDelta::Set("Codex - ◓".into()),
+            "Shell"
+        ));
+        assert_eq!(current, "Codex - ◓");
     }
 
     fn registry_tab_manager(id: crate::tab::SessionId) -> crate::tab::TabManager {
