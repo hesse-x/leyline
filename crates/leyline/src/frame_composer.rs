@@ -98,6 +98,7 @@ pub struct FrameOverlays<'a> {
     pub search: Option<&'a SearchOverlay>,
     pub preedit: Option<&'a PreeditOverlay>,
     pub paste_confirmation: Option<&'a PasteConfirmationOverlay>,
+    pub close_confirmation: bool,
     pub scrollbar: Option<&'a ScrollbarPresentation>,
     pub tab_bar: Option<&'a crate::tab::TabBarPresentation>,
     pub search_dialog: Option<&'a crate::search::SearchDialogPresentation>,
@@ -184,6 +185,11 @@ fn compose_active_scene(
     visual_map: &VisualGridMap,
     layout_generation: u64,
 ) -> Result<SceneData, ComposeError> {
+    let confirmation_lines = overlays
+        .paste_confirmation
+        .map(paste_confirmation_lines)
+        .or_else(|| overlays.close_confirmation.then(close_confirmation_lines));
+    let hides_terminal = overlays.paste_confirmation.is_some();
     if snapshot.grid != layout.grid
         || snapshot.cells.len() != snapshot.grid.columns() * snapshot.grid.lines()
         || visual_map.grid != snapshot.grid
@@ -223,7 +229,8 @@ fn compose_active_scene(
     let (shaped_cache, terminal_shapes, mut assets) = prepare_glyph_working_set(
         text,
         snapshot,
-        overlays.paste_confirmation,
+        confirmation_lines.as_deref(),
+        hides_terminal,
         overlays.preedit,
         visual_map,
     )?;
@@ -251,9 +258,10 @@ fn compose_active_scene(
     let cursor_visible = snapshot.cursor.visible
         && (snapshot.cursor.blink == CursorBlink::Steady || cursor_policy.blink_phase_visible);
     let mut decoration_primitives = 0_usize;
-    if let Some(confirmation) = overlays.paste_confirmation {
-        compose_paste_confirmation(
-            confirmation,
+    if hides_terminal && let Some(lines) = confirmation_lines.as_deref() {
+        compose_confirmation(
+            lines,
+            true,
             layout,
             metrics,
             &shaped_cache,
@@ -767,6 +775,20 @@ fn compose_active_scene(
             }
         }
     }
+    if overlays.close_confirmation
+        && let Some(lines) = confirmation_lines.as_deref()
+    {
+        compose_confirmation(
+            lines,
+            false,
+            layout,
+            metrics,
+            &shaped_cache,
+            &mut rectangles,
+            &mut glyphs,
+            &mut assets,
+        )?;
+    }
     validate_glyph_working_set(&glyphs, &assets)?;
     Ok(SceneData {
         clear: LinearColor::from_srgba8(colors.background.0),
@@ -806,7 +828,8 @@ fn glyph_intersects_rect(
 fn prepare_glyph_working_set(
     text: &mut TextSystem,
     snapshot: &FrameSnapshot,
-    paste_confirmation: Option<&PasteConfirmationOverlay>,
+    confirmation_lines: Option<&[String]>,
+    hides_terminal: bool,
     preedit: Option<&PreeditOverlay>,
     visual_map: &VisualGridMap,
 ) -> Result<(ShapedCache, TerminalShapes, GlyphAssets), ComposeError> {
@@ -817,11 +840,12 @@ fn prepare_glyph_working_set(
             requests.push((cluster, style));
         }
     };
-    if let Some(confirmation) = paste_confirmation {
-        for line in paste_confirmation_lines(confirmation) {
-            request(line, FontStyle::Regular);
+    if let Some(lines) = confirmation_lines {
+        for line in lines {
+            request(line.clone(), FontStyle::Regular);
         }
-    } else {
+    }
+    if !hides_terminal {
         for cell in snapshot.cells.iter() {
             if matches!(cell.width, CellWidth::Spacer | CellWidth::LeadingSpacer)
                 || cell.flags.hidden
@@ -864,16 +888,24 @@ fn prepare_glyph_working_set(
         }
         shaped.insert((cluster, style), run);
     }
-    let terminal_shapes = if paste_confirmation.is_none() && visual_map.bidi_enabled {
+    let terminal_shapes = if !hides_terminal && visual_map.bidi_enabled {
         prepare_terminal_runs(text, snapshot, visual_map, &mut key_set, &mut keys)?
     } else {
         TerminalShapes::new()
     };
-    let placements = if paste_confirmation.is_some() {
-        count_prepared_placements(snapshot, paste_confirmation, preedit, &shaped)
+    let placements = if hides_terminal {
+        count_prepared_placements(snapshot, confirmation_lines, preedit, &shaped)
     } else {
-        terminal_shapes.values().try_fold(0_usize, |total, shape| {
-            total.checked_add(shape.run.glyphs.len())
+        let terminal = if visual_map.bidi_enabled {
+            terminal_shapes.values().try_fold(0_usize, |total, shape| {
+                total.checked_add(shape.run.glyphs.len())
+            })
+        } else {
+            count_prepared_placements(snapshot, None, preedit, &shaped)
+        };
+        terminal.and_then(|terminal| {
+            count_confirmation_placements(confirmation_lines, &shaped)
+                .and_then(|confirmation| terminal.checked_add(confirmation))
         })
     };
     if placements.is_none_or(|count| count > MAX_PREPARED_GLYPHS) {
@@ -1265,19 +1297,17 @@ fn search_icon_asset(points_down: bool) -> GlyphAsset {
 
 fn count_prepared_placements(
     snapshot: &FrameSnapshot,
-    paste_confirmation: Option<&PasteConfirmationOverlay>,
+    confirmation_lines: Option<&[String]>,
     preedit: Option<&PreeditOverlay>,
     shaped: &ShapedCache,
 ) -> Option<usize> {
-    if let Some(confirmation) = paste_confirmation {
-        paste_confirmation_lines(confirmation)
-            .iter()
-            .try_fold(0_usize, |total, line| {
-                let count = shaped
-                    .get(&(line.clone(), FontStyle::Regular))
-                    .map_or(0, |run| run.glyphs.len());
-                total.checked_add(count)
-            })
+    if let Some(lines) = confirmation_lines {
+        lines.iter().try_fold(0_usize, |total, line| {
+            let count = shaped
+                .get(&(line.clone(), FontStyle::Regular))
+                .map_or(0, |run| run.glyphs.len());
+            total.checked_add(count)
+        })
     } else {
         let mut total = 0_usize;
         for cell in snapshot.cells.iter().filter(|cell| {
@@ -1314,6 +1344,18 @@ fn count_prepared_placements(
         }
         Some(total)
     }
+}
+
+fn count_confirmation_placements(lines: Option<&[String]>, shaped: &ShapedCache) -> Option<usize> {
+    lines
+        .unwrap_or_default()
+        .iter()
+        .try_fold(0_usize, |total, line| {
+            let count = shaped
+                .get(&(line.clone(), FontStyle::Regular))
+                .map_or(0, |run| run.glyphs.len());
+            total.checked_add(count)
+        })
 }
 
 fn validate_glyph_working_set(
@@ -1360,9 +1402,14 @@ fn validate_glyph_budget(
     Ok(())
 }
 
-#[allow(clippy::cast_precision_loss)]
-fn compose_paste_confirmation(
-    confirmation: &PasteConfirmationOverlay,
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+fn compose_confirmation(
+    lines: &[String],
+    hides_terminal: bool,
     layout: &GridLayout,
     metrics: CellMetrics,
     shaped_cache: &ShapedCache,
@@ -1370,50 +1417,87 @@ fn compose_paste_confirmation(
     glyphs: &mut Vec<GlyphPlacement>,
     assets: &mut GlyphAssets,
 ) -> Result<(), ComposeError> {
-    let lines = paste_confirmation_lines(confirmation);
     let cell_width = u32::from(layout.cell_px[0].get());
     let cell_height = u32::from(layout.cell_px[1].get());
-    let margin = cell_width.saturating_mul(2);
-    let panel_width = cell_width
-        .saturating_mul(62)
-        .min(layout.viewport_px.width.saturating_sub(margin).max(1));
-    let panel_height = cell_height
-        .saturating_mul(6)
-        .min(layout.viewport_px.height.max(1));
-    let panel_origin = [
-        layout.viewport_px.width.saturating_sub(panel_width) / 2,
-        layout.viewport_px.height.saturating_sub(panel_height) / 2,
-    ];
+    let geometry = close_dialog_geometry(layout);
+    let panel_origin = [geometry.panel.x, geometry.panel.y];
+    let panel_width = geometry.panel.width;
+    let panel_height = geometry.panel.height;
 
-    // The modal card deliberately hides terminal content and never receives clipboard text.
-    glyphs.clear();
+    if hides_terminal {
+        // Paste confirmation intentionally hides terminal content and never receives clipboard text.
+        glyphs.clear();
+        rectangles.push(RectangleInstance {
+            origin_px: [0.0, 0.0],
+            size_px: [
+                layout.viewport_px.width as f32,
+                layout.viewport_px.height as f32,
+            ],
+            color: LinearColor::from_srgba8(0x090b_0fff),
+        });
+    } else {
+        glyphs.retain(|glyph| !glyph_intersects_rect(glyph, geometry.shadow, assets));
+        rectangles.push(RectangleInstance {
+            origin_px: [geometry.shadow.x as f32, geometry.shadow.y as f32],
+            size_px: [geometry.shadow.width as f32, geometry.shadow.height as f32],
+            color: LinearColor::from_srgba8(0x1717_17ff),
+        });
+    }
     rectangles.push(RectangleInstance {
-        origin_px: [0.0, 0.0],
-        size_px: [
-            layout.viewport_px.width as f32,
-            layout.viewport_px.height as f32,
+        origin_px: [
+            panel_origin[0].saturating_sub(2) as f32,
+            panel_origin[1].saturating_sub(2) as f32,
         ],
-        color: LinearColor::from_srgba8(0x090b_0fff),
+        size_px: [
+            panel_width.saturating_add(4) as f32,
+            panel_height.saturating_add(4) as f32,
+        ],
+        color: LinearColor::from_srgba8(if hides_terminal {
+            0xf2b8_4bff
+        } else {
+            TAB_DIVIDER
+        }),
     });
     rectangles.push(RectangleInstance {
         origin_px: [panel_origin[0] as f32, panel_origin[1] as f32],
         size_px: [panel_width as f32, panel_height as f32],
-        color: LinearColor::from_srgba8(0x1c22_29ff),
+        color: LinearColor::from_srgba8(if hides_terminal {
+            0x1c22_29ff
+        } else {
+            TAB_BAR_BACKGROUND
+        }),
     });
     rectangles.push(RectangleInstance {
         origin_px: [panel_origin[0] as f32, panel_origin[1] as f32],
-        size_px: [panel_width as f32, 3.0],
-        color: LinearColor::from_srgba8(0xf2b8_4bff),
+        size_px: [panel_width as f32, if hides_terminal { 3.0 } else { 2.0 }],
+        color: LinearColor::from_srgba8(if hides_terminal {
+            0xf2b8_4bff
+        } else {
+            TAB_ACCENT
+        }),
     });
 
     let text_x = panel_origin[0].saturating_add(cell_width.saturating_mul(2));
-    for (index, line) in lines.iter().enumerate() {
+    let body_lines = if hides_terminal {
+        lines.len()
+    } else {
+        lines.len().min(3)
+    };
+    for (index, line) in lines.iter().take(body_lines).enumerate() {
         let line_index = u32::try_from(index).unwrap_or(u32::MAX);
         let origin = [
             text_x,
             panel_origin[1].saturating_add(cell_height.saturating_mul(line_index + 1)),
         ];
-        let color = if index == 0 { 0xf2b8_4bff } else { 0xf4f1_e8ff };
+        let color = if index == 0 {
+            if hides_terminal {
+                0xf2b8_4bff
+            } else {
+                TAB_ACTIVE_TEXT
+            }
+        } else {
+            TAB_INACTIVE_TEXT
+        };
         append_overlay_text(
             line,
             origin,
@@ -1426,7 +1510,97 @@ fn compose_paste_confirmation(
             assets,
         )?;
     }
+    if !hides_terminal && lines.len() >= 5 {
+        for (button, label) in [
+            (geometry.close_button, &lines[3]),
+            (geometry.cancel_button, &lines[4]),
+        ] {
+            rectangles.push(RectangleInstance {
+                origin_px: [button.x as f32, button.y as f32],
+                size_px: [button.width as f32, button.height as f32],
+                color: LinearColor::from_srgba8(if button == geometry.close_button {
+                    TAB_ACCENT
+                } else {
+                    TAB_DIVIDER
+                }),
+            });
+            append_overlay_text(
+                label,
+                [
+                    button.x.saturating_add(cell_width.saturating_mul(2)),
+                    button.y.saturating_add(cell_height),
+                ],
+                panel_origin,
+                [panel_width, panel_height],
+                TAB_ACTIVE_TEXT,
+                metrics,
+                shaped_cache,
+                glyphs,
+                assets,
+            )?;
+        }
+    }
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CloseDialogGeometry {
+    pub panel: crate::tab::PixelRect,
+    pub shadow: crate::tab::PixelRect,
+    pub close_button: crate::tab::PixelRect,
+    pub cancel_button: crate::tab::PixelRect,
+}
+
+#[must_use]
+pub fn close_dialog_geometry(layout: &GridLayout) -> CloseDialogGeometry {
+    let cell_width = u32::from(layout.cell_px[0].get());
+    let cell_height = u32::from(layout.cell_px[1].get());
+    let margin = cell_width.saturating_mul(4);
+    let width = cell_width
+        .saturating_mul(58)
+        .min(layout.viewport_px.width.saturating_sub(margin).max(1));
+    let height = cell_height
+        .saturating_mul(9)
+        .min(layout.viewport_px.height.saturating_sub(cell_height).max(1));
+    let panel = crate::tab::PixelRect {
+        x: layout.viewport_px.width.saturating_sub(width) / 2,
+        y: layout.viewport_px.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let button_width = cell_width.saturating_mul(14).min(width / 3);
+    let button_height = cell_height.saturating_mul(2);
+    let button_y = panel.y.saturating_add(
+        height
+            .saturating_sub(button_height)
+            .saturating_sub(cell_height),
+    );
+    let inset = cell_width.saturating_mul(4);
+    let close_button = crate::tab::PixelRect {
+        x: panel.x.saturating_add(inset),
+        y: button_y,
+        width: button_width,
+        height: button_height,
+    };
+    let cancel_button = crate::tab::PixelRect {
+        x: panel
+            .x
+            .saturating_add(width.saturating_sub(inset).saturating_sub(button_width)),
+        y: button_y,
+        width: button_width,
+        height: button_height,
+    };
+    CloseDialogGeometry {
+        panel,
+        shadow: crate::tab::PixelRect {
+            x: panel.x.saturating_add(cell_width),
+            y: panel.y.saturating_add(cell_height / 2),
+            width,
+            height,
+        },
+        close_button,
+        cancel_button,
+    }
 }
 
 #[allow(clippy::too_many_arguments, clippy::cast_possible_wrap)]
@@ -1475,7 +1649,7 @@ fn append_overlay_text(
     Ok(())
 }
 
-fn paste_confirmation_lines(confirmation: &PasteConfirmationOverlay) -> [String; 4] {
+fn paste_confirmation_lines(confirmation: &PasteConfirmationOverlay) -> Vec<String> {
     let source = match confirmation.source {
         TransferTarget::Clipboard => "Clipboard",
         TransferTarget::Primary => "Primary selection",
@@ -1484,7 +1658,7 @@ fn paste_confirmation_lines(confirmation: &PasteConfirmationOverlay) -> [String;
         PasteRisk::Multiline => "Multiple lines may execute commands",
         PasteRisk::ControlCharacters => "Control characters may alter terminal state",
     };
-    [
+    vec![
         "PASTE REQUIRES CONFIRMATION".to_owned(),
         format!(
             "Source: {source}   {} bytes   {} lines",
@@ -1492,6 +1666,16 @@ fn paste_confirmation_lines(confirmation: &PasteConfirmationOverlay) -> [String;
         ),
         format!("Risk: {risk}"),
         "Enter / Y  Paste     Esc / N  Cancel".to_owned(),
+    ]
+}
+
+fn close_confirmation_lines() -> Vec<String> {
+    vec![
+        "Close tab?".to_owned(),
+        "A process is still running.".to_owned(),
+        "Closing this tab will terminate the process.".to_owned(),
+        "Close tab".to_owned(),
+        "Cancel".to_owned(),
     ]
 }
 

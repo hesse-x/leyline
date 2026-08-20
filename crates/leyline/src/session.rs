@@ -107,6 +107,7 @@ pub struct TerminalSession {
     state: SessionState,
     exited: Option<ChildExit>,
     read_closed: bool,
+    leader_is_shell: bool,
     hold_after_exit: bool,
     dirty: bool,
     force_frame: bool,
@@ -139,6 +140,7 @@ impl TerminalSession {
         initial_size: GridSize,
         runtime: &AppRuntime,
     ) -> Result<Self, SessionStartError> {
+        let leader_is_shell = matches!(launch, LaunchRequest::DefaultShell);
         let pty_size =
             leyline_pty::PtySize::new(initial_size.columns.get(), initial_size.lines.get(), 0, 0)?;
         let mut spec = match launch {
@@ -195,6 +197,7 @@ impl TerminalSession {
                         crate::config::CursorStyle::Beam => CursorShape::Beam,
                         crate::config::CursorStyle::Underline => CursorShape::Underline,
                     },
+                    scroll_on_output: config.scrolling.scroll_on_output,
                 },
             )?,
             cwd_tracker: CwdTracker::default(),
@@ -202,6 +205,7 @@ impl TerminalSession {
             state: SessionState::Running,
             exited: None,
             read_closed: false,
+            leader_is_shell,
             hold_after_exit: config.behavior.hold_after_exit,
             dirty: true,
             force_frame: true,
@@ -461,6 +465,21 @@ impl TerminalSession {
     }
     pub fn foreground_process_group(&self) -> Option<u32> {
         self.process.as_ref()?.foreground_process_group().ok()
+    }
+    #[must_use]
+    pub fn has_foreground_job(&self) -> bool {
+        if self.state != SessionState::Running {
+            return false;
+        }
+        if !self.leader_is_shell {
+            return true;
+        }
+        let Some(process) = &self.process else {
+            return false;
+        };
+        process
+            .foreground_process_group()
+            .is_ok_and(|foreground| foreground != process.leader_process_group())
     }
     pub fn input_key(
         &mut self,
@@ -1154,14 +1173,9 @@ mod tests {
     #[test]
     fn offscreen_output_does_not_change_the_visible_frame() {
         let mut core = TerminalCoreAdapter::new(GridSize::new(8, 3).unwrap(), 10).unwrap();
-        core.advance(b"one\r\ntwo\r\nthree").unwrap();
-        core.start_selection(
-            crate::terminal::SelectionKind::Simple,
-            crate::terminal::SelectionPoint { column: 0, line: 0 },
-            crate::terminal::SelectionSide::Left,
-        )
-        .unwrap();
-        core.advance(b"\r\nfour\r\nfive").unwrap();
+        core.advance(b"one\r\ntwo\r\nthree\r\nfour\r\nfive")
+            .unwrap();
+        core.scroll_display(1).unwrap();
         let previous = core.snapshot().unwrap();
         assert!(!previous.cursor.visible);
 
@@ -1316,6 +1330,43 @@ mod tests {
 
         assert!(session.pending_input.is_empty());
         assert_eq!(session.pending_input_bytes, 0);
+        session.begin_shutdown();
+    }
+
+    #[test]
+    fn direct_and_text_input_restore_live_output_following() {
+        let runtime = AppRuntimeBuilder::new(Arc::new(CountingWake::default()))
+            .build()
+            .unwrap();
+        let config = EffectiveConfig::default();
+        let launch = LaunchRequest::Command(crate::cli::CommandSpec {
+            program: OsString::from("/bin/sh"),
+            args: vec![OsString::from("-c"), OsString::from("exec sleep 30")],
+        });
+        let mut session = TerminalSession::start(
+            &launch,
+            cwd(),
+            &config,
+            GridSize::new(10, 2).unwrap(),
+            &runtime,
+        )
+        .unwrap();
+        session.core.advance(b"one\r\ntwo\r\nthree").unwrap();
+
+        session.core.scroll_display(1).unwrap();
+        session.commit_text("x").unwrap();
+        assert_eq!(session.core.snapshot().unwrap().display_offset, 0);
+        session.core.advance(b"\r\nfour\r\nfive").unwrap();
+        assert_eq!(session.core.snapshot().unwrap().display_offset, 0);
+
+        session.core.scroll_display(1).unwrap();
+        session
+            .input_key(
+                crate::terminal::TerminalKey::Enter,
+                crate::terminal::Modifiers::default(),
+            )
+            .unwrap();
+        assert_eq!(session.core.snapshot().unwrap().display_offset, 0);
         session.begin_shutdown();
     }
 

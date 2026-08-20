@@ -35,6 +35,17 @@ use crate::{
 struct PendingVisualBuild {
     snapshot: crate::terminal::FrameSnapshot,
     builder: VisualMapBuilder,
+    queued_snapshot: Option<crate::terminal::FrameSnapshot>,
+}
+
+impl PendingVisualBuild {
+    fn queue_latest(&mut self, snapshot: &crate::terminal::FrameSnapshot) {
+        self.queued_snapshot = Some(snapshot.clone());
+    }
+
+    fn take_queued(&mut self) -> Option<crate::terminal::FrameSnapshot> {
+        self.queued_snapshot.take()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -48,6 +59,12 @@ struct PressedTerminalKey {
     identity: leyline_gfx::KeyIdentity,
     associated_text_allowed: bool,
     foreground_process_group: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CloseConfirmation {
+    session: crate::tab::SessionId,
+    ime_suspended: bool,
 }
 
 struct DesktopGfx {
@@ -433,6 +450,7 @@ pub struct WindowRuntime {
     ime: ImeState,
     ime_context: Option<leyline_gfx::TextInputContext>,
     pending_search_paste: Option<(crate::tab::SessionId, u64)>,
+    close_confirmation: Option<CloseConfirmation>,
     last_input_serial: Option<leyline_gfx::InputSerial>,
     wheel_remainder_120: i32,
     scrollbar: ScrollbarController,
@@ -484,6 +502,7 @@ impl WindowRuntime {
             ime: ImeState::default(),
             ime_context: None,
             pending_search_paste: None,
+            close_confirmation: None,
             last_input_serial: None,
             wheel_remainder_120: 0,
             scrollbar: ScrollbarController::default(),
@@ -1052,6 +1071,7 @@ impl DesktopRuntime {
             ime: ImeState::default(),
             ime_context: None,
             pending_search_paste: None,
+            close_confirmation: None,
             last_input_serial: None,
             wheel_remainder_120: 0,
             scrollbar: ScrollbarController::default(),
@@ -1820,6 +1840,10 @@ impl DesktopRuntime {
                 crate::terminal::KeyboardEventKind::Repeat,
             );
         }
+        if self.handle_close_confirmation_key(key)? {
+            self.remember_local_key(physical);
+            return Ok(());
+        }
         if self.handle_paste_confirmation_key(key)? {
             self.remember_local_key(physical);
             return Ok(());
@@ -2264,6 +2288,10 @@ impl DesktopRuntime {
         &mut self,
         snapshot: &crate::terminal::FrameSnapshot,
     ) -> Result<(), UiRuntimeError> {
+        if let Some(pending) = self.current_window_mut().visual_build.as_mut() {
+            pending.queue_latest(snapshot);
+            return Ok(());
+        }
         let builder = begin_visual_map(
             snapshot,
             UnicodePolicy {
@@ -2274,6 +2302,7 @@ impl DesktopRuntime {
         self.current_window_mut().visual_build = Some(PendingVisualBuild {
             snapshot: snapshot.clone(),
             builder,
+            queued_snapshot: None,
         });
         Ok(())
     }
@@ -2288,7 +2317,11 @@ impl DesktopRuntime {
         {
             BuildStep::Pending => self.current_window_mut().visual_build = Some(pending),
             BuildStep::Ready(map) => {
+                let queued_snapshot = pending.take_queued();
                 self.compose_with_visual_map(&pending.snapshot, Arc::new(map))?;
+                if let Some(snapshot) = queued_snapshot {
+                    self.compose_snapshot(&snapshot)?;
+                }
             }
         }
         Ok(())
@@ -2351,6 +2384,7 @@ impl DesktopRuntime {
                     .then_some(window.ime.preedit.as_ref())
                     .flatten(),
                 paste_confirmation: paste_confirmation.as_ref(),
+                close_confirmation: window.close_confirmation.is_some(),
                 scrollbar: scrollbar.as_ref(),
                 tab_bar: Some(&window.tab_bar),
                 search_dialog: search_dialog.as_ref(),
@@ -2656,7 +2690,7 @@ impl DesktopRuntime {
             Action::NewTab => self.new_tab()?,
             Action::NewWindow => self.new_window()?,
             Action::MoveTabToNewWindow => self.move_active_tab_to_new_window(),
-            Action::CloseTab => self.close_active_tab(ShutdownReason::UserRequested)?,
+            Action::CloseTab => self.request_close_active_tab()?,
             Action::PreviousTab => self.switch_relative(-1)?,
             Action::NextTab => self.switch_relative(1)?,
             Action::MoveTabLeft | Action::MoveTabRight => {
@@ -3424,6 +3458,110 @@ impl DesktopRuntime {
         self.refresh_active_title()
     }
 
+    fn request_close_active_tab(&mut self) -> Result<(), UiRuntimeError> {
+        if self.current_window().close_confirmation.is_some() {
+            return Ok(());
+        }
+        if !self.active_session().has_foreground_job() {
+            return self.close_active_tab(ShutdownReason::UserRequested);
+        }
+
+        self.cancel_paste_confirmation()?;
+        let session = self
+            .current_tabs()
+            .active_id()
+            .expect("running UI has an active tab");
+        let ime_suspended = self.current_window().ime.is_active();
+        if ime_suspended {
+            if let Some(serial) = self.gfx.disable_text_input()? {
+                self.current_window_mut().ime.record_commit_serial(serial);
+            }
+            self.current_window_mut().ime.deactivate();
+            self.current_window_mut().ime_context = None;
+        }
+        self.current_window_mut().close_confirmation = Some(CloseConfirmation {
+            session,
+            ime_suspended,
+        });
+        tracing::info!(
+            category = "tab_close_confirmation",
+            session_id = session.get(),
+            "foreground process requires close confirmation"
+        );
+        self.compose_latest()
+    }
+
+    fn handle_close_confirmation_key(
+        &mut self,
+        key: &leyline_gfx::KeyInput,
+    ) -> Result<bool, UiRuntimeError> {
+        use leyline_gfx::LogicalKey;
+
+        let Some(confirmation) = self.current_window().close_confirmation else {
+            return Ok(false);
+        };
+        let confirm = matches!(
+            key.logical_key,
+            LogicalKey::Enter | LogicalKey::Character('y' | 'Y')
+        );
+        let cancel = matches!(
+            key.logical_key,
+            LogicalKey::Escape | LogicalKey::Character('n' | 'N')
+        );
+        if !confirm && !cancel {
+            return Ok(true);
+        }
+        debug_assert_eq!(
+            self.current_window()
+                .close_confirmation
+                .map(|value| value.session),
+            Some(confirmation.session)
+        );
+        self.resolve_close_confirmation(confirm)?;
+        Ok(true)
+    }
+
+    fn resolve_close_confirmation(&mut self, confirm: bool) -> Result<(), UiRuntimeError> {
+        let Some(confirmation) = self.current_window_mut().close_confirmation.take() else {
+            return Ok(());
+        };
+        if confirm && self.current_tabs().active_id() == Some(confirmation.session) {
+            self.close_active_tab(ShutdownReason::UserRequested)
+        } else {
+            self.restore_ime_after_paste_confirmation(confirmation.ime_suspended)?;
+            self.compose_latest()
+        }
+    }
+
+    fn handle_close_confirmation_pointer(
+        &mut self,
+        event: &leyline_gfx::PointerInput,
+    ) -> Result<(), UiRuntimeError> {
+        if !matches!(
+            event.kind,
+            leyline_gfx::PointerKind::Press { button: 0x110, .. }
+        ) || !event.position.0.is_finite()
+            || !event.position.1.is_finite()
+            || event.position.0 < 0.0
+            || event.position.1 < 0.0
+        {
+            return Ok(());
+        }
+        let scale = f64::from(self.gfx.scale().0) / 120.0;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let pixel = [
+            (event.position.0 * scale).floor() as u32,
+            (event.position.1 * scale).floor() as u32,
+        ];
+        let geometry = crate::frame_composer::close_dialog_geometry(&self.current_window().layout);
+        if geometry.close_button.contains(pixel) {
+            self.resolve_close_confirmation(true)?;
+        } else if geometry.cancel_button.contains(pixel) {
+            self.resolve_close_confirmation(false)?;
+        }
+        Ok(())
+    }
+
     fn switch_relative(&mut self, delta: i8) -> Result<(), UiRuntimeError> {
         self.quiesce_active_interaction()?;
         if matches!(
@@ -3473,6 +3611,7 @@ impl DesktopRuntime {
 
     fn quiesce_active_interaction(&mut self) -> Result<(), UiRuntimeError> {
         self.cancel_paste_confirmation()?;
+        self.current_window_mut().close_confirmation = None;
         self.cancel_pointer_gesture();
         self.current_window_mut().visual_build = None;
         self.current_window_mut().presentation.reset();
@@ -3504,6 +3643,10 @@ impl DesktopRuntime {
 
     #[allow(clippy::too_many_lines)]
     fn handle_pointer(&mut self, event: leyline_gfx::PointerInput) -> Result<(), UiRuntimeError> {
+        if self.current_window().close_confirmation.is_some() {
+            self.handle_close_confirmation_pointer(&event)?;
+            return Ok(());
+        }
         if matches!(
             self.selection.interaction_mode(),
             crate::selection::InteractionMode::ConfirmPaste { .. }
@@ -3729,7 +3872,7 @@ impl DesktopRuntime {
                     if let Some((id, close)) = self.current_window_mut().tab_bar.hit(pixel) {
                         self.switch_to(id)?;
                         if close {
-                            self.close_active_tab(ShutdownReason::UserRequested)?;
+                            self.request_close_active_tab()?;
                         } else {
                             let proposed_index = self
                                 .current_tabs_mut()
@@ -3752,7 +3895,7 @@ impl DesktopRuntime {
                 leyline_gfx::PointerKind::Press { button: 0x112, .. } => {
                     if let Some((id, _)) = self.current_window_mut().tab_bar.hit(pixel) {
                         self.switch_to(id)?;
-                        self.close_active_tab(ShutdownReason::UserRequested)?;
+                        self.request_close_active_tab()?;
                     }
                 }
                 leyline_gfx::PointerKind::Axis {
@@ -4746,14 +4889,57 @@ fn window_title(ordinal: usize, count: usize, title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        accumulate_wheel_steps, cwd_title, format_terminal_query, ignores_key_repeat,
-        keep_selection_after_release, key_text, renderer_fault_is_process_fatal,
-        resolved_session_title, rotate_window_service_order, search_query_capacity,
-        select_new_tab_cwd, selection_drag_scroll_direction, should_cancel_pointer_gesture,
-        should_cancel_search, starts_terminal_control_gesture, tab_drag_edge_direction,
-        take_priority_close_event, terminal_key_owner_changed, terminal_modifiers,
-        update_session_title, visible_search_query, visual_mapping_changed, xkb_text_allowed,
+        PendingVisualBuild, accumulate_wheel_steps, cwd_title, format_terminal_query,
+        ignores_key_repeat, keep_selection_after_release, key_text,
+        renderer_fault_is_process_fatal, resolved_session_title, rotate_window_service_order,
+        search_query_capacity, select_new_tab_cwd, selection_drag_scroll_direction,
+        should_cancel_pointer_gesture, should_cancel_search, starts_terminal_control_gesture,
+        tab_drag_edge_direction, take_priority_close_event, terminal_key_owner_changed,
+        terminal_modifiers, update_session_title, visible_search_query, visual_mapping_changed,
+        xkb_text_allowed,
     };
+
+    #[test]
+    fn continuous_output_keeps_the_latest_snapshot_while_a_visual_build_finishes() {
+        let mut core = crate::terminal::TerminalCoreAdapter::new(
+            crate::terminal::GridSize::new(1, 65).unwrap(),
+            10,
+        )
+        .unwrap();
+        let first = core.snapshot().unwrap();
+        core.advance(b"x").unwrap();
+        let latest = core.snapshot().unwrap();
+        let builder = crate::unicode_layout::begin_visual_map(
+            &first,
+            crate::unicode_layout::UnicodePolicy {
+                bidi: true,
+                generation: 1,
+            },
+        )
+        .unwrap();
+        let mut pending = PendingVisualBuild {
+            snapshot: first,
+            builder,
+            queued_snapshot: None,
+        };
+
+        assert!(matches!(
+            pending
+                .builder
+                .step(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .unwrap(),
+            crate::unicode_layout::BuildStep::Pending
+        ));
+        pending.queue_latest(&latest);
+        assert!(matches!(
+            pending
+                .builder
+                .step(std::time::Instant::now() + std::time::Duration::from_secs(1))
+                .unwrap(),
+            crate::unicode_layout::BuildStep::Ready(_)
+        ));
+        assert_eq!(pending.take_queued().unwrap().generation, latest.generation);
+    }
 
     #[test]
     fn empty_session_title_uses_launch_fallback() {

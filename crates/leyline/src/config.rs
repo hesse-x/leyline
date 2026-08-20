@@ -161,6 +161,7 @@ pub enum StartupWindowState {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ScrollingConfig {
     pub history_lines: u32,
+    pub scroll_on_output: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -304,6 +305,7 @@ impl Default for EffectiveConfig {
             },
             scrolling: ScrollingConfig {
                 history_lines: 10_000,
+                scroll_on_output: false,
             },
             scrollbar: ScrollbarConfig {
                 mode: ScrollbarMode::Auto,
@@ -723,6 +725,7 @@ struct RawWindow {
 #[serde(default)]
 struct RawScrolling {
     history_lines: Option<i64>,
+    scroll_on_output: Option<bool>,
     #[serde(flatten)]
     unknown: BTreeMap<String, toml::Value>,
 }
@@ -883,7 +886,7 @@ impl RawConfig {
             source,
             "scrolling",
             &self.scrolling.unknown,
-            &["history_lines"],
+            &["history_lines", "scroll_on_output"],
         );
         collect_unknown(
             &mut warnings,
@@ -1185,6 +1188,9 @@ impl RawConfig {
             100_000,
             &mut result.scrolling.history_lines,
         )?;
+        if let Some(scroll_on_output) = self.scrolling.scroll_on_output {
+            result.scrolling.scroll_on_output = scroll_on_output;
+        }
         if let Some(style) = self.cursor.style {
             result.cursor.style = match style.as_str() {
                 "block" => CursorStyle::Block,
@@ -1799,7 +1805,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         let source = format!(
-            "[font]\nsize=72\nhinting=\"full\"\nantialiasing=\"system\"\nline_spacing=2.5\n[colors]\nforeground=\"#01020304\"\nansi=[{ansi}]\n[scrollbar]\nmode=\"always\"\nwidth=5\nhit_width=14\nmin_thumb_size=20\n[window]\npadding_x=0\n[[keybindings]]\nkey=\"PageUp\"\nmods=[\"Shift\"]\naction=\"ScrollPageUp\"\n"
+            "[font]\nsize=72\nhinting=\"full\"\nantialiasing=\"system\"\nline_spacing=2.5\n[colors]\nforeground=\"#01020304\"\nansi=[{ansi}]\n[scrolling]\nscroll_on_output=true\n[scrollbar]\nmode=\"always\"\nwidth=5\nhit_width=14\nmin_thumb_size=20\n[window]\npadding_x=0\n[[keybindings]]\nkey=\"PageUp\"\nmods=[\"Shift\"]\naction=\"ScrollPageUp\"\n"
         );
         let raw: RawConfig = toml::from_str(&source).expect("raw config");
         let (effective, warnings) = raw
@@ -1813,6 +1819,7 @@ mod tests {
         assert!((effective.font.line_spacing - 2.5).abs() < f64::EPSILON);
         assert_eq!(effective.colors.ansi[15], Color(0x0f0f_0fff));
         assert_eq!(effective.scrollbar.mode, ScrollbarMode::Always);
+        assert!(effective.scrolling.scroll_on_output);
         assert!(effective.keybindings.iter().any(|binding| binding.chord.key
             == crate::input::shortcut::LogicalKeyPattern::PageUp
             && binding.action == Action::ScrollPageUp));

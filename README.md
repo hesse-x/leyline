@@ -126,6 +126,7 @@ max_windows = 8
 
 [scrolling]
 history_lines = 10000
+scroll_on_output = false # true forces new output to leave history and jump to the bottom
 
 [scrollbar]
 mode = "auto"              # auto | always | hidden
@@ -180,9 +181,11 @@ The tab bar follows `[tabs].visibility`: `always`, `multiple`, or `never`. `Ctrl
 and activates a tab, `Ctrl+Shift+W` closes it, `Ctrl+Shift+Left/Right` cycles, and
 `Ctrl+Shift+1..9` activates an ordinal tab. `Ctrl+Shift+PageUp/PageDown` reorders the active tab.
 Mouse clicks switch tabs; a close button or middle click closes one, and dragging reorders tabs in
-the current window with a moving title preview and bounded edge scrolling. By default, tab and
-window titles show the current local directory: `~/` for HOME, `~/...` below HOME, and an absolute
-path elsewhere. An explicit OSC 0/2 application title takes precedence until it is reset.
+the current window with a moving title preview and bounded edge scrolling. Closing a tab while a
+foreground job is running requires `Enter`/`Y` confirmation; `Escape`/`N` keeps the tab open.
+The confirmation dialog also provides clickable `Close tab` and `Cancel` buttons. By default,
+tab and window titles show the current local directory: `~/` for HOME, `~/...` below HOME,
+and an absolute path elsewhere. An explicit OSC 0/2 application title takes precedence until it is reset.
 `Ctrl+Shift+Alt+N` creates a new window with a new session, while `F11` toggles fullscreen. New tabs
 and windows repeat the startup launch request and use `[tabs].new_tab_cwd`: `inherit` prefers the
 active tab's last valid OSC 7 directory, `fixed`

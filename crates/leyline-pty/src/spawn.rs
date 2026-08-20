@@ -384,6 +384,7 @@ pub enum WriteStatus {
 }
 
 pub struct PtyProcess {
+    leader_process_group: u32,
     commands: Sender<CommandMessage>,
     shutdown: Arc<AtomicBool>,
     outstanding_write_bytes: Arc<AtomicUsize>,
@@ -432,7 +433,9 @@ impl PtyProcess {
             program: spec.program,
             source,
         })?;
-        let pidfd = match open_pidfd(child.id()) {
+        // The child calls setsid before exec, so its PID is also the session's shell process group.
+        let leader_process_group = child.id();
+        let pidfd = match open_pidfd(leader_process_group) {
             Ok(pidfd) => pidfd,
             Err(error) => {
                 let _ = child.kill();
@@ -483,6 +486,7 @@ impl PtyProcess {
             }
         };
         Ok(Self {
+            leader_process_group,
             commands,
             shutdown,
             outstanding_write_bytes,
@@ -576,6 +580,10 @@ impl PtyProcess {
         }
         u32::try_from(process_group)
             .map_err(|_| io::Error::other("invalid foreground process group"))
+    }
+    #[must_use]
+    pub const fn leader_process_group(&self) -> u32 {
+        self.leader_process_group
     }
     /// Requests worker shutdown and master closure.
     ///

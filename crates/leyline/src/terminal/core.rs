@@ -66,6 +66,7 @@ pub enum TerminalQuery {
 pub struct TerminalCoreConfig {
     pub history_lines: usize,
     pub default_cursor_shape: CursorShape,
+    pub scroll_on_output: bool,
 }
 
 impl From<usize> for TerminalCoreConfig {
@@ -73,6 +74,7 @@ impl From<usize> for TerminalCoreConfig {
         Self {
             history_lines,
             default_cursor_shape: CursorShape::Block,
+            scroll_on_output: false,
         }
     }
 }
@@ -146,6 +148,8 @@ pub struct TerminalCoreAdapter {
     selection_revision: u64,
     sync_epoch: u64,
     keyboard_protocol: KeyboardProtocolTracker,
+    follow_output: bool,
+    scroll_on_output: bool,
     _main_thread: Rc<()>,
 }
 
@@ -156,6 +160,7 @@ impl TerminalCoreAdapter {
         config: impl Into<TerminalCoreConfig>,
     ) -> Result<Self, TerminalError> {
         let config = config.into();
+        let scroll_on_output = config.scroll_on_output;
         let listener = Listener::default();
         let events = Rc::clone(&listener.0);
         let config = Config {
@@ -190,6 +195,8 @@ impl TerminalCoreAdapter {
             selection_revision: 0,
             sync_epoch: 0,
             keyboard_protocol: KeyboardProtocolTracker::default(),
+            follow_output: true,
+            scroll_on_output,
             _main_thread: Rc::new(()),
         })
     }
@@ -201,9 +208,6 @@ impl TerminalCoreAdapter {
         if bytes.len() > ByteBatch::MAX_LEN {
             return Err(TerminalError::BatchTooLarge(bytes.len()));
         }
-        let selection_was_active = self.term.selection.is_some();
-        let history_before = self.term.history_size();
-        let display_offset_before = self.term.grid().display_offset();
         let (keyboard_replies, keyboard_audit) = self.keyboard_protocol.advance(bytes);
         let was_pending = self.parser.sync_timeout().sync_timeout().is_some();
         let mut start = 0;
@@ -213,18 +217,10 @@ impl TerminalCoreAdapter {
             start = offset.saturating_add(1);
         }
         self.parser.advance(&mut self.term, &bytes[start..]);
-        if selection_was_active {
-            let history_growth = self.term.history_size().saturating_sub(history_before);
-            let target = display_offset_before
-                .saturating_add(history_growth)
-                .min(self.term.history_size());
-            let current = self.term.grid().display_offset();
-            if target > current {
-                let delta = i32::try_from(target - current)
-                    .map_err(|_| TerminalError::GenerationOverflow)?;
-                self.term
-                    .scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
-            }
+        if self.follow_output || self.scroll_on_output {
+            self.term
+                .scroll_display(alacritty_terminal::grid::Scroll::Bottom);
+            self.follow_output = true;
         }
         let commits = self.parser.take_sync_commit_delta();
         let is_pending = self.parser.sync_timeout().sync_timeout().is_some();
@@ -329,6 +325,7 @@ impl TerminalCoreAdapter {
         }
         self.term
             .resize(TermSize::new(size.columns(), size.lines()));
+        self.follow_output = self.term.grid().display_offset() == 0;
         self.size = size;
         self.bump_content_revision()?;
         self.cached.get_mut().take();
@@ -912,6 +909,7 @@ impl TerminalCoreAdapter {
     pub fn scroll_display(&mut self, lines: i32) -> Result<(), TerminalError> {
         self.term
             .scroll_display(alacritty_terminal::grid::Scroll::Delta(lines));
+        self.follow_output = self.term.grid().display_offset() == 0;
         self.generation = self
             .generation
             .checked_add(1)
@@ -924,6 +922,7 @@ impl TerminalCoreAdapter {
         let target = offset.min(self.term.history_size());
         let current = self.term.grid().display_offset();
         if target == current {
+            self.follow_output = target == 0;
             return Ok(());
         }
         let delta = i64::try_from(target)
@@ -935,6 +934,7 @@ impl TerminalCoreAdapter {
     }
 
     pub fn scroll_to_bottom(&mut self) -> Result<(), TerminalError> {
+        self.follow_output = true;
         if self.term.grid().display_offset() == 0 {
             return Ok(());
         }
@@ -1372,6 +1372,7 @@ mod tests {
         let config = TerminalCoreConfig {
             history_lines: 0,
             default_cursor_shape: CursorShape::Beam,
+            scroll_on_output: false,
         };
         let mut core = TerminalCoreAdapter::new(GridSize::new(12, 2).unwrap(), config).unwrap();
 
@@ -1648,7 +1649,7 @@ mod tests {
     }
 
     #[test]
-    fn active_selection_stays_visible_while_output_scrolls() {
+    fn output_follows_bottom_even_with_an_active_selection() {
         let mut core = TerminalCoreAdapter::new(GridSize::new(8, 3).unwrap(), 10).unwrap();
         core.advance(b"one\r\ntwo\r\nthree").unwrap();
         core.start_selection(
@@ -1662,13 +1663,40 @@ mod tests {
 
         core.advance(b"\r\nfour\r\nfive").unwrap();
 
-        assert_eq!(
-            core.projected_selection(),
-            Some(ProjectedSelection {
-                start: [0, 0],
-                end: [2, 0],
-            })
-        );
+        let snapshot = core.snapshot().unwrap();
+        assert_eq!(snapshot.display_offset, 0);
+        assert!(snapshot.cells.iter().any(|cell| cell.ch == 'f'));
+    }
+
+    #[test]
+    fn output_preserves_a_manually_scrolled_viewport() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 3).unwrap(), 10).unwrap();
+        core.advance(b"one\r\ntwo\r\nthree\r\nfour").unwrap();
+        core.scroll_display(1).unwrap();
+        let before = core.snapshot().unwrap();
+
+        core.advance(b"\r\nfive\r\nsix").unwrap();
+
+        let after = core.snapshot().unwrap();
+        assert_eq!(after.display_offset, before.display_offset + 2);
+        assert_eq!(after.cells, before.cells);
+    }
+
+    #[test]
+    fn scroll_on_output_forces_a_scrolled_viewport_back_to_live_bottom() {
+        let config = TerminalCoreConfig {
+            history_lines: 10,
+            default_cursor_shape: CursorShape::Block,
+            scroll_on_output: true,
+        };
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 3).unwrap(), config).unwrap();
+        core.advance(b"one\r\ntwo\r\nthree\r\nfour").unwrap();
+        core.scroll_display(1).unwrap();
+        assert_eq!(core.snapshot().unwrap().display_offset, 1);
+
+        core.advance(b"\r\nfive").unwrap();
+
+        assert_eq!(core.snapshot().unwrap().display_offset, 0);
     }
 
     #[test]
