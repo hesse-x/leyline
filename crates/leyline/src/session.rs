@@ -81,17 +81,6 @@ fn keyboard_protocol_active(state: crate::terminal::KeyboardProtocolState) -> bo
         || state.modify_other_keys != crate::terminal::ModifyOtherKeysLevel::Disabled
 }
 
-fn stale_keyboard_protocol_enable(
-    before: crate::terminal::KeyboardProtocolState,
-    after: crate::terminal::KeyboardProtocolState,
-    owner: Option<u32>,
-    foreground: Option<u32>,
-) -> bool {
-    !keyboard_protocol_active(before)
-        && keyboard_protocol_active(after)
-        && matches!((owner, foreground), (Some(owner), Some(foreground)) if owner != foreground)
-}
-
 fn keyboard_protocol_owner_changed(
     state: crate::terminal::KeyboardProtocolState,
     owner: Option<u32>,
@@ -238,29 +227,17 @@ impl TerminalSession {
                     return Err(SessionError::OutputAfterClose);
                 }
                 self.cwd_tracker.advance(batch.as_slice());
+                self.reset_keyboard_protocol_after_foreground_change();
                 let keyboard_before = self.core.input_modes().keyboard;
                 let delta = self.core.advance(batch.as_slice())?;
-                let mut keyboard_after = self.core.input_modes().keyboard;
+                let keyboard_after = self.core.input_modes().keyboard;
                 let foreground_process_group = self.foreground_process_group();
                 if !keyboard_protocol_active(keyboard_before)
                     && keyboard_protocol_active(keyboard_after)
                 {
-                    if stale_keyboard_protocol_enable(
-                        keyboard_before,
-                        keyboard_after,
-                        self.keyboard_protocol_owner,
-                        foreground_process_group,
-                    ) {
-                        tracing::debug!(
-                            keyboard_protocol_owner = self.keyboard_protocol_owner,
-                            foreground_process_group,
-                            "discarding stale keyboard protocol enable after foreground job change"
-                        );
-                        self.core.reset_keyboard_protocol();
-                        keyboard_after = self.core.input_modes().keyboard;
-                    } else {
-                        self.keyboard_protocol_owner = foreground_process_group;
-                    }
+                    self.keyboard_protocol_owner = foreground_process_group;
+                } else if !keyboard_protocol_active(keyboard_after) {
+                    self.keyboard_protocol_owner = None;
                 }
                 if keyboard_before != keyboard_after {
                     tracing::trace!(
@@ -499,22 +476,9 @@ impl TerminalSession {
         &mut self,
         event: &crate::terminal::TerminalKeyboardEvent,
     ) -> Result<bool, SessionError> {
-        let mut modes = self.core.input_modes();
+        self.reset_keyboard_protocol_after_foreground_change();
+        let modes = self.core.input_modes();
         let foreground_process_group = self.foreground_process_group();
-        if keyboard_protocol_owner_changed(
-            modes.keyboard,
-            self.keyboard_protocol_owner,
-            foreground_process_group,
-        ) {
-            tracing::debug!(
-                keyboard_protocol_owner = self.keyboard_protocol_owner,
-                foreground_process_group,
-                "resetting keyboard protocol after foreground job change"
-            );
-            self.core.reset_keyboard_protocol();
-            self.keyboard_protocol_owner = None;
-            modes = self.core.input_modes();
-        }
         if event.kind == crate::terminal::KeyboardEventKind::Press
             && !keyboard_protocol_active(modes.keyboard)
             && matches!(
@@ -543,6 +507,24 @@ impl TerminalSession {
             }
             crate::terminal::EncodedKey::TextFallback => Ok(true),
             crate::terminal::EncodedKey::Ignored(_) => Ok(false),
+        }
+    }
+
+    fn reset_keyboard_protocol_after_foreground_change(&mut self) {
+        let modes = self.core.input_modes();
+        let foreground_process_group = self.foreground_process_group();
+        if keyboard_protocol_owner_changed(
+            modes.keyboard,
+            self.keyboard_protocol_owner,
+            foreground_process_group,
+        ) {
+            tracing::debug!(
+                keyboard_protocol_owner = self.keyboard_protocol_owner,
+                foreground_process_group,
+                "resetting keyboard protocol after foreground job change"
+            );
+            self.core.reset_keyboard_protocol();
+            self.keyboard_protocol_owner = None;
         }
     }
     pub fn commit_text(&mut self, text: &str) -> Result<(), SessionError> {
@@ -1086,30 +1068,12 @@ mod tests {
     }
 
     #[test]
-    fn protocol_owner_rejects_stale_enable_from_a_background_job() {
+    fn protocol_owner_detects_a_foreground_job_change() {
         let disabled = crate::terminal::KeyboardProtocolState::default();
         let enabled = crate::terminal::KeyboardProtocolState {
             kitty: crate::terminal::KittyKeyboardFlags::from_valid_bits(7).unwrap(),
             ..disabled
         };
-        assert!(stale_keyboard_protocol_enable(
-            disabled,
-            enabled,
-            Some(10),
-            Some(20)
-        ));
-        assert!(!stale_keyboard_protocol_enable(
-            disabled,
-            enabled,
-            Some(10),
-            Some(10)
-        ));
-        assert!(!stale_keyboard_protocol_enable(
-            enabled,
-            disabled,
-            Some(10),
-            Some(20)
-        ));
         assert!(keyboard_protocol_owner_changed(enabled, Some(10), Some(20)));
         assert!(!keyboard_protocol_owner_changed(
             enabled,
@@ -1121,6 +1085,70 @@ mod tests {
             Some(10),
             Some(20)
         ));
+    }
+
+    #[test]
+    fn suspended_tui_cannot_leave_the_shell_in_kitty_keyboard_mode() {
+        let mut runtime = AppRuntimeBuilder::new(Arc::new(CountingWake::default()))
+            .build()
+            .unwrap();
+        let config = EffectiveConfig::default();
+        let launch = LaunchRequest::Command(crate::cli::CommandSpec {
+            program: OsString::from("/bin/bash"),
+            args: vec![
+                OsString::from("--noprofile"),
+                OsString::from("--norc"),
+                OsString::from("-i"),
+            ],
+        });
+        let mut session = TerminalSession::start(
+            &launch,
+            cwd(),
+            &config,
+            GridSize::new(40, 8).unwrap(),
+            &runtime,
+        )
+        .unwrap();
+        let shell_process_group = session.foreground_process_group().unwrap();
+        let stub = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/keyboard-mode-stub.sh");
+        session
+            .commit_text(&format!("/bin/sh {}\n", stub.display()))
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_stub_mode = false;
+        loop {
+            let mut events = Vec::new();
+            runtime.inbox().drain_round(|event| events.push(event));
+            for event in events {
+                if let crate::app::event::AppEvent::Pty(event) = event {
+                    session.handle_pty_event(event).unwrap();
+                    if keyboard_protocol_active(session.input_modes().keyboard) {
+                        saw_stub_mode = true;
+                    }
+                }
+            }
+
+            let shell_has_foreground =
+                session.foreground_process_group() == Some(shell_process_group);
+            if saw_stub_mode
+                && shell_has_foreground
+                && !keyboard_protocol_active(session.input_modes().keyboard)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "stub mode was not reset after its foreground job stopped: saw_stub_mode={saw_stub_mode}, foreground={:?}, keyboard={:?}",
+                session.foreground_process_group(),
+                session.input_modes().keyboard
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        session.commit_text("kill %1\n").unwrap();
+        session.begin_shutdown();
     }
 
     #[test]
