@@ -1247,7 +1247,10 @@ impl DesktopRuntime {
                         .cloned();
                     if let Some(map) = self.current_window_mut().presentation.commit(committed) {
                         let mapping_changed = visual_mapping_changed(previous.as_deref(), &map);
-                        if mapping_changed {
+                        if should_cancel_pointer_gesture(
+                            mapping_changed,
+                            self.current_window_mut().selecting,
+                        ) {
                             self.cancel_terminal_pointer_gesture();
                         }
                         self.refresh_text_input_rectangle()?;
@@ -3715,6 +3718,7 @@ impl DesktopRuntime {
             .tab_bar
             .bar
             .is_some_and(|bar| bar.contains(pixel))
+            && !self.current_window_mut().selecting
         {
             match event.kind {
                 leyline_gfx::PointerKind::Press {
@@ -3788,7 +3792,6 @@ impl DesktopRuntime {
             .presentation
             .published_visual_map()
             .cloned();
-        let above_grid = event.position.1 * scale < f64::from(layout.content_origin_px[1]);
         let (point, owner_point, selection_endpoint) = visual_map.as_ref().map_or_else(
             || (None, None, None),
             |map| match crate::unicode_layout::hit_test(map, &layout, pixel) {
@@ -3949,16 +3952,23 @@ impl DesktopRuntime {
                         self.active_session_mut().update_selection(endpoint)?;
                     }
                     self.current_window_mut().selection_point = Some(endpoint);
-                    self.current_window_mut().drag_scroll = None;
-                } else if let Some((direction, point)) = self.drag_scroll_target(pixel, above_grid)
-                {
+                }
+                if let Some((direction, point)) = self.drag_scroll_target(pixel) {
                     self.current_window_mut().selection_dragged = true;
                     self.current_window_mut().selection_point = Some(point);
-                    self.current_window_mut().drag_scroll = Some(DragScroll {
-                        direction,
-                        point,
-                        deadline: Instant::now() + DRAG_SCROLL_INTERVAL,
-                    });
+                    self.current_window_mut().drag_scroll = Some(
+                        self.current_window_mut()
+                            .drag_scroll
+                            .filter(|scroll| scroll.direction == direction)
+                            .map_or(
+                                DragScroll {
+                                    direction,
+                                    point,
+                                    deadline: Instant::now() + DRAG_SCROLL_INTERVAL,
+                                },
+                                |scroll| DragScroll { point, ..scroll },
+                            ),
+                    );
                 } else {
                     self.current_window_mut().drag_scroll = None;
                 }
@@ -3992,10 +4002,30 @@ impl DesktopRuntime {
                     let lines = -steps * 3;
                     if modifiers.shift || !self.active_session_mut().alternate_scroll(lines)? {
                         self.active_session_mut().scroll(lines)?;
+                        if self.current_window_mut().selecting {
+                            if let Some((endpoint, side)) = selection_endpoint {
+                                self.active_session_mut()
+                                    .update_selection_with_side(endpoint, side)?;
+                                self.current_window_mut().selection_point = Some(endpoint);
+                            } else {
+                                self.active_session_mut().update_selection(point)?;
+                                self.current_window_mut().selection_point = Some(point);
+                            }
+                            self.current_window_mut().selection_dragged = true;
+                        }
                         self.current_window_mut()
                             .scrollbar
                             .note_scroll(Instant::now());
                     }
+                }
+            }
+            leyline_gfx::PointerKind::Leave { .. } if self.current_window_mut().selecting => {
+                if let Some((direction, point)) = self.drag_scroll_target(pixel) {
+                    self.current_window_mut().drag_scroll = Some(DragScroll {
+                        direction,
+                        point,
+                        deadline: Instant::now() + DRAG_SCROLL_INTERVAL,
+                    });
                 }
             }
             leyline_gfx::PointerKind::Leave { .. } => self.cancel_pointer_gesture(),
@@ -4103,7 +4133,6 @@ impl DesktopRuntime {
     fn drag_scroll_target(
         &self,
         pixel: [u32; 2],
-        above_grid: bool,
     ) -> Option<(i32, crate::terminal::SelectionPoint)> {
         let layout = self.current_window().layout;
         let origin = layout.content_origin_px;
@@ -4116,9 +4145,11 @@ impl DesktopRuntime {
         }
         let column =
             u16::try_from((pixel[0] - origin[0]) / u32::from(layout.cell_px[0].get())).ok()?;
-        if above_grid {
+        let edge = u32::from(layout.cell_px[1].get()).div_ceil(3).max(2);
+        let direction = selection_drag_scroll_direction(pixel[1], origin[1], height, edge)?;
+        if direction > 0 {
             Some((1, crate::terminal::SelectionPoint { column, line: 0 }))
-        } else if pixel[1] >= origin[1].checked_add(height)? {
+        } else {
             Some((
                 -1,
                 crate::terminal::SelectionPoint {
@@ -4126,8 +4157,6 @@ impl DesktopRuntime {
                     line: layout.grid.lines.get() - 1,
                 },
             ))
-        } else {
-            None
         }
     }
 
@@ -4513,6 +4542,17 @@ fn keep_selection_after_release(
         )
 }
 
+fn selection_drag_scroll_direction(y: u32, origin: u32, height: u32, edge: u32) -> Option<i32> {
+    let bottom = origin.checked_add(height)?;
+    if y < origin.saturating_add(edge).min(bottom) {
+        Some(1)
+    } else if y >= bottom.saturating_sub(edge) {
+        Some(-1)
+    } else {
+        None
+    }
+}
+
 fn accumulate_wheel_steps(remainder_120: &mut i32, delta_120: i32) -> i32 {
     let total = remainder_120.saturating_add(delta_120);
     let steps = (total / 120).clamp(-4, 4);
@@ -4709,10 +4749,10 @@ mod tests {
         accumulate_wheel_steps, cwd_title, format_terminal_query, ignores_key_repeat,
         keep_selection_after_release, key_text, renderer_fault_is_process_fatal,
         resolved_session_title, rotate_window_service_order, search_query_capacity,
-        select_new_tab_cwd, should_cancel_search, starts_terminal_control_gesture,
-        tab_drag_edge_direction, take_priority_close_event, terminal_key_owner_changed,
-        terminal_modifiers, update_session_title, visible_search_query, visual_mapping_changed,
-        xkb_text_allowed,
+        select_new_tab_cwd, selection_drag_scroll_direction, should_cancel_pointer_gesture,
+        should_cancel_search, starts_terminal_control_gesture, tab_drag_edge_direction,
+        take_priority_close_event, terminal_key_owner_changed, terminal_modifiers,
+        update_session_title, visible_search_query, visual_mapping_changed, xkb_text_allowed,
     };
 
     #[test]
@@ -5099,6 +5139,17 @@ mod tests {
     }
 
     #[test]
+    fn selection_drag_scroll_uses_narrow_top_and_bottom_edge_zones() {
+        assert_eq!(selection_drag_scroll_direction(7, 10, 100, 4), Some(1));
+        assert_eq!(selection_drag_scroll_direction(10, 10, 100, 4), Some(1));
+        assert_eq!(selection_drag_scroll_direction(13, 10, 100, 4), Some(1));
+        assert_eq!(selection_drag_scroll_direction(14, 10, 100, 4), None);
+        assert_eq!(selection_drag_scroll_direction(105, 10, 100, 4), None);
+        assert_eq!(selection_drag_scroll_direction(106, 10, 100, 4), Some(-1));
+        assert_eq!(selection_drag_scroll_direction(120, 10, 100, 4), Some(-1));
+    }
+
+    #[test]
     fn keyboard_text_falls_back_to_printable_keysym() {
         assert_eq!(key_text(&key(u32::from('a'), None)).as_deref(), Some("a"));
         assert_eq!(
@@ -5218,6 +5269,8 @@ mod tests {
         };
         assert!(visual_mapping_changed(Some(&current), &next_snapshot));
         assert!(visual_mapping_changed(None, &current));
+        assert!(!should_cancel_pointer_gesture(true, true));
+        assert!(should_cancel_pointer_gesture(true, false));
     }
 
     #[test]
@@ -5484,6 +5537,10 @@ fn visual_mapping_changed(current: Option<&VisualGridMap>, next: &VisualGridMap)
             || current.grid != next.grid
             || current.bidi_enabled != next.bidi_enabled
     })
+}
+
+const fn should_cancel_pointer_gesture(mapping_changed: bool, selecting: bool) -> bool {
+    mapping_changed && !selecting
 }
 
 #[derive(Debug, thiserror::Error)]

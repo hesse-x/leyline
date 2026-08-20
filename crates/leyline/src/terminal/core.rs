@@ -865,20 +865,32 @@ impl TerminalCoreAdapter {
     pub fn projected_selection(&self) -> Option<ProjectedSelection> {
         let range = self.term.selection.as_ref()?.to_range(&self.term)?;
         let offset = i32::try_from(self.term.grid().display_offset()).ok()?;
-        let visible = |point: Point| -> Option<[u16; 2]> {
-            let line = point.line.0.checked_add(offset)?;
-            if line < 0 || usize::try_from(line).ok()? >= self.size.lines() {
-                return None;
-            }
-            Some([
-                u16::try_from(point.column.0).ok()?,
-                u16::try_from(line).ok()?,
-            ])
+        let last_column_index = self.size.columns().checked_sub(1)?;
+        let last_line_index = self.size.lines().checked_sub(1)?;
+        let visible_top = offset.checked_neg()?;
+        let visible_bottom = i32::try_from(last_line_index).ok()?.checked_sub(offset)?;
+        if range.end.line.0 < visible_top || range.start.line.0 > visible_bottom {
+            return None;
+        }
+        let last_column = u16::try_from(last_column_index).ok()?;
+        let last_line = u16::try_from(last_line_index).ok()?;
+        let start = if range.start.line.0 < visible_top {
+            [0, 0]
+        } else {
+            [
+                u16::try_from(range.start.column.0).ok()?,
+                u16::try_from(range.start.line.0.checked_add(offset)?).ok()?,
+            ]
         };
-        Some(ProjectedSelection {
-            start: visible(range.start)?,
-            end: visible(range.end)?,
-        })
+        let end = if range.end.line.0 > visible_bottom {
+            [last_column, last_line]
+        } else {
+            [
+                u16::try_from(range.end.column.0).ok()?,
+                u16::try_from(range.end.line.0.checked_add(offset)?).ok()?,
+            ]
+        };
+        Some(ProjectedSelection { start, end })
     }
 
     pub fn scroll_display(&mut self, lines: i32) -> Result<(), TerminalError> {
@@ -1601,6 +1613,22 @@ mod tests {
             })
         );
         assert_eq!(core.selection_revision(), 2);
+    }
+
+    #[test]
+    fn selection_endpoint_tracks_the_viewport_while_scrolling() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 2).unwrap(), 10).unwrap();
+        core.advance(b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight")
+            .unwrap();
+        let endpoint = SelectionPoint { column: 3, line: 1 };
+        core.start_selection(SelectionKind::Simple, endpoint, SelectionSide::Right)
+            .unwrap();
+        for _ in 0..3 {
+            core.scroll_display(1).unwrap();
+            core.update_selection(endpoint, SelectionSide::Right)
+                .unwrap();
+            assert!(core.projected_selection().is_some());
+        }
     }
 
     #[test]

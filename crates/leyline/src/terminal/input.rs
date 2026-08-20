@@ -325,6 +325,14 @@ fn encode_keypad(
             Ok(EncodedKey::Ignored(IgnoreReason::UnknownKey))
         };
     };
+    // NumLock selects the numeric meaning even while an application has enabled DECKPAM.
+    // XKB supplies the resulting text, so keep it on the regular text-input path.
+    if event.num_lock
+        && matches!(keypad, KeypadKey::Digit(_) | KeypadKey::Decimal)
+        && event.text.is_some()
+    {
+        return Ok(EncodedKey::TextFallback);
+    }
     if !modes.application_keypad {
         if event.text.is_some() {
             return Ok(EncodedKey::TextFallback);
@@ -1077,6 +1085,22 @@ mod tests {
             encode_keyboard_event(&modified, application).unwrap(),
             EncodedKey::Bytes(b"\x1b[1;5k".to_vec())
         );
+
+        for digit in [3, 9] {
+            let mut numeric = keyboard_event(
+                LogicalKey::Character(char::from(b'0' + digit)),
+                KeyboardEventKind::Press,
+            );
+            numeric.identity.location = KeyLocation::Numpad;
+            numeric.identity.keypad = Some(KeypadKey::Digit(digit));
+            numeric.text = Some(char::from(b'0' + digit).to_string());
+            numeric.num_lock = true;
+            assert_eq!(
+                encode_keyboard_event(&numeric, application).unwrap(),
+                EncodedKey::TextFallback,
+                "NumLock keypad {digit}"
+            );
+        }
     }
     #[test]
     fn keys_cover_control_application_and_modifiers() {
