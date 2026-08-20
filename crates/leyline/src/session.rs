@@ -101,6 +101,15 @@ fn keyboard_protocol_owner_changed(
         && matches!((owner, foreground), (Some(owner), Some(foreground)) if owner != foreground)
 }
 
+fn visible_frame_changed(previous: &FrameSnapshot, next: &FrameSnapshot) -> bool {
+    previous.active_buffer != next.active_buffer
+        || previous.grid != next.grid
+        || previous.cells != next.cells
+        || previous.hyperlinks != next.hyperlinks
+        || previous.cursor.visible != next.cursor.visible
+        || (next.cursor.visible && previous.cursor != next.cursor)
+}
+
 #[allow(clippy::struct_excessive_bools)]
 pub struct TerminalSession {
     core: TerminalCoreAdapter,
@@ -111,6 +120,7 @@ pub struct TerminalSession {
     read_closed: bool,
     hold_after_exit: bool,
     dirty: bool,
+    force_frame: bool,
     latest_snapshot: Option<FrameSnapshot>,
     pending_title: Option<SessionTitleDelta>,
     pending_bell: bool,
@@ -205,6 +215,7 @@ impl TerminalSession {
             read_closed: false,
             hold_after_exit: config.behavior.hold_after_exit,
             dirty: true,
+            force_frame: true,
             latest_snapshot: None,
             pending_title: None,
             pending_bell: false,
@@ -300,6 +311,7 @@ impl TerminalSession {
             self.search.invalidate(Instant::now());
         }
         self.dirty = true;
+        self.force_frame = true;
         if matches!(
             self.state,
             SessionState::Running | SessionState::ExitObserved | SessionState::ReadClosed
@@ -403,9 +415,15 @@ impl TerminalSession {
             return Ok(None);
         }
         let snapshot = self.core.snapshot()?;
+        let needs_frame = self.force_frame
+            || self
+                .latest_snapshot
+                .as_ref()
+                .is_none_or(|previous| visible_frame_changed(previous, &snapshot));
         self.latest_snapshot = Some(snapshot.clone());
         self.dirty = false;
-        Ok(Some(snapshot))
+        self.force_frame = false;
+        Ok(needs_frame.then_some(snapshot))
     }
 
     pub fn latest_snapshot(&self) -> Option<&FrameSnapshot> {
@@ -457,6 +475,7 @@ impl TerminalSession {
         if let Some(offset) = effect.scroll_target {
             self.core.scroll_to_display_offset(offset)?;
             self.dirty = true;
+            self.force_frame = true;
         }
         Ok(effect)
     }
@@ -565,6 +584,7 @@ impl TerminalSession {
     ) -> Result<(), SessionError> {
         self.core.start_selection(kind, point, side)?;
         self.dirty = true;
+        self.force_frame = true;
         Ok(())
     }
     pub fn update_selection(
@@ -580,11 +600,13 @@ impl TerminalSession {
     ) -> Result<(), SessionError> {
         self.core.update_selection(point, side)?;
         self.dirty = true;
+        self.force_frame = true;
         Ok(())
     }
     pub fn clear_selection(&mut self) -> Result<(), SessionError> {
         self.core.clear_selection()?;
         self.dirty = true;
+        self.force_frame = true;
         Ok(())
     }
     pub fn selection_overlay(&self, generation: u64) -> crate::frame_composer::SelectionOverlay {
@@ -684,11 +706,13 @@ impl TerminalSession {
     pub fn scroll(&mut self, lines: i32) -> Result<(), SessionError> {
         self.core.scroll_display(lines)?;
         self.dirty = true;
+        self.force_frame = true;
         Ok(())
     }
     pub fn scroll_to_display_offset(&mut self, offset: usize) -> Result<(), SessionError> {
         self.core.scroll_to_display_offset(offset)?;
         self.dirty = true;
+        self.force_frame = true;
         Ok(())
     }
     pub fn alternate_scroll(&mut self, lines: i32) -> Result<bool, SessionError> {
@@ -703,6 +727,7 @@ impl TerminalSession {
     fn restore_viewport_after_input(&mut self) -> Result<(), SessionError> {
         self.core.scroll_to_bottom()?;
         self.dirty = true;
+        self.force_frame = true;
         Ok(())
     }
     pub const fn state(&self) -> SessionState {
@@ -1096,6 +1121,28 @@ mod tests {
             Some(10),
             Some(20)
         ));
+    }
+
+    #[test]
+    fn offscreen_output_does_not_change_the_visible_frame() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 3).unwrap(), 10).unwrap();
+        core.advance(b"one\r\ntwo\r\nthree").unwrap();
+        core.start_selection(
+            crate::terminal::SelectionKind::Simple,
+            crate::terminal::SelectionPoint { column: 0, line: 0 },
+            crate::terminal::SelectionSide::Left,
+        )
+        .unwrap();
+        core.advance(b"\r\nfour\r\nfive").unwrap();
+        let previous = core.snapshot().unwrap();
+        assert!(!previous.cursor.visible);
+
+        core.advance(b"\r\nsix\r\nseven").unwrap();
+        let next = core.snapshot().unwrap();
+
+        assert!(!visible_frame_changed(&previous, &next));
+        assert_ne!(previous.generation, next.generation);
+        assert_ne!(previous.history_size, next.history_size);
     }
 
     #[test]

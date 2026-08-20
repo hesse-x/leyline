@@ -201,6 +201,9 @@ impl TerminalCoreAdapter {
         if bytes.len() > ByteBatch::MAX_LEN {
             return Err(TerminalError::BatchTooLarge(bytes.len()));
         }
+        let selection_was_active = self.term.selection.is_some();
+        let history_before = self.term.history_size();
+        let display_offset_before = self.term.grid().display_offset();
         let (keyboard_replies, keyboard_audit) = self.keyboard_protocol.advance(bytes);
         let was_pending = self.parser.sync_timeout().sync_timeout().is_some();
         let mut start = 0;
@@ -210,6 +213,19 @@ impl TerminalCoreAdapter {
             start = offset.saturating_add(1);
         }
         self.parser.advance(&mut self.term, &bytes[start..]);
+        if selection_was_active {
+            let history_growth = self.term.history_size().saturating_sub(history_before);
+            let target = display_offset_before
+                .saturating_add(history_growth)
+                .min(self.term.history_size());
+            let current = self.term.grid().display_offset();
+            if target > current {
+                let delta = i32::try_from(target - current)
+                    .map_err(|_| TerminalError::GenerationOverflow)?;
+                self.term
+                    .scroll_display(alacritty_terminal::grid::Scroll::Delta(delta));
+            }
+        }
         let commits = self.parser.take_sync_commit_delta();
         let is_pending = self.parser.sync_timeout().sync_timeout().is_some();
         if is_pending && (!was_pending || commits.explicit != 0 || commits.capacity != 0) {
@@ -1629,6 +1645,30 @@ mod tests {
                 .unwrap();
             assert!(core.projected_selection().is_some());
         }
+    }
+
+    #[test]
+    fn active_selection_stays_visible_while_output_scrolls() {
+        let mut core = TerminalCoreAdapter::new(GridSize::new(8, 3).unwrap(), 10).unwrap();
+        core.advance(b"one\r\ntwo\r\nthree").unwrap();
+        core.start_selection(
+            SelectionKind::Simple,
+            SelectionPoint { column: 0, line: 0 },
+            SelectionSide::Left,
+        )
+        .unwrap();
+        core.update_selection(SelectionPoint { column: 2, line: 0 }, SelectionSide::Right)
+            .unwrap();
+
+        core.advance(b"\r\nfour\r\nfive").unwrap();
+
+        assert_eq!(
+            core.projected_selection(),
+            Some(ProjectedSelection {
+                start: [0, 0],
+                end: [2, 0],
+            })
+        );
     }
 
     #[test]
