@@ -337,9 +337,7 @@ impl Drop for WaylandWindow {
         if host.state.pointer_focus.as_ref() == Some(&surface) {
             host.state.pointer_focus = None;
         }
-        if host.state.text_input_focus.as_ref() == Some(&surface) {
-            host.state.text_input_focus = None;
-        }
+        leave_text_input_focus(&mut host.state.text_input_focus, &surface);
         host.trace_snapshot();
     }
 }
@@ -537,6 +535,10 @@ impl WaylandConnectionHost {
             read_guard
                 .read()
                 .map_err(|error| format!("Wayland socket read failed: {error}"))?;
+            tracing::trace!(
+                category = "wayland_socket_read",
+                "read Wayland socket events"
+            );
         }
         if readiness.contains(PollFlags::OUT) {
             self.flush()?;
@@ -768,12 +770,21 @@ impl WaylandWindow {
         &mut self,
         context: TextInputContext,
     ) -> Result<Option<u32>, String> {
-        if !self.state.borrow().text_input_focused {
+        if !self.owns_text_input_focus() {
+            tracing::debug!(
+                category = "text_input_request_rejected",
+                operation = "enable",
+                local_focus = self.state.borrow().text_input_focused,
+                "ignored text-input request from a surface without focus"
+            );
             return Ok(None);
         }
         let Some(input) = self.host.borrow().state.text_input.clone() else {
             return Ok(None);
         };
+        let purpose = context.purpose;
+        let surrounding_bytes = context.surrounding_text.len();
+        let rectangle = context.rectangle;
         input.enable();
         input.set_content_type(
             ContentHint::None,
@@ -796,6 +807,15 @@ impl WaylandWindow {
         input.commit();
         self.surface.commit();
         let serial = self.host.borrow_mut().state.bump_text_input_commit();
+        tracing::debug!(
+            category = "text_input_request",
+            operation = "enable",
+            ?serial,
+            ?purpose,
+            surrounding_bytes,
+            ?rectangle,
+            "committed text-input state"
+        );
         self.flush()?;
         Ok(serial)
     }
@@ -804,12 +824,21 @@ impl WaylandWindow {
         &mut self,
         context: TextInputContext,
     ) -> Result<Option<u32>, String> {
-        if !self.state.borrow().text_input_focused {
+        if !self.owns_text_input_focus() {
+            tracing::debug!(
+                category = "text_input_request_rejected",
+                operation = "update",
+                local_focus = self.state.borrow().text_input_focused,
+                "ignored text-input request from a surface without focus"
+            );
             return Ok(None);
         }
         let Some(input) = self.host.borrow().state.text_input.clone() else {
             return Ok(None);
         };
+        let purpose = context.purpose;
+        let surrounding_bytes = context.surrounding_text.len();
+        let rectangle = context.rectangle;
         input.set_content_type(
             ContentHint::None,
             match context.purpose {
@@ -831,11 +860,31 @@ impl WaylandWindow {
         input.commit();
         self.surface.commit();
         let serial = self.host.borrow_mut().state.bump_text_input_commit();
+        tracing::trace!(
+            category = "text_input_request",
+            operation = "update",
+            ?serial,
+            ?purpose,
+            surrounding_bytes,
+            ?rectangle,
+            "committed text-input state"
+        );
         self.flush()?;
         Ok(serial)
     }
 
     pub(crate) fn disable_text_input(&mut self) -> Result<Option<u32>, String> {
+        // The text-input object is shared by every surface on this seat. A delayed keyboard-leave
+        // from an old window must not disable the surface which currently owns text-input focus.
+        if !self.owns_text_input_focus() {
+            tracing::debug!(
+                category = "text_input_request_rejected",
+                operation = "disable",
+                local_focus = self.state.borrow().text_input_focused,
+                "ignored text-input request from a surface without focus"
+            );
+            return Ok(None);
+        }
         let Some(input) = self.host.borrow().state.text_input.clone() else {
             return Ok(None);
         };
@@ -845,8 +894,23 @@ impl WaylandWindow {
         input.commit();
         self.surface.commit();
         let serial = self.host.borrow_mut().state.bump_text_input_commit();
+        tracing::debug!(
+            category = "text_input_request",
+            operation = "disable",
+            ?serial,
+            "committed text-input state"
+        );
         self.flush()?;
         Ok(serial)
+    }
+
+    fn owns_text_input_focus(&self) -> bool {
+        let locally_focused = self.state.borrow().text_input_focused;
+        text_input_request_owned_by(
+            locally_focused,
+            self.host.borrow().state.text_input_focus.as_ref(),
+            &self.surface.id(),
+        )
     }
 
     pub(crate) fn publish_selection(
@@ -1059,6 +1123,20 @@ impl WindowEventState {
             configured: false,
             suspended: false,
         }
+    }
+}
+
+fn text_input_request_owned_by<T: PartialEq>(
+    locally_focused: bool,
+    focus: Option<&T>,
+    surface: &T,
+) -> bool {
+    locally_focused && focus == Some(surface)
+}
+
+fn leave_text_input_focus<T: PartialEq>(focus: &mut Option<T>, surface: &T) {
+    if focus.as_ref() == Some(surface) {
+        *focus = None;
     }
 }
 
@@ -2023,6 +2101,7 @@ impl Dispatch<ZwpTextInputManagerV3, ()> for WaylandState {
 }
 
 impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
+    #[allow(clippy::too_many_lines)]
     fn event(
         state: &mut Self,
         _: &ZwpTextInputV3,
@@ -2035,6 +2114,11 @@ impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
             zwp_text_input_v3::Event::Enter { surface }
                 if state.windows.contains_key(&surface.id()) =>
             {
+                tracing::debug!(
+                    category = "text_input_event",
+                    event = "enter",
+                    "text-input focus entered surface"
+                );
                 state.text_input_focus = Some(surface.id());
                 state
                     .windows
@@ -2047,6 +2131,11 @@ impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
             zwp_text_input_v3::Event::Leave { surface }
                 if state.windows.contains_key(&surface.id()) =>
             {
+                tracing::debug!(
+                    category = "text_input_event",
+                    event = "leave",
+                    "text-input focus left surface"
+                );
                 if let Some(local) = state.windows.get(&surface.id()) {
                     let mut local = local.borrow_mut();
                     local.text_input_focused = false;
@@ -2054,31 +2143,62 @@ impl Dispatch<ZwpTextInputV3, ()> for WaylandState {
                         .pending
                         .push_input(PlatformEvent::TextInput(TextInputEvent::Leave));
                 }
-                if state.text_input_focus.as_ref() == Some(&surface.id()) {
-                    state.text_input_focus = None;
-                }
+                leave_text_input_focus(&mut state.text_input_focus, &surface.id());
                 None
             }
             zwp_text_input_v3::Event::PreeditString {
                 text,
                 cursor_begin,
                 cursor_end,
-            } if state.text_input_focus.is_some() => Some(TextInputEvent::Preedit {
-                text: text.unwrap_or_default(),
-                cursor: (cursor_begin != -1 || cursor_end != -1)
-                    .then_some((cursor_begin, cursor_end)),
-            }),
+            } if state.text_input_focus.is_some() => {
+                let text = text.unwrap_or_default();
+                tracing::trace!(
+                    category = "text_input_event",
+                    event = "preedit",
+                    bytes = text.len(),
+                    has_cursor = cursor_begin != -1 || cursor_end != -1,
+                    "received text-input event"
+                );
+                Some(TextInputEvent::Preedit {
+                    text,
+                    cursor: (cursor_begin != -1 || cursor_end != -1)
+                        .then_some((cursor_begin, cursor_end)),
+                })
+            }
             zwp_text_input_v3::Event::CommitString { text } if state.text_input_focus.is_some() => {
-                Some(TextInputEvent::Commit(text.unwrap_or_default()))
+                let text = text.unwrap_or_default();
+                tracing::trace!(
+                    category = "text_input_event",
+                    event = "commit",
+                    bytes = text.len(),
+                    "received text-input event"
+                );
+                Some(TextInputEvent::Commit(text))
             }
             zwp_text_input_v3::Event::DeleteSurroundingText {
                 before_length,
                 after_length,
-            } if state.text_input_focus.is_some() => Some(TextInputEvent::DeleteSurrounding {
-                before_bytes: before_length,
-                after_bytes: after_length,
-            }),
+            } if state.text_input_focus.is_some() => {
+                tracing::trace!(
+                    category = "text_input_event",
+                    event = "delete_surrounding",
+                    before_bytes = before_length,
+                    after_bytes = after_length,
+                    "received text-input event"
+                );
+                Some(TextInputEvent::DeleteSurrounding {
+                    before_bytes: before_length,
+                    after_bytes: after_length,
+                })
+            }
             zwp_text_input_v3::Event::Done { serial } if state.text_input_focus.is_some() => {
+                tracing::trace!(
+                    category = "text_input_event",
+                    event = "done",
+                    serial,
+                    expected_serial = state.text_input_commits,
+                    "received text-input event"
+                );
                 Some(TextInputEvent::Done { serial })
             }
             _ => None,
@@ -2371,5 +2491,20 @@ mod retained_event_tests {
             panic!("expected coalesced pointer motion");
         };
         assert_eq!(pointer.position, (999.0, 0.0));
+    }
+
+    #[test]
+    fn stale_surface_cannot_modify_new_text_input_owner() {
+        let old = 1_u8;
+        let new = 2_u8;
+        let mut focus = Some(old);
+
+        assert!(text_input_request_owned_by(true, focus.as_ref(), &old));
+
+        focus = Some(new);
+        leave_text_input_focus(&mut focus, &old);
+        assert!(!text_input_request_owned_by(true, focus.as_ref(), &old));
+        assert!(text_input_request_owned_by(true, focus.as_ref(), &new));
+        assert!(!text_input_request_owned_by(false, focus.as_ref(), &new));
     }
 }

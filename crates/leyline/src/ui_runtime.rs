@@ -1158,6 +1158,11 @@ impl DesktopRuntime {
             }
             let round_deadline = Instant::now() + PROCESS_UI_TIME_BUDGET;
             if self.pending_platform_events.is_empty() {
+                // PTY producers can remain ready indefinitely (for example while an agent streams
+                // output). Always admit Wayland socket data before dispatching callbacks so
+                // keyboard and text-input events cannot be starved until the PTY becomes idle.
+                self.gfx
+                    .poll_wait(Some(self.wake.as_fd()), Some(Duration::ZERO))?;
                 let mut events = Vec::new();
                 self.gfx.dispatch_pending(&mut events)?;
                 self.pending_platform_events.extend(events);
@@ -2170,12 +2175,21 @@ impl DesktopRuntime {
         let Some(context) = self.text_input_context() else {
             return Ok(());
         };
-        if self.current_window_mut().ime_context.as_ref() == Some(&context)
-            && !self.current_window_mut().ime.outbound.dirty
+        let needs_enable = self.current_window().ime_context.is_none();
+        if !needs_enable
+            && self.current_window().ime_context.as_ref() == Some(&context)
+            && !self.current_window().ime.outbound.dirty
         {
             return Ok(());
         }
-        let serial = self.gfx.update_text_input(context.clone())?;
+        // Enter can arrive before the first terminal snapshot exists. In that case the immediate
+        // enable has no cursor context to send; the first later refresh must enable the protocol,
+        // not merely update an object which the compositor still considers disabled.
+        let serial = if needs_enable {
+            self.gfx.enable_text_input(context.clone())?
+        } else {
+            self.gfx.update_text_input(context.clone())?
+        };
         if let Some(serial) = serial {
             self.current_window_mut().ime.record_commit_serial(serial);
             self.current_window_mut().ime_context = Some(context);
@@ -2288,6 +2302,19 @@ impl DesktopRuntime {
         &mut self,
         snapshot: &crate::terminal::FrameSnapshot,
     ) -> Result<(), UiRuntimeError> {
+        if snapshot.grid != self.current_window().layout.grid {
+            // PTY resize and snapshot publication are asynchronous. Repaint requests in between
+            // must wait for the first snapshot on the new grid instead of treating the previous
+            // grid as a corrupt frame.
+            tracing::trace!(
+                snapshot_columns = snapshot.grid.columns.get(),
+                snapshot_lines = snapshot.grid.lines.get(),
+                layout_columns = self.current_window().layout.grid.columns.get(),
+                layout_lines = self.current_window().layout.grid.lines.get(),
+                "deferred stale snapshot during terminal resize"
+            );
+            return Ok(());
+        }
         if let Some(pending) = self.current_window_mut().visual_build.as_mut() {
             pending.queue_latest(snapshot);
             return Ok(());
@@ -3272,6 +3299,8 @@ impl DesktopRuntime {
             window.tab_bar.offset,
         );
         window.layout = layout;
+        window.visual_build = None;
+        window.presentation.reset();
         window.layout_generation = window.layout_generation.saturating_add(1);
         Ok(())
     }

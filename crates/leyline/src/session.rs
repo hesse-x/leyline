@@ -75,6 +75,7 @@ struct InputTransaction {
 }
 
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
+const SUSPEND_PROTOCOL_RESET_GRACE: Duration = Duration::from_millis(250);
 
 fn keyboard_protocol_active(state: crate::terminal::KeyboardProtocolState) -> bool {
     !state.kitty.is_empty()
@@ -88,6 +89,18 @@ fn keyboard_protocol_owner_changed(
 ) -> bool {
     keyboard_protocol_active(state)
         && matches!((owner, foreground), (Some(owner), Some(foreground)) if owner != foreground)
+}
+
+fn job_control_suspend_chord(event: &crate::terminal::TerminalKeyboardEvent) -> bool {
+    event.kind == crate::terminal::KeyboardEventKind::Press
+        && matches!(
+            event.identity.logical,
+            leyline_gfx::LogicalKey::Character('z' | 'Z')
+        )
+        && event.modifiers.control
+        && !event.modifiers.shift
+        && !event.modifiers.alt
+        && !event.modifiers.super_key
 }
 
 fn visible_frame_changed(previous: &FrameSnapshot, next: &FrameSnapshot) -> bool {
@@ -122,6 +135,7 @@ pub struct TerminalSession {
     security_audit: ParseAuditDelta,
     audit_log_limiter: MetadataRateLimiter,
     keyboard_protocol_owner: Option<u32>,
+    keyboard_protocol_suspend_reset_until: Option<Instant>,
     search: crate::search::SearchController,
 }
 
@@ -220,6 +234,7 @@ impl TerminalSession {
             security_audit: ParseAuditDelta::default(),
             audit_log_limiter: MetadataRateLimiter::default(),
             keyboard_protocol_owner: None,
+            keyboard_protocol_suspend_reset_until: None,
             search: crate::search::SearchController::default(),
         })
     }
@@ -234,7 +249,23 @@ impl TerminalSession {
                 self.reset_keyboard_protocol_after_foreground_change();
                 let keyboard_before = self.core.input_modes().keyboard;
                 let delta = self.core.advance(batch.as_slice())?;
-                let keyboard_after = self.core.input_modes().keyboard;
+                let mut keyboard_after = self.core.input_modes().keyboard;
+                if let Some(deadline) = self.keyboard_protocol_suspend_reset_until {
+                    if Instant::now() <= deadline {
+                        if keyboard_protocol_active(keyboard_after) {
+                            tracing::debug!(
+                                kitty = keyboard_after.kitty.bits(),
+                                modify_other_keys = ?keyboard_after.modify_other_keys,
+                                "suppressing late keyboard protocol enable after suspend chord"
+                            );
+                            self.core.reset_keyboard_protocol();
+                            self.keyboard_protocol_owner = None;
+                            keyboard_after = self.core.input_modes().keyboard;
+                        }
+                    } else {
+                        self.keyboard_protocol_suspend_reset_until = None;
+                    }
+                }
                 let foreground_process_group = self.foreground_process_group();
                 if !keyboard_protocol_active(keyboard_before)
                     && keyboard_protocol_active(keyboard_after)
@@ -497,6 +528,8 @@ impl TerminalSession {
     ) -> Result<bool, SessionError> {
         self.reset_keyboard_protocol_after_foreground_change();
         let modes = self.core.input_modes();
+        let reset_after_suspend =
+            keyboard_protocol_active(modes.keyboard) && job_control_suspend_chord(event);
         let foreground_process_group = self.foreground_process_group();
         if event.kind == crate::terminal::KeyboardEventKind::Press
             && !keyboard_protocol_active(modes.keyboard)
@@ -522,6 +555,20 @@ impl TerminalSession {
             crate::terminal::EncodedKey::Bytes(bytes) => {
                 self.restore_viewport_after_input()?;
                 self.queue_transaction(QueueClass::Interactive, bytes)?;
+                if reset_after_suspend {
+                    // A container proxy remains the host PTY's foreground process even after the
+                    // job inside its nested PTY is suspended, so tcgetpgrp cannot observe that
+                    // transition. Encode Ctrl+Z in the active mode first, then restore the shell's
+                    // legacy keyboard mode locally.
+                    self.core.reset_keyboard_protocol();
+                    self.keyboard_protocol_owner = None;
+                    self.keyboard_protocol_suspend_reset_until =
+                        Some(Instant::now() + SUSPEND_PROTOCOL_RESET_GRACE);
+                    tracing::debug!(
+                        foreground_process_group,
+                        "resetting keyboard protocol after job-control suspend chord"
+                    );
+                }
                 Ok(false)
             }
             crate::terminal::EncodedKey::TextFallback => Ok(true),
@@ -1104,6 +1151,38 @@ mod tests {
             Some(10),
             Some(20)
         ));
+    }
+
+    #[test]
+    fn only_plain_control_z_is_a_job_control_suspend_chord() {
+        let mut event = crate::terminal::TerminalKeyboardEvent {
+            identity: leyline_gfx::KeyIdentity {
+                logical: leyline_gfx::LogicalKey::Character('z'),
+                location: leyline_gfx::KeyLocation::Standard,
+                keypad: None,
+                base_codepoint: Some('z'),
+                shifted_codepoint: Some('Z'),
+            },
+            text: None,
+            modifiers: crate::terminal::Modifiers {
+                control: true,
+                ..crate::terminal::Modifiers::default()
+            },
+            caps_lock: false,
+            num_lock: false,
+            kind: crate::terminal::KeyboardEventKind::Press,
+            associated_text_allowed: false,
+        };
+        assert!(job_control_suspend_chord(&event));
+
+        event.kind = crate::terminal::KeyboardEventKind::Release;
+        assert!(!job_control_suspend_chord(&event));
+        event.kind = crate::terminal::KeyboardEventKind::Press;
+        event.modifiers.shift = true;
+        assert!(!job_control_suspend_chord(&event));
+        event.modifiers.shift = false;
+        event.identity.logical = leyline_gfx::LogicalKey::Character('x');
+        assert!(!job_control_suspend_chord(&event));
     }
 
     #[test]
