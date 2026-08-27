@@ -64,10 +64,22 @@ impl ScrollbarGeometry {
             width: (f64::from(layout.viewport_px.width) - grid_right).max(0.0),
             height: f64::from(layout.cell_px[1].get()) * f64::from(layout.grid.lines.get()),
         };
-        let hit_width = (config.hit_width * scale).round().max(1.0).min(track.width);
-        let visual_width = (config.width * scale).round().max(1.0).min(track.width);
+        let resize_inset = f64::from(leyline_gfx::FALLBACK_RESIZE_MARGIN_LOGICAL) * scale;
+        let interactive_right = (f64::from(layout.viewport_px.width) - resize_inset).max(0.0);
+        if interactive_right <= track.x {
+            return None;
+        }
+        let interactive_width = interactive_right - track.x;
+        let hit_width = (config.hit_width * scale)
+            .round()
+            .max(1.0)
+            .min(interactive_width);
+        let visual_width = (config.width * scale)
+            .round()
+            .max(1.0)
+            .min(interactive_width);
         let hit = PixelRect {
-            x: f64::from(layout.viewport_px.width) - hit_width,
+            x: interactive_right - hit_width,
             width: hit_width,
             ..track
         };
@@ -89,7 +101,7 @@ impl ScrollbarGeometry {
                 / snapshot.history_size as f64
         };
         let thumb = PixelRect {
-            x: f64::from(layout.viewport_px.width) - visual_width - 2.0 * scale,
+            x: (interactive_right - visual_width - 2.0 * scale).max(track.x),
             y: track.y + (position.clamp(0.0, 1.0) * travel).round(),
             width: visual_width,
             height: thumb_height,
@@ -720,14 +732,20 @@ mod tests {
             strike_y_px: 5,
             strike_thickness_px: NonZeroU16::new(1).unwrap(),
         };
-        let layout = GridLayout::calculate(
+        let layout = GridLayout::calculate_with_style(
             leyline_gfx::LogicalSize {
                 width: 120,
                 height: 40,
             },
             leyline_gfx::Scale120::ONE,
-            [4, 4],
+            crate::layout::ContentInsets {
+                left: 4,
+                right: 18,
+                top: 4,
+                bottom: 4,
+            },
             metrics,
+            0.0,
             1,
         )
         .unwrap();
@@ -740,5 +758,9 @@ mod tests {
         .unwrap();
         assert_eq!(geometry.offset_for_pointer(geometry.track.y, 0.0), 0);
         assert!((geometry.thumb.height - geometry.track.height).abs() < f64::EPSILON);
+        let resize_boundary = f64::from(layout.viewport_px.width)
+            - f64::from(leyline_gfx::FALLBACK_RESIZE_MARGIN_LOGICAL);
+        assert!(geometry.hit.x + geometry.hit.width <= resize_boundary);
+        assert!(geometry.thumb.x + geometry.thumb.width <= resize_boundary);
     }
 }

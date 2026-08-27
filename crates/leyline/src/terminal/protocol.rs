@@ -10,7 +10,7 @@ struct ScreenKeyboardState {
     depth: usize,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 enum ScanState {
     #[default]
     Ground,
@@ -29,12 +29,13 @@ pub(super) struct ProtocolAudit {
     pub stack_overflow: u32,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(super) struct KeyboardProtocolTracker {
     screens: [ScreenKeyboardState; 2],
     alternate: bool,
     modify_other_keys: ModifyOtherKeysLevel,
     scan: ScanState,
+    suppressed: bool,
 }
 
 impl KeyboardProtocolTracker {
@@ -107,6 +108,9 @@ impl KeyboardProtocolTracker {
                 format!("\x1b[>4;{}m", self.modify_other_keys as u8).into_bytes(),
             ));
             audit.queries = audit.queries.saturating_add(1);
+            return;
+        }
+        if self.suppressed {
             return;
         }
         let Some((&prefix, parameters)) = body.split_first() else {
@@ -212,6 +216,12 @@ impl KeyboardProtocolTracker {
         self.screens = [ScreenKeyboardState::default(); 2];
         self.alternate = false;
         self.modify_other_keys = ModifyOtherKeysLevel::Disabled;
+        self.scan = ScanState::Ground;
+    }
+
+    pub(super) fn set_suppressed(&mut self, suppressed: bool) {
+        self.reset();
+        self.suppressed = suppressed;
     }
 }
 
@@ -276,6 +286,20 @@ mod tests {
         assert_eq!(tracker.state().kitty.bits(), 1);
         tracker.advance(b"\x1b[>4;2m\x1bc");
         assert_eq!(tracker.state(), KeyboardProtocolState::default());
+    }
+
+    #[test]
+    fn suppression_ignores_changes_and_answers_queries_with_legacy_state() {
+        let mut tracker = KeyboardProtocolTracker::default();
+        tracker.advance(b"\x1b[>1u\x1b[>7u\x1b[>4;2m");
+        tracker.set_suppressed(true);
+        let (replies, _) = tracker.advance(b"\x1b[>7u\x1b[>4;2m\x1b[?u\x1b[?4m");
+
+        assert_eq!(tracker.state(), KeyboardProtocolState::default());
+        assert_eq!(
+            replies,
+            vec![(15, b"\x1b[?0u".to_vec()), (20, b"\x1b[>4;0m".to_vec())]
+        );
     }
 
     #[test]

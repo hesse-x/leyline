@@ -4,3 +4,4 @@
 printf '\033[=3u'
 sleep 0.2
 kill -TSTP "$$"
+sleep 0.5

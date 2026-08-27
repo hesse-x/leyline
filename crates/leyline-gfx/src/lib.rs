@@ -31,3 +31,6 @@ pub use runtime::{
 };
 pub use vulkan::{RendererFault, RendererOperation};
 pub use wake::{EventWake, WakeError};
+
+/// Logical pixels reserved at content edges for client-side resize fallback.
+pub const FALLBACK_RESIZE_MARGIN_LOGICAL: u16 = 6;

@@ -75,20 +75,11 @@ struct InputTransaction {
 }
 
 const SHUTDOWN_DEADLINE: Duration = Duration::from_secs(2);
-const SUSPEND_PROTOCOL_RESET_GRACE: Duration = Duration::from_millis(250);
+const MAX_SAVED_KEYBOARD_PROTOCOL_OWNERS: usize = 16;
 
 fn keyboard_protocol_active(state: crate::terminal::KeyboardProtocolState) -> bool {
     !state.kitty.is_empty()
         || state.modify_other_keys != crate::terminal::ModifyOtherKeysLevel::Disabled
-}
-
-fn keyboard_protocol_owner_changed(
-    state: crate::terminal::KeyboardProtocolState,
-    owner: Option<u32>,
-    foreground: Option<u32>,
-) -> bool {
-    keyboard_protocol_active(state)
-        && matches!((owner, foreground), (Some(owner), Some(foreground)) if owner != foreground)
 }
 
 fn job_control_suspend_chord(event: &crate::terminal::TerminalKeyboardEvent) -> bool {
@@ -135,7 +126,9 @@ pub struct TerminalSession {
     security_audit: ParseAuditDelta,
     audit_log_limiter: MetadataRateLimiter,
     keyboard_protocol_owner: Option<u32>,
-    keyboard_protocol_suspend_reset_until: Option<Instant>,
+    saved_keyboard_protocols: VecDeque<(u32, crate::terminal::KeyboardProtocolCheckpoint)>,
+    keyboard_protocol_suspend_pending: bool,
+    keyboard_protocol_suppressed: bool,
     search: crate::search::SearchController,
 }
 
@@ -201,6 +194,7 @@ impl TerminalSession {
             }),
         };
         let process = PtyProcess::spawn(spec, sinks)?;
+        let keyboard_protocol_owner = process.foreground_process_group().ok();
         Ok(Self {
             core: TerminalCoreAdapter::new(
                 initial_size,
@@ -233,8 +227,10 @@ impl TerminalSession {
             shutdown_deadline: None,
             security_audit: ParseAuditDelta::default(),
             audit_log_limiter: MetadataRateLimiter::default(),
-            keyboard_protocol_owner: None,
-            keyboard_protocol_suspend_reset_until: None,
+            keyboard_protocol_owner,
+            saved_keyboard_protocols: VecDeque::new(),
+            keyboard_protocol_suspend_pending: false,
+            keyboard_protocol_suppressed: false,
             search: crate::search::SearchController::default(),
         })
     }
@@ -246,34 +242,11 @@ impl TerminalSession {
                     return Err(SessionError::OutputAfterClose);
                 }
                 self.cwd_tracker.advance(batch.as_slice());
-                self.reset_keyboard_protocol_after_foreground_change();
+                self.synchronize_keyboard_protocol_owner();
                 let keyboard_before = self.core.input_modes().keyboard;
                 let delta = self.core.advance(batch.as_slice())?;
-                let mut keyboard_after = self.core.input_modes().keyboard;
-                if let Some(deadline) = self.keyboard_protocol_suspend_reset_until {
-                    if Instant::now() <= deadline {
-                        if keyboard_protocol_active(keyboard_after) {
-                            tracing::debug!(
-                                kitty = keyboard_after.kitty.bits(),
-                                modify_other_keys = ?keyboard_after.modify_other_keys,
-                                "suppressing late keyboard protocol enable after suspend chord"
-                            );
-                            self.core.reset_keyboard_protocol();
-                            self.keyboard_protocol_owner = None;
-                            keyboard_after = self.core.input_modes().keyboard;
-                        }
-                    } else {
-                        self.keyboard_protocol_suspend_reset_until = None;
-                    }
-                }
+                let keyboard_after = self.core.input_modes().keyboard;
                 let foreground_process_group = self.foreground_process_group();
-                if !keyboard_protocol_active(keyboard_before)
-                    && keyboard_protocol_active(keyboard_after)
-                {
-                    self.keyboard_protocol_owner = foreground_process_group;
-                } else if !keyboard_protocol_active(keyboard_after) {
-                    self.keyboard_protocol_owner = None;
-                }
                 if keyboard_before != keyboard_after {
                     tracing::trace!(
                         kitty_before = keyboard_before.kitty.bits(),
@@ -517,6 +490,7 @@ impl TerminalSession {
         key: crate::terminal::TerminalKey,
         modifiers: crate::terminal::Modifiers,
     ) -> Result<(), SessionError> {
+        self.prepare_keyboard_input();
         let bytes = crate::terminal::encode_key(key, modifiers, self.core.input_modes())
             .map_err(SessionError::Input)?;
         self.restore_viewport_after_input()?;
@@ -526,20 +500,14 @@ impl TerminalSession {
         &mut self,
         event: &crate::terminal::TerminalKeyboardEvent,
     ) -> Result<bool, SessionError> {
-        self.reset_keyboard_protocol_after_foreground_change();
+        self.synchronize_keyboard_protocol_owner();
+        if event.kind == crate::terminal::KeyboardEventKind::Press {
+            self.suppress_pending_keyboard_protocol();
+        }
         let modes = self.core.input_modes();
         let reset_after_suspend =
             keyboard_protocol_active(modes.keyboard) && job_control_suspend_chord(event);
         let foreground_process_group = self.foreground_process_group();
-        if event.kind == crate::terminal::KeyboardEventKind::Press
-            && !keyboard_protocol_active(modes.keyboard)
-            && matches!(
-                (self.keyboard_protocol_owner, foreground_process_group),
-                (Some(owner), Some(foreground)) if owner != foreground
-            )
-        {
-            self.keyboard_protocol_owner = None;
-        }
         let encoded =
             crate::terminal::encode_keyboard_event(event, modes).map_err(SessionError::Input)?;
         tracing::trace!(
@@ -556,17 +524,10 @@ impl TerminalSession {
                 self.restore_viewport_after_input()?;
                 self.queue_transaction(QueueClass::Interactive, bytes)?;
                 if reset_after_suspend {
-                    // A container proxy remains the host PTY's foreground process even after the
-                    // job inside its nested PTY is suspended, so tcgetpgrp cannot observe that
-                    // transition. Encode Ctrl+Z in the active mode first, then restore the shell's
-                    // legacy keyboard mode locally.
-                    self.core.reset_keyboard_protocol();
-                    self.keyboard_protocol_owner = None;
-                    self.keyboard_protocol_suspend_reset_until =
-                        Some(Instant::now() + SUSPEND_PROTOCOL_RESET_GRACE);
+                    self.keyboard_protocol_suspend_pending = true;
                     tracing::debug!(
                         foreground_process_group,
-                        "resetting keyboard protocol after job-control suspend chord"
+                        "waiting for foreground owner transition after suspend chord"
                     );
                 }
                 Ok(false)
@@ -576,29 +537,74 @@ impl TerminalSession {
         }
     }
 
-    fn reset_keyboard_protocol_after_foreground_change(&mut self) {
-        let modes = self.core.input_modes();
-        let foreground_process_group = self.foreground_process_group();
-        if keyboard_protocol_owner_changed(
-            modes.keyboard,
-            self.keyboard_protocol_owner,
-            foreground_process_group,
-        ) {
-            tracing::debug!(
-                keyboard_protocol_owner = self.keyboard_protocol_owner,
-                foreground_process_group,
-                "resetting keyboard protocol after foreground job change"
+    fn synchronize_keyboard_protocol_owner(&mut self) {
+        let Some(foreground) = self.foreground_process_group() else {
+            return;
+        };
+        if self.keyboard_protocol_owner == Some(foreground) {
+            return;
+        }
+
+        if let Some(owner) = self
+            .keyboard_protocol_owner
+            .filter(|_| !self.keyboard_protocol_suppressed)
+        {
+            self.saved_keyboard_protocols
+                .retain(|(saved_owner, _)| *saved_owner != owner);
+            self.saved_keyboard_protocols
+                .push_back((owner, self.core.keyboard_protocol_checkpoint()));
+            while self.saved_keyboard_protocols.len() > MAX_SAVED_KEYBOARD_PROTOCOL_OWNERS {
+                self.saved_keyboard_protocols.pop_front();
+            }
+        }
+
+        self.core.suppress_keyboard_protocol(false);
+        if let Some(index) = self
+            .saved_keyboard_protocols
+            .iter()
+            .position(|(owner, _)| *owner == foreground)
+        {
+            let (_, checkpoint) = self
+                .saved_keyboard_protocols
+                .remove(index)
+                .expect("checkpoint index came from the same deque");
+            self.core.restore_keyboard_protocol(checkpoint);
+        }
+        tracing::debug!(
+            previous_owner = self.keyboard_protocol_owner,
+            foreground_process_group = foreground,
+            kitty = self.core.input_modes().keyboard.kitty.bits(),
+            "switched keyboard protocol foreground owner"
+        );
+        self.keyboard_protocol_owner = Some(foreground);
+        self.keyboard_protocol_suspend_pending = false;
+        self.keyboard_protocol_suppressed = false;
+    }
+
+    fn prepare_keyboard_input(&mut self) {
+        self.synchronize_keyboard_protocol_owner();
+        self.suppress_pending_keyboard_protocol();
+    }
+
+    fn suppress_pending_keyboard_protocol(&mut self) {
+        if self.keyboard_protocol_suspend_pending && !self.keyboard_protocol_suppressed {
+            self.core.suppress_keyboard_protocol(true);
+            self.keyboard_protocol_suspend_pending = false;
+            self.keyboard_protocol_suppressed = true;
+            tracing::warn!(
+                foreground_process_group = self.keyboard_protocol_owner,
+                "suppressing keyboard protocol for opaque foreground proxy after suspend"
             );
-            self.core.reset_keyboard_protocol();
-            self.keyboard_protocol_owner = None;
         }
     }
     pub fn commit_text(&mut self, text: &str) -> Result<(), SessionError> {
+        self.prepare_keyboard_input();
         let bytes = crate::terminal::commit_text(text).map_err(SessionError::Input)?;
         self.restore_viewport_after_input()?;
         self.queue_transaction(QueueClass::Interactive, bytes)
     }
     pub fn paste(&mut self, text: &str) -> Result<(), SessionError> {
+        self.prepare_keyboard_input();
         let bytes =
             crate::terminal::paste_transaction(text, self.core.input_modes().bracketed_paste)
                 .map_err(SessionError::Input)?;
@@ -1134,26 +1140,6 @@ mod tests {
     }
 
     #[test]
-    fn protocol_owner_detects_a_foreground_job_change() {
-        let disabled = crate::terminal::KeyboardProtocolState::default();
-        let enabled = crate::terminal::KeyboardProtocolState {
-            kitty: crate::terminal::KittyKeyboardFlags::from_valid_bits(7).unwrap(),
-            ..disabled
-        };
-        assert!(keyboard_protocol_owner_changed(enabled, Some(10), Some(20)));
-        assert!(!keyboard_protocol_owner_changed(
-            enabled,
-            Some(10),
-            Some(10)
-        ));
-        assert!(!keyboard_protocol_owner_changed(
-            disabled,
-            Some(10),
-            Some(20)
-        ));
-    }
-
-    #[test]
     fn only_plain_control_z_is_a_job_control_suspend_chord() {
         let mut event = crate::terminal::TerminalKeyboardEvent {
             identity: leyline_gfx::KeyIdentity {
@@ -1186,7 +1172,38 @@ mod tests {
     }
 
     #[test]
-    fn suspended_tui_cannot_leave_the_shell_in_kitty_keyboard_mode() {
+    fn opaque_foreground_proxy_is_quarantined_without_parsing_shell_commands() {
+        let runtime = AppRuntimeBuilder::new(Arc::new(CountingWake::default()))
+            .build()
+            .unwrap();
+        let config = EffectiveConfig::default();
+        let launch = LaunchRequest::Command(crate::cli::CommandSpec {
+            program: OsString::from("/bin/cat"),
+            args: Vec::new(),
+        });
+        let mut session = TerminalSession::start(
+            &launch,
+            cwd(),
+            &config,
+            GridSize::new(40, 8).unwrap(),
+            &runtime,
+        )
+        .unwrap();
+        session.core.advance(b"\x1b[>7u\x1b[>4;2m").unwrap();
+        assert!(keyboard_protocol_active(session.input_modes().keyboard));
+
+        session.keyboard_protocol_suspend_pending = true;
+        session.prepare_keyboard_input();
+        assert!(session.keyboard_protocol_suppressed);
+        assert!(!keyboard_protocol_active(session.input_modes().keyboard));
+
+        session.core.advance(b"\x1b[>7u\x1b[>4;2m").unwrap();
+        assert!(!keyboard_protocol_active(session.input_modes().keyboard));
+        session.begin_shutdown();
+    }
+
+    #[test]
+    fn keyboard_protocol_follows_a_suspended_and_resumed_foreground_job() {
         let mut runtime = AppRuntimeBuilder::new(Arc::new(CountingWake::default()))
             .build()
             .unwrap();
@@ -1245,7 +1262,34 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
 
-        session.commit_text("kill %1\n").unwrap();
+        session.commit_text("fg\n").unwrap();
+        let resume_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if session.foreground_process_group() != Some(shell_process_group) {
+                session.synchronize_keyboard_protocol_owner();
+                assert!(keyboard_protocol_active(session.input_modes().keyboard));
+                break;
+            }
+            assert!(
+                Instant::now() < resume_deadline,
+                "foreground job did not resume"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let exit_deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if session.foreground_process_group() == Some(shell_process_group) {
+                session.synchronize_keyboard_protocol_owner();
+                assert!(!keyboard_protocol_active(session.input_modes().keyboard));
+                break;
+            }
+            assert!(
+                Instant::now() < exit_deadline,
+                "resumed foreground job did not exit"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         session.begin_shutdown();
     }
 

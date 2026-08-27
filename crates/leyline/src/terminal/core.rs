@@ -153,6 +153,9 @@ pub struct TerminalCoreAdapter {
     _main_thread: Rc<()>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct KeyboardProtocolCheckpoint(KeyboardProtocolTracker);
+
 #[allow(clippy::missing_errors_doc)]
 impl TerminalCoreAdapter {
     pub fn new(
@@ -271,6 +274,18 @@ impl TerminalCoreAdapter {
 
     pub fn reset_keyboard_protocol(&mut self) {
         self.keyboard_protocol.reset();
+    }
+
+    pub(crate) fn keyboard_protocol_checkpoint(&self) -> KeyboardProtocolCheckpoint {
+        KeyboardProtocolCheckpoint(self.keyboard_protocol.clone())
+    }
+
+    pub(crate) fn restore_keyboard_protocol(&mut self, checkpoint: KeyboardProtocolCheckpoint) {
+        self.keyboard_protocol = checkpoint.0;
+    }
+
+    pub(crate) fn suppress_keyboard_protocol(&mut self, suppressed: bool) {
+        self.keyboard_protocol.set_suppressed(suppressed);
     }
 
     #[must_use]

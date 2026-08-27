@@ -81,13 +81,14 @@ use xkbcommon::xkb;
 
 use crate::decor::{Libdecor, LibdecorContext, ResizeEdge};
 use crate::{
-    ClipboardEvent, GfxInitError, InputSerial, KeyInput, KeyState, LogicalSize, ModifierMask,
-    ModifiersState, PlatformEvent, PointerCursor, PointerInput, PointerKind, Scale120, SeatToken,
-    SelectionTarget, SerialKind, TextInputContext, TextInputEvent, TextInputPurpose, WindowState,
-    key_identity_from_keysym, logical_key_from_keysym,
+    ClipboardEvent, FALLBACK_RESIZE_MARGIN_LOGICAL, GfxInitError, InputSerial, KeyInput, KeyState,
+    LogicalSize, ModifierMask, ModifiersState, PlatformEvent, PointerCursor, PointerInput,
+    PointerKind, Scale120, SeatToken, SelectionTarget, SerialKind, TextInputContext,
+    TextInputEvent, TextInputPurpose, WindowState, key_identity_from_keysym,
+    logical_key_from_keysym,
 };
 
-const CONTENT_RESIZE_MARGIN: f64 = 6.0;
+const CONTENT_RESIZE_MARGIN: f64 = FALLBACK_RESIZE_MARGIN_LOGICAL as f64;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PressedModifiers(u16);

@@ -6,6 +6,7 @@ mod protocol;
 mod search;
 mod snapshot;
 
+pub(crate) use core::KeyboardProtocolCheckpoint;
 pub use core::{
     DefaultColorSlot, ParseAuditDelta, PendingSync, QueryTerminator, SyncFlushReason,
     TerminalAction, TerminalCoreAdapter, TerminalCoreConfig, TerminalDelta, TerminalError,

@@ -1276,7 +1276,7 @@ impl DesktopRuntime {
                             mapping_changed,
                             self.current_window_mut().selecting,
                         ) {
-                            self.cancel_terminal_pointer_gesture();
+                            self.cancel_grid_pointer_gesture();
                         }
                         self.refresh_text_input_rectangle()?;
                     }
@@ -4206,6 +4206,7 @@ impl DesktopRuntime {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn handle_scrollbar_pointer(
         &mut self,
         event: &leyline_gfx::PointerInput,
@@ -4243,6 +4244,12 @@ impl DesktopRuntime {
                     now,
                 ) {
                     self.active_session_mut().scroll_to_display_offset(offset)?;
+                    trace_scrollbar_pointer(
+                        "press",
+                        point,
+                        Some(offset),
+                        self.current_window_mut().scrollbar.interaction(),
+                    );
                 }
                 self.compose_latest()?;
                 return Ok(true);
@@ -4254,6 +4261,12 @@ impl DesktopRuntime {
                     .pointer_motion(point, geometry, now)
                 {
                     self.active_session_mut().scroll_to_display_offset(offset)?;
+                    trace_scrollbar_pointer(
+                        "drag",
+                        point,
+                        Some(offset),
+                        self.current_window_mut().scrollbar.interaction(),
+                    );
                 }
                 if previous != self.current_window_mut().scrollbar.interaction() {
                     self.compose_latest()?;
@@ -4273,6 +4286,12 @@ impl DesktopRuntime {
                 ) =>
             {
                 self.current_window_mut().scrollbar.release();
+                trace_scrollbar_pointer(
+                    "release",
+                    point,
+                    None,
+                    self.current_window_mut().scrollbar.interaction(),
+                );
                 self.compose_latest()?;
                 return Ok(true);
             }
@@ -4389,12 +4408,13 @@ impl DesktopRuntime {
     }
 
     fn cancel_pointer_gesture(&mut self) {
-        self.cancel_terminal_pointer_gesture();
+        self.cancel_grid_pointer_gesture();
+        self.current_window_mut().scrollbar.cancel();
         self.current_window_mut().tab_drag = None;
         self.current_window_mut().tab_drag_scroll = None;
     }
 
-    fn cancel_terminal_pointer_gesture(&mut self) {
+    fn cancel_grid_pointer_gesture(&mut self) {
         self.current_window_mut().selecting = false;
         self.current_window_mut().selection_point = None;
         self.current_window_mut().selection_kind = None;
@@ -4402,7 +4422,6 @@ impl DesktopRuntime {
         self.current_window_mut().drag_scroll = None;
         self.current_window_mut().link_candidate = None;
         self.current_window_mut().click_tracker.reset();
-        self.current_window_mut().scrollbar.cancel();
     }
 
     fn copy_selection(
@@ -5653,7 +5672,10 @@ fn content_insets(config: &crate::config::EffectiveConfig, tab_count: usize) -> 
     } else {
         #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
         let gutter = config.scrollbar.hit_width.ceil() as u16;
-        config.window.padding_x.max(gutter.saturating_add(2))
+        config
+            .window
+            .padding_x
+            .max(gutter.saturating_add(leyline_gfx::FALLBACK_RESIZE_MARGIN_LOGICAL))
     };
     let show_tabs = tab_bar_visible(config, tab_count);
     ContentInsets {
@@ -5722,7 +5744,10 @@ fn requested_normal_size(
         .and_then(|value| value.checked_add(u32::from(config.window.padding_x) * 2))
         .and_then(|value| {
             (config.scrollbar.mode != crate::config::ScrollbarMode::Hidden)
-                .then(|| config.scrollbar.hit_width.ceil() as u32 + 2)
+                .then(|| {
+                    config.scrollbar.hit_width.ceil() as u32
+                        + u32::from(leyline_gfx::FALLBACK_RESIZE_MARGIN_LOGICAL)
+                })
                 .map_or(Some(value), |gutter| value.checked_add(gutter))
         })
         .ok_or_else(|| UiRuntimeError::Grid("requested window width overflow".into()))?;
@@ -5752,6 +5777,23 @@ fn visual_mapping_changed(current: Option<&VisualGridMap>, next: &VisualGridMap)
             || current.grid != next.grid
             || current.bidi_enabled != next.bidi_enabled
     })
+}
+
+fn trace_scrollbar_pointer(
+    operation: &'static str,
+    point: [f64; 2],
+    display_offset: Option<usize>,
+    interaction: crate::interaction::ScrollbarInteraction,
+) {
+    tracing::trace!(
+        category = "scrollbar_pointer",
+        operation,
+        pointer_x = point[0],
+        pointer_y = point[1],
+        display_offset,
+        ?interaction,
+        "scrollbar pointer event handled"
+    );
 }
 
 const fn should_cancel_pointer_gesture(mapping_changed: bool, selecting: bool) -> bool {
