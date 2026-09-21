@@ -276,6 +276,18 @@ struct TabDragScroll {
     deadline: Instant,
 }
 
+/// A primary-button press withheld from a mouse-reporting TUI until we know whether
+/// it will become a drag-select. If the pointer stays within the drag threshold the
+/// press is synthesized back to the child as a plain click on release; if it crosses
+/// the threshold the gesture is stolen into a local text selection.
+#[derive(Clone, Copy, Debug)]
+struct PendingDragPress {
+    point: crate::terminal::SelectionPoint,
+    side: Option<crate::terminal::SelectionSide>,
+    pixel: [f64; 2],
+    modifiers: crate::terminal::Modifiers,
+}
+
 enum WindowRecord {
     Creating {
         cwd: SpawnDirectory,
@@ -444,6 +456,12 @@ pub struct WindowRuntime {
     selection_point: Option<crate::terminal::SelectionPoint>,
     selection_kind: Option<crate::terminal::SelectionKind>,
     selection_dragged: bool,
+    /// Press forwarded to a mouse-reporting TUI is withheld here until the gesture is
+    /// resolved into either a synthesized click (release) or a stolen drag-select.
+    pending_drag_press: Option<PendingDragPress>,
+    /// True while a local selection was started by stealing a withheld press, so the
+    /// matching release is not forwarded to a child that never saw the press.
+    selection_press_withheld: bool,
     click_tracker: ClickTracker,
     drag_scroll: Option<DragScroll>,
     link_candidate: Option<LinkCandidate>,
@@ -496,6 +514,8 @@ impl WindowRuntime {
             selection_point: None,
             selection_kind: None,
             selection_dragged: false,
+            pending_drag_press: None,
+            selection_press_withheld: false,
             click_tracker: ClickTracker::default(),
             drag_scroll: None,
             link_candidate: None,
@@ -540,6 +560,9 @@ struct WindowPresentation {
 }
 
 const DRAG_SCROLL_INTERVAL: Duration = Duration::from_millis(50);
+/// A press must wander at least this many surface pixels before a withheld click is
+/// stolen into a drag-select, so a plain click still reaches a mouse-reporting TUI.
+const DRAG_SELECT_THRESHOLD_PX: f64 = 5.0;
 const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_SETTLE_INTERVAL: Duration = Duration::from_millis(50);
 const WINDOW_STATE_STABILIZATION: Duration = Duration::from_secs(1);
@@ -1065,6 +1088,8 @@ impl DesktopRuntime {
             selection_point: None,
             selection_kind: None,
             selection_dragged: false,
+            pending_drag_press: None,
+            selection_press_withheld: false,
             click_tracker: ClickTracker::default(),
             drag_scroll: None,
             link_candidate: None,
@@ -4029,18 +4054,68 @@ impl DesktopRuntime {
                         return Ok(());
                     }
                 }
-                if !self.active_session_mut().pointer_report(
-                    crate::terminal::MouseButton::Left,
-                    crate::terminal::ButtonState::Pressed,
-                    point,
-                    modifiers,
-                )? {
-                    let selection_point = selection_endpoint.map_or(point, |endpoint| endpoint.0);
-                    let kind = self.current_window_mut().click_tracker.register(
-                        0x110,
-                        selection_point,
-                        time_ms,
-                    );
+                let selection_point = selection_endpoint.map_or(point, |endpoint| endpoint.0);
+                let kind = self.current_window_mut().click_tracker.register(
+                    0x110,
+                    selection_point,
+                    time_ms,
+                );
+                // A double/triple click is an explicit terminal selection gesture. Preserve it
+                // even when an interactive TUI has enabled mouse reporting (Shift-click remains
+                // the escape hatch for sending a single click to that TUI).
+                let force_local_selection = matches!(
+                    kind,
+                    crate::terminal::SelectionKind::Semantic
+                        | crate::terminal::SelectionKind::Lines
+                );
+                let mouse_protocol = self.active_session().input_modes().mouse_protocol;
+                // A plain (Simple) click inside a mouse-reporting TUI is withheld until
+                // we know whether it becomes a drag-select: if the pointer stays within
+                // the drag threshold we synthesize a plain click to the child on release,
+                // otherwise we steal the gesture into a local text selection. Shift
+                // already forces a local selection (escape hatch) via `encode_mouse`, and
+                // Semantic/Lines clicks always select locally, so neither is deferred.
+                let deferred_click = !force_local_selection
+                    && mouse_protocol != crate::terminal::MouseProtocol::None
+                    && !modifiers.shift;
+                let reported = if deferred_click {
+                    // A plain press resets any existing selection (mirroring a normal
+                    // terminal where a press starts a fresh selection), so clicking
+                    // blank space clears a drag-selected highlight even inside a
+                    // mouse-reporting TUI. If the press later becomes a drag-select,
+                    // the steal starts a fresh selection at the press cell anyway.
+                    if self.active_session().selected_text().is_some() {
+                        self.active_session_mut().clear_selection()?;
+                    }
+                    self.current_window_mut().pending_drag_press = Some(PendingDragPress {
+                        point: selection_point,
+                        side: selection_endpoint.map(|(_, side)| side),
+                        pixel: [f64::from(pixel[0]), f64::from(pixel[1])],
+                        modifiers,
+                    });
+                    false
+                } else {
+                    !force_local_selection
+                        && self.active_session_mut().pointer_report(
+                            crate::terminal::MouseButton::Left,
+                            crate::terminal::ButtonState::Pressed,
+                            point,
+                            modifiers,
+                        )?
+                };
+                tracing::debug!(
+                    category = "terminal_pointer",
+                    operation = "press",
+                    column = point.column,
+                    line = point.line,
+                    selection_kind = ?kind,
+                    force_local_selection,
+                    mouse_protocol = ?mouse_protocol,
+                    deferred_click,
+                    reported,
+                    "processed primary-button press"
+                );
+                if !reported && !deferred_click {
                     if let Some((point, side)) = selection_endpoint {
                         self.active_session_mut()
                             .start_selection_kind_with_side(kind, point, side)?;
@@ -4077,15 +4152,66 @@ impl DesktopRuntime {
                     self.cancel_pointer_gesture();
                     return Ok(());
                 };
+                // A withheld press that never crossed the drag threshold is resolved
+                // into a synthesized plain click to the child on release, preserving
+                // mouse-driven TUI interaction.
+                if let Some(pending) = self.current_window_mut().pending_drag_press.take() {
+                    let mouse_protocol = self.active_session().input_modes().mouse_protocol;
+                    if mouse_protocol != crate::terminal::MouseProtocol::None {
+                        self.active_session_mut().pointer_report(
+                            crate::terminal::MouseButton::Left,
+                            crate::terminal::ButtonState::Pressed,
+                            pending.point,
+                            pending.modifiers,
+                        )?;
+                        self.active_session_mut().pointer_report(
+                            crate::terminal::MouseButton::Left,
+                            crate::terminal::ButtonState::Released,
+                            pending.point,
+                            pending.modifiers,
+                        )?;
+                    }
+                    tracing::debug!(
+                        category = "terminal_pointer",
+                        operation = "release",
+                        mouse_protocol = ?mouse_protocol,
+                        synthesized_click = true,
+                        "resolved withheld press into a plain click"
+                    );
+                    return Ok(());
+                }
                 self.current_window_mut().selection_dragged |=
                     self.current_window_mut().selection_point != Some(point);
-                if !self.active_session_mut().pointer_report(
-                    crate::terminal::MouseButton::Left,
-                    crate::terminal::ButtonState::Released,
-                    point,
-                    modifiers,
-                )? && self.current_window_mut().selecting
-                {
+                let local_multi_selection = self.current_window_mut().selecting
+                    && matches!(
+                        self.current_window_mut().selection_kind,
+                        Some(
+                            crate::terminal::SelectionKind::Semantic
+                                | crate::terminal::SelectionKind::Lines
+                        )
+                    );
+                let mouse_protocol = self.active_session().input_modes().mouse_protocol;
+                let press_withheld = self.current_window_mut().selection_press_withheld;
+                let reported = !local_multi_selection
+                    && !press_withheld
+                    && self.active_session_mut().pointer_report(
+                        crate::terminal::MouseButton::Left,
+                        crate::terminal::ButtonState::Released,
+                        point,
+                        modifiers,
+                    )?;
+                tracing::debug!(
+                    category = "terminal_pointer",
+                    operation = "release",
+                    column = point.column,
+                    line = point.line,
+                    local_multi_selection,
+                    mouse_protocol = ?mouse_protocol,
+                    reported,
+                    selecting = self.current_window().selecting,
+                    "processed primary-button release"
+                );
+                if !reported && self.current_window_mut().selecting {
                     if let Some((selection_point, side)) = selection_endpoint {
                         self.active_session_mut()
                             .update_selection_with_side(selection_point, side)?;
@@ -4107,6 +4233,8 @@ impl DesktopRuntime {
                 self.current_window_mut().selection_point = None;
                 self.current_window_mut().selection_kind = None;
                 self.current_window_mut().selection_dragged = false;
+                self.current_window_mut().pending_drag_press = None;
+                self.current_window_mut().selection_press_withheld = false;
                 self.current_window_mut().drag_scroll = None;
             }
             leyline_gfx::PointerKind::Press { button: 0x112, .. } if point.is_some() => {
@@ -4191,6 +4319,60 @@ impl DesktopRuntime {
                     }
                 }
             }
+            leyline_gfx::PointerKind::Motion { .. }
+            if self.current_window_mut().pending_drag_press.is_some() =>
+            {
+                // A withheld press crosses the drag threshold: steal the gesture
+                // into a local text selection starting at the press cell. The child
+                // never saw the press, so its release is suppressed via
+                // `selection_press_withheld`.
+                let pending = self
+                    .current_window_mut()
+                    .pending_drag_press
+                    .expect("guard ensures pending drag press is present");
+                if drag_exceeds_select_threshold(
+                    pending.pixel,
+                    [f64::from(pixel[0]), f64::from(pixel[1])],
+                ) {
+                    self.current_window_mut().pending_drag_press = None;
+                    self.current_window_mut().selection_press_withheld = true;
+                    if let Some(side) = pending.side {
+                        self.active_session_mut().start_selection_kind_with_side(
+                            crate::terminal::SelectionKind::Simple,
+                            pending.point,
+                            side,
+                        )?;
+                    } else {
+                        self.active_session_mut().start_selection_kind(
+                            crate::terminal::SelectionKind::Simple,
+                            pending.point,
+                        )?;
+                    }
+                    self.current_window_mut().selecting = true;
+                    self.current_window_mut().selection_point = Some(pending.point);
+                    self.current_window_mut().selection_kind =
+                        Some(crate::terminal::SelectionKind::Simple);
+                    self.current_window_mut().selection_dragged = true;
+                    if let Some(point) = point {
+                        let endpoint = selection_endpoint.map_or(point, |(endpoint, _)| endpoint);
+                        if let Some((endpoint, side)) = selection_endpoint {
+                            self.active_session_mut()
+                                .update_selection_with_side(endpoint, side)?;
+                        } else {
+                            self.active_session_mut().update_selection(endpoint)?;
+                        }
+                        self.current_window_mut().selection_point = Some(endpoint);
+                    }
+                    if let Some((direction, point)) = self.drag_scroll_target(pixel) {
+                        self.current_window_mut().drag_scroll = Some(DragScroll {
+                            direction,
+                            point,
+                            deadline: Instant::now() + DRAG_SCROLL_INTERVAL,
+                        });
+                    }
+                }
+                // Below threshold: do nothing (no forwarding, no selection yet).
+            }
             leyline_gfx::PointerKind::Leave { .. } if self.current_window_mut().selecting => {
                 if let Some((direction, point)) = self.drag_scroll_target(pixel) {
                     self.current_window_mut().drag_scroll = Some(DragScroll {
@@ -4233,6 +4415,8 @@ impl DesktopRuntime {
                 self.current_window_mut().selection_point = None;
                 self.current_window_mut().selection_kind = None;
                 self.current_window_mut().selection_dragged = false;
+                self.current_window_mut().pending_drag_press = None;
+                self.current_window_mut().selection_press_withheld = false;
                 self.current_window_mut().drag_scroll = None;
                 self.current_window_mut().link_candidate = None;
                 self.current_window_mut().click_tracker.reset();
@@ -4410,6 +4594,7 @@ impl DesktopRuntime {
     fn cancel_pointer_gesture(&mut self) {
         self.cancel_grid_pointer_gesture();
         self.current_window_mut().scrollbar.cancel();
+        self.current_window_mut().click_tracker.reset();
         self.current_window_mut().tab_drag = None;
         self.current_window_mut().tab_drag_scroll = None;
     }
@@ -4421,7 +4606,6 @@ impl DesktopRuntime {
         self.current_window_mut().selection_dragged = false;
         self.current_window_mut().drag_scroll = None;
         self.current_window_mut().link_candidate = None;
-        self.current_window_mut().click_tracker.reset();
     }
 
     fn copy_selection(
@@ -4733,6 +4917,14 @@ fn keep_selection_after_release(
         )
 }
 
+/// Whether a withheld press has wandered far enough from its origin to be stolen
+/// into a drag-select rather than synthesized back to the child as a plain click.
+fn drag_exceeds_select_threshold(press: [f64; 2], current: [f64; 2]) -> bool {
+    let dx = current[0] - press[0];
+    let dy = current[1] - press[1];
+    dx * dx + dy * dy >= DRAG_SELECT_THRESHOLD_PX.powi(2)
+}
+
 fn selection_drag_scroll_direction(y: u32, origin: u32, height: u32, edge: u32) -> Option<i32> {
     let bottom = origin.checked_add(height)?;
     if y < origin.saturating_add(edge).min(bottom) {
@@ -4937,8 +5129,8 @@ fn window_title(ordinal: usize, count: usize, title: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        PendingVisualBuild, accumulate_wheel_steps, cwd_title, format_terminal_query,
-        ignores_key_repeat, keep_selection_after_release, key_text,
+        PendingVisualBuild, accumulate_wheel_steps, cwd_title, drag_exceeds_select_threshold,
+        format_terminal_query, ignores_key_repeat, keep_selection_after_release, key_text,
         renderer_fault_is_process_fatal, resolved_session_title, rotate_window_service_order,
         search_query_capacity, select_new_tab_cwd, selection_drag_scroll_direction,
         should_cancel_pointer_gesture, should_cancel_search, starts_terminal_control_gesture,
@@ -5338,6 +5530,24 @@ mod tests {
             Some(SelectionKind::Lines),
             false
         ));
+    }
+
+    #[test]
+    fn drag_threshold_steals_a_withheld_click_only_past_the_limit() {
+        let press = [100.0, 100.0];
+        // Same point and small sub-threshold moves stay a plain click.
+        assert!(!drag_exceeds_select_threshold(press, press));
+        assert!(!drag_exceeds_select_threshold(press, [103.0, 100.0]));
+        assert!(!drag_exceeds_select_threshold(press, [100.0, 103.0]));
+        assert!(!drag_exceeds_select_threshold(
+            press,
+            [103.0, 103.0] // ~4.24px, still under 5
+        ));
+        // Crossing the 5px threshold in a single axis steals the gesture.
+        assert!(drag_exceeds_select_threshold(press, [105.0, 100.0]));
+        assert!(drag_exceeds_select_threshold(press, [100.0, 105.0]));
+        // A larger diagonal move clearly steals it.
+        assert!(drag_exceeds_select_threshold(press, [110.0, 110.0]));
     }
 
     fn key(keysym: u32, utf8: Option<&str>) -> leyline_gfx::KeyInput {

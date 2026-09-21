@@ -26,9 +26,9 @@ tests = ["key-fixtures", "mouse-fixtures", "paste-fixtures"]
 names = [
   "km", "kbs", "kcbt", "kcub1", "kcud1", "kcuf1", "kcuu1", "kdch1", "kend", "kent",
   "kf1", "kf2", "kf3", "kf4", "kf5", "kf6", "kf7", "kf8", "kf9", "kf10", "kf11",
-  "kf12", "khome", "kich1", "kmous", "knp", "kpp"
+  "kf12", "khome", "kich1", "kmous", "knp", "kpp", "smkx", "rmkx"
 ]
 
 [[rejected]]
-names = ["Ms", "Cs", "Cr", "Ss", "Se", "initc", "oc", "mc0", "mc4", "mc5", "smkx", "rmkx"]
+names = ["Ms", "Cs", "Cr", "Ss", "Se", "initc", "oc", "mc0", "mc4", "mc5"]
 reason = "unsafe or missing end-to-end implementation evidence in epoch 1"

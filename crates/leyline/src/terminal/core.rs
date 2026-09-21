@@ -1302,6 +1302,44 @@ mod tests {
     }
 
     #[test]
+    fn decckm_application_cursor_mode_switches_arrow_encoding() {
+        use crate::terminal::input::{encode_key, Modifiers, TerminalKey};
+
+        let mut core = TerminalCoreAdapter::new(GridSize::new(20, 4).unwrap(), 0).unwrap();
+        // Without DECCKM, arrows are normal-mode CSI sequences.
+        assert!(!core.input_modes().application_cursor);
+        assert_eq!(
+            encode_key(TerminalKey::Up, Modifiers::default(), core.input_modes())
+                .unwrap(),
+            b"\x1b[A",
+        );
+        // Enable DECCKM (\ESC[?1h): the terminal must switch to application SS3 sequences.
+        core.advance(b"\x1b[?1h").unwrap();
+        assert!(
+            core.input_modes().application_cursor,
+            "DECCKM must set application_cursor; vim smkx relies on this"
+        );
+        assert_eq!(
+            encode_key(TerminalKey::Up, Modifiers::default(), core.input_modes())
+                .unwrap(),
+            b"\x1bOA",
+        );
+        assert_eq!(
+            encode_key(TerminalKey::Down, Modifiers::default(), core.input_modes())
+                .unwrap(),
+            b"\x1bOB",
+        );
+        // Disabling DECCKM (\ESC[?1l) must restore normal-mode encoding.
+        core.advance(b"\x1b[?1l").unwrap();
+        assert!(!core.input_modes().application_cursor);
+        assert_eq!(
+            encode_key(TerminalKey::Up, Modifiers::default(), core.input_modes())
+                .unwrap(),
+            b"\x1b[A",
+        );
+    }
+
+    #[test]
     fn horizontal_tab_advances_without_exposing_a_control_glyph() {
         let mut core = TerminalCoreAdapter::new(GridSize::new(16, 2).unwrap(), 0).unwrap();
         core.advance(b"\tX").unwrap();

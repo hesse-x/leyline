@@ -95,7 +95,10 @@ pub fn resolve_with_terminal_gesture(
     key: &KeyInput,
     terminal_control_gesture: bool,
 ) -> ShortcutResult {
-    if terminal_control_gesture {
+    // A terminal control character (for example Ctrl-C) must not be retroactively
+    // turned into an application shortcut. Extra modifiers form a new chord,
+    // though, so Ctrl+Shift+Arrow remains available while Ctrl is held.
+    if terminal_control_gesture && key.shortcut_modifiers == ModifierMask::CONTROL {
         ShortcutResult::NotMatched
     } else {
         resolve(bindings, key)
@@ -240,6 +243,12 @@ mod tests {
         );
         assert_eq!(
             resolve_with_terminal_gesture(std::slice::from_ref(&tab_five), &shifted_five, true),
+            ShortcutResult::Matched(Action::ActivateTab(5))
+        );
+        let mut plain_control = shifted_five;
+        plain_control.shortcut_modifiers = ModifierMask::CONTROL;
+        assert_eq!(
+            resolve_with_terminal_gesture(std::slice::from_ref(&tab_five), &plain_control, true),
             ShortcutResult::NotMatched
         );
     }
