@@ -785,6 +785,7 @@ impl TerminalCoreAdapter {
         if cells.len() > self.size.columns() * self.size.lines() {
             cells.truncate(self.size.columns() * self.size.lines());
         }
+        normalize_cell_widths(&mut cells, self.size.columns());
         let mode = *self.term.mode();
         let cursor = content.cursor;
         let cursor_style = self.term.cursor_style();
@@ -1213,6 +1214,48 @@ fn default_cell() -> SnapshotCell {
     }
 }
 
+/// Repairs cell widths that the upstream grid can produce but the snapshot
+/// contract forbids.
+///
+/// Alacritty's own renderer tolerates a wide cell whose trailing spacer is
+/// missing (it still draws the glyph two cells wide), and its insert-mode
+/// shift can rotate a wide char into the last column with no room for the
+/// spacer. Rather than failing the frame contract and shutting down, the
+/// damaged cells are downgraded to narrow and the location is reported so the
+/// responsible application can still be identified.
+fn normalize_cell_widths(cells: &mut [SnapshotCell], columns: usize) {
+    if columns == 0 {
+        return;
+    }
+    for line in 0..cells.len() / columns {
+        let row = &mut cells[line * columns..(line + 1) * columns];
+        for column in 0..row.len() {
+            let repair = match row[column].width {
+                CellWidth::Wide
+                    if column + 1 == row.len() || row[column + 1].width != CellWidth::Spacer =>
+                {
+                    Some("wide cell is not followed by spacer")
+                }
+                CellWidth::Spacer if column == 0 || row[column - 1].width != CellWidth::Wide => {
+                    Some("orphan spacer cell")
+                }
+                _ => None,
+            };
+            if let Some(reason) = repair {
+                tracing::warn!(
+                    category = "terminal_snapshot",
+                    line,
+                    column,
+                    character = %row[column].ch,
+                    reason,
+                    "repaired grid cell width for snapshot contract"
+                );
+                row[column].width = CellWidth::Narrow;
+            }
+        }
+    }
+}
+
 fn collect_regex_matches(
     compiled: &CompiledRegex,
     cursor: &mut RegexScanCursor,
@@ -1282,6 +1325,57 @@ pub enum TerminalError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[track_caller]
+    fn assert_width_contract(snapshot: &FrameSnapshot) {
+        let columns = snapshot.grid.columns();
+        for (index, cell) in snapshot.cells.iter().enumerate() {
+            match cell.width {
+                CellWidth::Wide => {
+                    assert_ne!(
+                        index % columns,
+                        columns - 1,
+                        "wide cell at last column {index}"
+                    );
+                    assert_eq!(
+                        snapshot.cells[index + 1].width,
+                        CellWidth::Spacer,
+                        "wide cell {index} is not followed by spacer"
+                    );
+                }
+                CellWidth::Spacer => {
+                    assert!(index % columns > 0, "orphan spacer at column 0: {index}");
+                    assert_eq!(
+                        snapshot.cells[index - 1].width,
+                        CellWidth::Wide,
+                        "orphan spacer cell {index}"
+                    );
+                }
+                CellWidth::Narrow | CellWidth::LeadingSpacer => {}
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_repairs_wide_cell_missing_trailing_spacer() {
+        // Insert mode (IRM) shifts cells right before printing. When a wide
+        // pair occupies the last two columns, the shift rotates the wide char
+        // into the last column where no spacer can follow it. The snapshot
+        // must repair that state instead of failing the frame contract.
+        let mut core = TerminalCoreAdapter::new(GridSize::new(4, 2).unwrap(), 0).unwrap();
+        core.advance("\u{4e2d}\u{4e2d}".as_bytes()).unwrap();
+        core.advance(b"\x1b[4h").unwrap();
+        core.advance(b"\x08a").unwrap();
+        let snapshot = core.snapshot().unwrap();
+        assert_width_contract(&snapshot);
+        // The surviving pair from the first wide char stays intact.
+        assert_eq!(snapshot.cells[0].width, CellWidth::Wide);
+        assert_eq!(snapshot.cells[1].width, CellWidth::Spacer);
+        // The rotated wide char in the last column is downgraded to narrow.
+        assert_eq!(snapshot.cells[3].width, CellWidth::Narrow);
+        assert_eq!(snapshot.cells[3].ch, '\u{4e2d}');
+    }
+
     #[test]
     fn parses_utf8_color_modes_title_and_rejects_clipboard() {
         let mut core = TerminalCoreAdapter::new(GridSize::new(20, 4).unwrap(), 100).unwrap();
@@ -1303,14 +1397,13 @@ mod tests {
 
     #[test]
     fn decckm_application_cursor_mode_switches_arrow_encoding() {
-        use crate::terminal::input::{encode_key, Modifiers, TerminalKey};
+        use crate::terminal::input::{Modifiers, TerminalKey, encode_key};
 
         let mut core = TerminalCoreAdapter::new(GridSize::new(20, 4).unwrap(), 0).unwrap();
         // Without DECCKM, arrows are normal-mode CSI sequences.
         assert!(!core.input_modes().application_cursor);
         assert_eq!(
-            encode_key(TerminalKey::Up, Modifiers::default(), core.input_modes())
-                .unwrap(),
+            encode_key(TerminalKey::Up, Modifiers::default(), core.input_modes()).unwrap(),
             b"\x1b[A",
         );
         // Enable DECCKM (\ESC[?1h): the terminal must switch to application SS3 sequences.
@@ -1320,21 +1413,18 @@ mod tests {
             "DECCKM must set application_cursor; vim smkx relies on this"
         );
         assert_eq!(
-            encode_key(TerminalKey::Up, Modifiers::default(), core.input_modes())
-                .unwrap(),
+            encode_key(TerminalKey::Up, Modifiers::default(), core.input_modes()).unwrap(),
             b"\x1bOA",
         );
         assert_eq!(
-            encode_key(TerminalKey::Down, Modifiers::default(), core.input_modes())
-                .unwrap(),
+            encode_key(TerminalKey::Down, Modifiers::default(), core.input_modes()).unwrap(),
             b"\x1bOB",
         );
         // Disabling DECCKM (\ESC[?1l) must restore normal-mode encoding.
         core.advance(b"\x1b[?1l").unwrap();
         assert!(!core.input_modes().application_cursor);
         assert_eq!(
-            encode_key(TerminalKey::Up, Modifiers::default(), core.input_modes())
-                .unwrap(),
+            encode_key(TerminalKey::Up, Modifiers::default(), core.input_modes()).unwrap(),
             b"\x1b[A",
         );
     }
